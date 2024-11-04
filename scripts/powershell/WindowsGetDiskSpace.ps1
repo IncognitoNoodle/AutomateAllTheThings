@@ -1,0 +1,1 @@
+Get-PSDrive -PSProvider 'FileSystem' | Select-Object Name, Description,@{ E={$_.Used/1GB}; L='Used' }, @{ E={$_.Free/1GB}; L='Free' }  | Export-CSV -Path "C:\Temp\DiskSpaceAnalysis.csv"
