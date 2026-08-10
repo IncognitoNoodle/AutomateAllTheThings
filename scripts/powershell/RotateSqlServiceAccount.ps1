@@ -40,8 +40,7 @@ param(
     [switch]$InstallModule,
 
     [Parameter(ParameterSetName = 'Rotate')]
-    [ValidateRange(12, 128)]
-    [int]$PasswordLength = 18,
+    [int]$PasswordLength = 0,
 
     [Parameter(ParameterSetName = 'Rotate')]
     [ValidateRange(30, 3600)]
@@ -59,6 +58,11 @@ param(
 $script:OutputFolder = '\\FILESERVER\Share\SqlServiceAccountVault'
 # Password that encrypts the vault (min 12 chars). Change once for the environment.
 $script:VaultPasswordPlain = 'ChangeMe-VaultPassword'
+# Generated service-account password length (raise if domain policy requires more).
+$script:PasswordLength = 24
+
+if ($PasswordLength -lt 12) { $PasswordLength = $script:PasswordLength }
+if ($PasswordLength -gt 128) { throw 'PasswordLength must be <= 128.' }
 
 $ErrorActionPreference = 'Stop'
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -209,13 +213,30 @@ function Write-VaultAtomic {
     Set-RestrictedAcl -Path $Path
 }
 
+function Test-PasswordAvoidsAccountName {
+    param([string]$Candidate, [string]$Account)
+    if ([string]::IsNullOrWhiteSpace($Account)) { return $true }
+    $sam = ($Account.Split('\')[-1]).ToLowerInvariant()
+    $text = $Candidate.ToLowerInvariant()
+    if ($sam.Length -ge 3 -and $text.Contains($sam)) { return $false }
+    # Domain complexity also rejects 3+ char tokens from the account name
+    for ($i = 0; $i -le $sam.Length - 3; $i++) {
+        if ($text.Contains($sam.Substring($i, 3))) { return $false }
+    }
+    return $true
+}
+
 function Get-StrongPassword {
-    param([int]$Length = 18)
+    param(
+        [int]$Length = 24,
+        [string]$Account
+    )
+    # Domain-friendly specials (avoid quotes/slashes that break service configs)
     $sets = @(
         'ABCDEFGHJKLMNPQRSTUVWXYZ'
         'abcdefghijkmnopqrstuvwxyz'
         '23456789'
-        '!@#$%^&*_-+='
+        '!@#$%*?-_+='
     )
     $all = -join $sets
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -228,27 +249,39 @@ function Get-StrongPassword {
             [int]($v % [uint32]$Max)
         }
 
-        $chars = [System.Collections.Generic.List[char]]::new()
-        foreach ($s in $sets) {
-            $idx = & $nextIndex $s.Length
-            $chars.Add($s[$idx])
-        }
-        while ($chars.Count -lt $Length) {
-            $idx = & $nextIndex $all.Length
-            $chars.Add($all[$idx])
-        }
-        for ($i = $chars.Count - 1; $i -gt 0; $i--) {
-            $j = & $nextIndex ($i + 1)
-            $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t
-        }
+        for ($attempt = 1; $attempt -le 50; $attempt++) {
+            $chars = [System.Collections.Generic.List[char]]::new()
+            # At least 2 from each class for stricter domain policies
+            foreach ($s in $sets) {
+                $chars.Add($s[(& $nextIndex $s.Length)])
+                $chars.Add($s[(& $nextIndex $s.Length)])
+            }
+            while ($chars.Count -lt $Length) {
+                $chars.Add($all[(& $nextIndex $all.Length)])
+            }
+            for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+                $j = & $nextIndex ($i + 1)
+                $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t
+            }
 
-        $secure = [System.Security.SecureString]::new()
-        foreach ($ch in $chars) { $secure.AppendChar($ch) }
-        $secure.MakeReadOnly()
-        return $secure
+            $plain = -join $chars
+            if (-not (Test-PasswordAvoidsAccountName -Candidate $plain -Account $Account)) { continue }
+
+            $secure = [System.Security.SecureString]::new()
+            foreach ($ch in $chars) { $secure.AppendChar($ch) }
+            $secure.MakeReadOnly()
+            return $secure
+        }
+        throw "Could not generate a domain-safe password for '$Account' after 50 attempts."
     } finally {
         $rng.Dispose()
     }
+}
+
+function Test-IsPasswordPolicyError {
+    param($ErrorRecord)
+    $msg = [string]$ErrorRecord
+    return [bool]($msg -match 'length|complexity|history|password.*requir|does not meet|password.*policy')
 }
 
 function Test-AccountEligible {
@@ -709,15 +742,27 @@ try {
         foreach ($g in $groups) {
             $account = $g.Name
             Write-Host "`nRotating: $account" -ForegroundColor Green
-            $securePwd = Get-StrongPassword -Length $PasswordLength
             $ok = $true
+            $securePwd = $null
+            $maxPwdAttempts = 5
 
-            if (-not $SkipAdPasswordReset) {
+            for ($pwdAttempt = 1; $pwdAttempt -le $maxPwdAttempts; $pwdAttempt++) {
+                if ($securePwd) { $securePwd.Dispose(); Remove-Variable securePwd -EA SilentlyContinue }
+                $securePwd = Get-StrongPassword -Length $PasswordLength -Account $account
+
+                if ($SkipAdPasswordReset) { break }
+
                 try {
                     Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
+                    break
                 } catch {
+                    if ((Test-IsPasswordPolicyError $_) -and $pwdAttempt -lt $maxPwdAttempts) {
+                        Write-Warning "AD rejected password (policy). Retry $($pwdAttempt + 1)/$maxPwdAttempts ..."
+                        continue
+                    }
                     Write-Host "  FAILED (AD): $_" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
+                    break
                 }
             }
 
