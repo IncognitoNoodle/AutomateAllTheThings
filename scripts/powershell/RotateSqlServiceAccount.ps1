@@ -14,7 +14,7 @@
 
     Why AD reset is required for domain accounts
       Update-DbaServiceAccount password mode calls SMO Service.ChangePassword only.
-      That updates the Windows service logon cache — it does NOT change Active Directory.
+      That updates the Windows service logon cache - it does NOT change Active Directory.
       So for a newly generated password: Set-ADAccountPassword first, then Update-DbaServiceAccount.
       Use -SkipAdPasswordReset only when AD was already rotated out-of-band.
 
@@ -24,7 +24,7 @@
       - ACL: Administrators + SYSTEM only
       - NOT a secrets manager. Equivalent to "any local admin on the vault host can recover passwords."
       - Prefer a local path (default: $env:ProgramData\SqlServiceAccountVault). A UNC works, but the
-        DPAPI key is still bound to the machine that runs the script — run it from one dedicated host.
+        DPAPI key is still bound to the machine that runs the script - run it from one dedicated host.
       - Prefer gMSA when possible (script skips those; AD manages the secret).
 
 .PARAMETER SqlInstance
@@ -64,12 +64,15 @@
     Vault / key / history / transcript. Default: local ProgramData (not a share).
 
 .EXAMPLE
-    # Standalone or AG — topology auto-detected
+    # Standalone or AG - topology auto-detected
     .\RotateSqlServiceAccount.ps1 -SqlInstance SQL01 -Confirm:$false
 
 .EXAMPLE
     .\RotateSqlServiceAccount.ps1 -SqlInstance SQL01\INST1 -AvailabilityGroup AG1 -Unattended -Confirm:$false
 #>
+# Interactive ops script: Write-Host is intentional. Helpers are gated by script-level ShouldProcess.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory)]
@@ -146,7 +149,10 @@ function Get-OrCreateMachineKey {
     return $key
 }
 
-function New-StrongPassword {
+function Get-StrongPassword {
+    <#
+      Returns a SecureString (no plaintext ConvertTo-SecureString).
+    #>
     param([int]$Length = 18)
     $sets = @(
         'ABCDEFGHJKLMNPQRSTUVWXYZ'
@@ -157,22 +163,35 @@ function New-StrongPassword {
     $all = -join $sets
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try {
-        $next = {
+        $nextIndex = {
             param([int]$Max)
             $b = [byte[]]::new(4)
             do { $rng.GetBytes($b); $v = [BitConverter]::ToUInt32($b, 0) }
             while ($v -ge ([uint32]::MaxValue - ([uint32]::MaxValue % [uint32]$Max)))
             [int]($v % [uint32]$Max)
         }
+
         $chars = [System.Collections.Generic.List[char]]::new()
-        foreach ($s in $sets) { $chars.Add($s[& $next $s.Length]) }
-        while ($chars.Count -lt $Length) { $chars.Add($all[& $next $all.Length]) }
+        foreach ($s in $sets) {
+            $idx = & $nextIndex $s.Length
+            $chars.Add($s[$idx])
+        }
+        while ($chars.Count -lt $Length) {
+            $idx = & $nextIndex $all.Length
+            $chars.Add($all[$idx])
+        }
         for ($i = $chars.Count - 1; $i -gt 0; $i--) {
-            $j = & $next ($i + 1)
+            $j = & $nextIndex ($i + 1)
             $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t
         }
-        -join $chars
-    } finally { $rng.Dispose() }
+
+        $secure = [System.Security.SecureString]::new()
+        foreach ($ch in $chars) { $secure.AppendChar($ch) }
+        $secure.MakeReadOnly()
+        return $secure
+    } finally {
+        $rng.Dispose()
+    }
 }
 
 function Test-AccountEligible {
@@ -205,7 +224,7 @@ function Write-VaultAtomic {
     $Vault | Export-Clixml -Path $temp -Force
     if (@((Import-Clixml -Path $temp).Keys).Count -ne @($Vault.Keys).Count) {
         Remove-Item $temp -Force -ErrorAction SilentlyContinue
-        throw 'Vault integrity check failed — previous vault untouched.'
+        throw 'Vault integrity check failed - previous vault untouched.'
     }
     if (Test-Path $Path) { Copy-Item $Path "$Path.bak" -Force }
     Move-Item $temp $Path -Force
@@ -391,7 +410,9 @@ function Invoke-GracefulAgApply {
         [switch]$SkipFailback
     )
 
-    $bySql = @{}; foreach ($n in $Nodes) { $bySql[$n.SqlInstance] = $n }
+    $bySql = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($n in $Nodes) { $bySql[$n.SqlInstance] = $n }
+
     # Map original primary / find a secondary
     $primarySql = $OriginalPrimary
     if (-not $bySql.ContainsKey($primarySql)) {
@@ -564,7 +585,7 @@ try {
             if (-not $PSCmdlet.ShouldProcess($account, 'Rotate password')) { continue }
 
             Write-Host "`nRotating: $account" -ForegroundColor Green
-            $securePwd = ConvertTo-SecureString (New-StrongPassword -Length $PasswordLength) -AsPlainText -Force
+            $securePwd = Get-StrongPassword -Length $PasswordLength
             $ok = $true
 
             # Domain: AD first (required). Service cache second.
