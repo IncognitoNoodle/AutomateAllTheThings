@@ -286,27 +286,61 @@ function Get-TargetTopology {
         [PSCredential]$Credential
     )
 
-    $agParams = @{ SqlInstance = $SqlInstance; EnableException = $true }
-    if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
+    # Connect first so we can use IsHadrEnabled (avoids Get-DbaAvailabilityGroup throw on standalone).
+    $conn = @{ SqlInstance = $SqlInstance; EnableException = $true }
+    if ($SqlCredential) { $conn.SqlCredential = $SqlCredential }
+
+    try {
+        $server = Connect-DbaInstance @conn
+    } catch {
+        throw @"
+Cannot connect to SQL instance '$SqlInstance'.
+For a named instance use Host\Instance (e.g. sdeposq403\SQL01), not just the instance name.
+Original error: $_
+"@
+    }
+
+    $computer = $server.ComputerName
+    if (-not $computer) {
+        try { $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential }
+        catch { $computer = $SqlInstance.Split('\')[0] }
+    }
+
+    $hadrOn = $false
+    try { $hadrOn = [bool]$server.IsHadrEnabled } catch { $hadrOn = $false }
+
+    if (-not $hadrOn) {
+        if ($AvailabilityGroup) {
+            throw "Instance $SqlInstance has HADR disabled, but -AvailabilityGroup was specified."
+        }
+        return [pscustomobject]@{
+            Mode            = 'Standalone'
+            SeedSqlInstance = $SqlInstance
+            Nodes           = @([pscustomobject]@{ ComputerName = $computer; SqlInstance = $SqlInstance })
+            AgNames         = @()
+            OriginalPrimary = $SqlInstance
+        }
+    }
+
+    $agParams = @{ SqlInstance = $server; EnableException = $true }
     if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
 
-    # Standalone instances throw from Get-DbaAvailabilityGroup ("HADR is not configured").
-    # Treat that as Mode=Standalone. Real connection failures still bubble up.
     $ags = @()
     try {
         $ags = @(Get-DbaAvailabilityGroup @agParams)
     } catch {
         $msg = [string]$_
-        $isNoHadr = $msg -match 'HADR|Availability Group|not configured|is not enabled'
-        if (-not $isNoHadr) { throw }
-        if ($AvailabilityGroup) {
-            throw "Instance $SqlInstance has no HADR/AG configured, but -AvailabilityGroup was specified."
+        if ($msg -match 'HADR|Availability Group|not configured|is not enabled') {
+            if ($AvailabilityGroup) {
+                throw "Instance $SqlInstance has no AG configured, but -AvailabilityGroup was specified."
+            }
+            $ags = @()
+        } else {
+            throw
         }
-        $ags = @()
     }
 
     if (-not $ags) {
-        $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential
         return [pscustomobject]@{
             Mode            = 'Standalone'
             SeedSqlInstance = $SqlInstance
