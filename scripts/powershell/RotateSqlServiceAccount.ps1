@@ -1,103 +1,80 @@
 <#
 .SYNOPSIS
-    Rotate SQL Engine/Agent service account passwords, then apply them with a
-    graceful Always On restart + failover + failback (dbatools).
+    Rotate SQL Engine/Agent service account passwords (standalone or Always On).
 
 .DESCRIPTION
-    KISS flow:
+    One entry point: -SqlInstance.
 
-      1. Discover eligible Engine/Agent service accounts
-      2. Generate a strong password and Update-DbaServiceAccount -NoRestart
-         on the target (and partner, when provided)
-      3. Persist encrypted password to a local DPAPI vault
-      4. Apply with a controlled restart:
-           - Standalone: Restart-DbaService on ComputerName
-           - AG pair:    restart secondary -> failover -> restart former primary
-                         -> failover back (Invoke-DbaAgFailover, no -Force)
+      1. Connect and detect topology (standalone vs AG replicas)
+      2. For domain accounts: reset AD password once, then Update-DbaServiceAccount -NoRestart on every node
+      3. Save ciphertext to a DPAPI-backed vault
+      4. Apply:
+           Standalone -> Restart-DbaService
+           AG        -> restart secondary -> Invoke-DbaAgFailover -> restart former primary -> fail back
 
-    Audit notes vs the previous draft:
-      - [switch]$NoRestart = $true was a bug (switch defaults are $false).
-        Password update always uses -NoRestart; restart is an explicit step.
-      - Dropped the extra Read-Host YES/SHARED prompt; SupportsShouldProcess
-        + ConfirmImpact High already gates destructive work (-Unattended / -Confirm:$false).
-      - No silent Install-Module in prod paths; pass -InstallModule if you want it.
-      - Shared-account conflict check no longer false-positives on the AG partner.
-      - Nested helpers flattened; AG rolling apply is one function.
+    Why AD reset is required for domain accounts
+      Update-DbaServiceAccount password mode calls SMO Service.ChangePassword only.
+      That updates the Windows service logon cache — it does NOT change Active Directory.
+      So for a newly generated password: Set-ADAccountPassword first, then Update-DbaServiceAccount.
+      Use -SkipAdPasswordReset only when AD was already rotated out-of-band.
 
-.PARAMETER ComputerName
-    Node to rotate (and preferred/home primary for failback). Default: local host.
-
-.PARAMETER PartnerComputerName
-    AG partner node. When set, password is updated on both nodes, then the
-    graceful rolling restart/failover sequence runs.
+    Vault security (honest model)
+      - Ciphertext: ConvertFrom-SecureString -Key <32-byte AES key>
+      - Key file: DPAPI LocalMachine (decryptable by any admin/SYSTEM on the machine that created it)
+      - ACL: Administrators + SYSTEM only
+      - NOT a secrets manager. Equivalent to "any local admin on the vault host can recover passwords."
+      - Prefer a local path (default: $env:ProgramData\SqlServiceAccountVault). A UNC works, but the
+        DPAPI key is still bound to the machine that runs the script — run it from one dedicated host.
+      - Prefer gMSA when possible (script skips those; AD manages the secret).
 
 .PARAMETER SqlInstance
-    SQL instance used for AG discovery/failover on ComputerName.
-    Default: ComputerName (default instance). Use SERVER\INSTANCE for named.
-
-.PARAMETER PartnerSqlInstance
-    SQL instance on the partner. Default: PartnerComputerName.
+    Any replica or standalone instance. AG partner nodes are discovered automatically.
 
 .PARAMETER AvailabilityGroup
-    AG name(s) to failover. Omit to failover every AG found on the pair.
+    Limit to specific AG name(s). Default: all AGs on the instance (if any).
 
 .PARAMETER InstanceName
-    Limit Get-DbaService to specific instance name(s).
+    Limit Engine/Agent services to these SQL instance names.
 
 .PARAMETER Credential
-    Windows credential for remote service WMI (Get/Update/Restart-DbaService).
+    Windows cred for remote Get/Update/Restart-DbaService.
 
 .PARAMETER SqlCredential
-    SQL login for Get-DbaAvailabilityGroup / Invoke-DbaAgFailover.
+    SQL login for AG discovery / failover.
 
 .PARAMETER IncludeDomain
-    Rotate domain accounts (default $true). Local/built-in/gMSA still skipped.
+    Rotate domain accounts (default $true). Built-in / gMSA always skipped.
 
 .PARAMETER SkipAdPasswordReset
-    Do not call Set-ADAccountPassword. Use when AD was already rotated
-    out-of-band and you only need to refresh the service logon cache.
+    AD already has the new password; only refresh service caches.
 
 .PARAMETER SkipRestart
-    Update passwords + vault only; do not restart or failover.
+    Update + vault only (no restart/failover).
 
 .PARAMETER SkipFailback
-    After failing over to the partner, leave roles there (no failback).
+    After AG failover + both restarts, leave primary on the partner.
 
 .PARAMETER Unattended
-    Skip shared-account interactive confirmation; skip conflicting accounts.
+    Skip shared-account conflicts automatically.
 
 .PARAMETER InstallModule
-    Allow Install-Module dbatools -Scope CurrentUser when missing.
+    Allow Install-Module dbatools -Scope CurrentUser if missing.
 
 .PARAMETER OutputFolder
-    Vault, key, history CSV, and transcript location.
-
-.PARAMETER PasswordLength
-    Generated password length (default 18).
-
-.PARAMETER SyncTimeoutSeconds
-    Max wait for AG replica sync before failover/failback (default 300).
+    Vault / key / history / transcript. Default: local ProgramData (not a share).
 
 .EXAMPLE
-    # Standalone node
-    .\RotateSqlServiceAccount.ps1 -ComputerName SQL01 -Confirm:$false
+    # Standalone or AG — topology auto-detected
+    .\RotateSqlServiceAccount.ps1 -SqlInstance SQL01 -Confirm:$false
 
 .EXAMPLE
-    # AG pair: rotate both, restart secondary, failover, restart former primary, fail back
-    .\RotateSqlServiceAccount.ps1 `
-        -ComputerName SQL01 -PartnerComputerName SQL02 `
-        -AvailabilityGroup 'AG1' -Unattended -Confirm:$false
-
-.NOTES
-    Requires: dbatools, local admin on target nodes, permissions to failover AGs.
-    Vault key is DPAPI LocalMachine-scoped — unreadable after OS rebuild.
+    .\RotateSqlServiceAccount.ps1 -SqlInstance SQL01\INST1 -AvailabilityGroup AG1 -Unattended -Confirm:$false
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
-    [string]$ComputerName = $env:COMPUTERNAME,
-    [string]$PartnerComputerName,
+    [Parameter(Mandatory)]
     [string]$SqlInstance,
-    [string]$PartnerSqlInstance,
+
     [string[]]$AvailabilityGroup,
     [string[]]$InstanceName,
     [PSCredential]$Credential,
@@ -108,7 +85,7 @@ param(
     [switch]$SkipFailback,
     [switch]$Unattended,
     [switch]$InstallModule,
-    [string]$OutputFolder = '\\DBAPRDAG03\C$\Temp\SecureCreds',
+    [string]$OutputFolder = $(Join-Path $env:ProgramData 'SqlServiceAccountVault'),
     [ValidateRange(12, 128)]
     [int]$PasswordLength = 18,
     [ValidateRange(30, 3600)]
@@ -116,19 +93,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-
-if (-not $SqlInstance) { $SqlInstance = $ComputerName }
-if ($PartnerComputerName -and -not $PartnerSqlInstance) { $PartnerSqlInstance = $PartnerComputerName }
-
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $vaultPath = Join-Path $OutputFolder 'SqlServiceAccountVault.xml'
 $keyPath   = Join-Path $OutputFolder 'vault.key'
 $mutexName = 'Global\SqlServiceAccountVault'
-$agPair    = [bool]$PartnerComputerName
-$nodes     = @($ComputerName) + @(if ($agPair) { $PartnerComputerName })
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Small helpers
 # ---------------------------------------------------------------------------
 function Set-RestrictedAcl {
     param([string]$Path, [switch]$Container)
@@ -137,10 +108,10 @@ function Set-RestrictedAcl {
         $acl.SetAccessRuleProtection($true, $false)
         foreach ($id in 'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM') {
             $rule = if ($Container) {
-                [System.Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.AccessControl.FileSystemAccessRule]::new(
                     $id, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
             } else {
-                [System.Security.AccessControl.FileSystemAccessRule]::new($id, 'FullControl', 'Allow')
+                [Security.AccessControl.FileSystemAccessRule]::new($id, 'FullControl', 'Allow')
             }
             $acl.AddAccessRule($rule)
         }
@@ -153,127 +124,184 @@ function Set-RestrictedAcl {
 function Get-OrCreateMachineKey {
     param([string]$Path)
     Add-Type -AssemblyName System.Security -ErrorAction Stop
-
     if (Test-Path -Path $Path) {
-        $bytes = [IO.File]::ReadAllBytes($Path)
         try {
             return [Security.Cryptography.ProtectedData]::Unprotect(
-                $bytes, $null, [Security.Cryptography.DataProtectionScope]::LocalMachine)
+                [IO.File]::ReadAllBytes($Path), $null,
+                [Security.Cryptography.DataProtectionScope]::LocalMachine)
         } catch {
-            throw "Vault key at $Path is unreadable (machine rebuilt?). Reset vault/key. $_"
+            throw "Vault key unreadable at $Path (wrong host / OS rebuilt?). $_"
         }
     }
 
-    Write-Host 'No vault key found - creating LocalMachine DPAPI key (first run).' -ForegroundColor Cyan
+    Write-Host 'Creating LocalMachine DPAPI vault key (first run).' -ForegroundColor Cyan
     $key = New-Object byte[] 32
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($key) } finally { $rng.Dispose() }
-    $protected = [Security.Cryptography.ProtectedData]::Protect(
-        $key, $null, [Security.Cryptography.DataProtectionScope]::LocalMachine)
-    [IO.File]::WriteAllBytes($Path, $protected)
+    [IO.File]::WriteAllBytes(
+        $Path,
+        [Security.Cryptography.ProtectedData]::Protect(
+            $key, $null, [Security.Cryptography.DataProtectionScope]::LocalMachine))
     Set-RestrictedAcl -Path $Path
     return $key
 }
 
 function New-StrongPassword {
     param([int]$Length = 18)
-    # Guaranteed charset mix + CSPRNG; no nested helper function.
     $sets = @(
-        'ABCDEFGHJKLMNPQRSTUVWXYZ',
-        'abcdefghijkmnopqrstuvwxyz',
-        '23456789',
+        'ABCDEFGHJKLMNPQRSTUVWXYZ'
+        'abcdefghijkmnopqrstuvwxyz'
+        '23456789'
         '!@#$%^&*_-+='
     )
     $all = -join $sets
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try {
-        $pick = {
-            param([string]$Alphabet)
+        $next = {
+            param([int]$Max)
             $b = [byte[]]::new(4)
-            $max = $Alphabet.Length
-            do {
-                $rng.GetBytes($b)
-                $v = [BitConverter]::ToUInt32($b, 0)
-            } while ($v -ge ([uint32]::MaxValue - ([uint32]::MaxValue % [uint32]$max)))
-            $Alphabet[$v % $max]
+            do { $rng.GetBytes($b); $v = [BitConverter]::ToUInt32($b, 0) }
+            while ($v -ge ([uint32]::MaxValue - ([uint32]::MaxValue % [uint32]$Max)))
+            [int]($v % [uint32]$Max)
         }
-
-        $chars = [char[]]::new($Length)
-        for ($i = 0; $i -lt $sets.Count; $i++) { $chars[$i] = & $pick $sets[$i] }
-        for ($i = $sets.Count; $i -lt $Length; $i++) { $chars[$i] = & $pick $all }
-
-        # Fisher-Yates
-        for ($i = $Length - 1; $i -gt 0; $i--) {
-            $b = [byte[]]::new(4)
-            do {
-                $rng.GetBytes($b)
-                $v = [BitConverter]::ToUInt32($b, 0)
-            } while ($v -ge ([uint32]::MaxValue - ([uint32]::MaxValue % [uint32]($i + 1))))
-            $j = [int]($v % [uint32]($i + 1))
-            $tmp = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $tmp
+        $chars = [System.Collections.Generic.List[char]]::new()
+        foreach ($s in $sets) { $chars.Add($s[& $next $s.Length]) }
+        while ($chars.Count -lt $Length) { $chars.Add($all[& $next $all.Length]) }
+        for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+            $j = & $next ($i + 1)
+            $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t
         }
-        return -join $chars
-    } finally {
-        $rng.Dispose()
-    }
+        -join $chars
+    } finally { $rng.Dispose() }
 }
 
 function Test-AccountEligible {
     param([string]$StartName, [string]$ForComputer, [bool]$IncludeDomain)
     if ($StartName -match '^(LocalSystem|NT AUTHORITY\\|NT SERVICE\\)') {
-        return @{ Ok = $false; Reason = 'built-in account' }
+        return @{ Ok = $false; Reason = 'built-in' }
     }
-    if ($StartName -match '\$$') {
-        return @{ Ok = $false; Reason = 'gMSA (AD-managed)' }
+    if ($StartName -match '\$$') { return @{ Ok = $false; Reason = 'gMSA' } }
+    $local = $StartName -match "^$([regex]::Escape($ForComputer))\\|^\.\\"
+    if (($StartName -match '\\') -and (-not $local) -and (-not $IncludeDomain)) {
+        return @{ Ok = $false; Reason = 'domain (pass -IncludeDomain)' }
     }
-    $isLocal = $StartName -match "^$([regex]::Escape($ForComputer))\\|^\.\\"
-    if (($StartName -match '\\') -and (-not $isLocal) -and (-not $IncludeDomain)) {
-        return @{ Ok = $false; Reason = 'domain account (use -IncludeDomain)' }
-    }
-    return @{ Ok = $true; Reason = $null }
+    @{ Ok = $true; Reason = $null }
+}
+
+function Test-IsDomainAccount {
+    param([string]$Account, [string]$Computer)
+    ($Account -match '\\') -and ($Account -notmatch "^$([regex]::Escape($Computer))\\|^\.\\")
 }
 
 function Read-Vault {
     param([string]$Path)
     if (-not (Test-Path -Path $Path)) { return @{} }
-    return @{} + (Import-Clixml -Path $Path)
+    @{} + (Import-Clixml -Path $Path)
 }
 
 function Write-VaultAtomic {
     param([hashtable]$Vault, [string]$Path)
     $temp = "$Path.tmp"
     $Vault | Export-Clixml -Path $temp -Force
-    $check = Import-Clixml -Path $temp
-    if (@($check.Keys).Count -ne @($Vault.Keys).Count) {
-        Remove-Item -Path $temp -Force -ErrorAction SilentlyContinue
-        throw 'Vault integrity check failed - previous vault left untouched.'
+    if (@((Import-Clixml -Path $temp).Keys).Count -ne @($Vault.Keys).Count) {
+        Remove-Item $temp -Force -ErrorAction SilentlyContinue
+        throw 'Vault integrity check failed — previous vault untouched.'
     }
-    if (Test-Path -Path $Path) { Copy-Item -Path $Path -Destination "$Path.bak" -Force }
-    Move-Item -Path $temp -Destination $Path -Force
+    if (Test-Path $Path) { Copy-Item $Path "$Path.bak" -Force }
+    Move-Item $temp $Path -Force
+    Set-RestrictedAcl -Path $Path
 }
 
-function Get-SqlServices {
-    param(
-        [string]$Computer,
-        [string[]]$InstanceName,
-        [PSCredential]$Credential
-    )
-    $p = @{
-        ComputerName    = $Computer
-        Type            = 'Engine', 'Agent'
-        EnableException = $true
-    }
-    if ($InstanceName) { $p.InstanceName = $InstanceName }
+function Get-NodeComputer {
+    param([string]$Instance, [PSCredential]$Credential)
+    $p = @{ ComputerName = $Instance }
     if ($Credential) { $p.Credential = $Credential }
-    Get-DbaService @p
+    $resolved = Resolve-DbaNetworkName @p
+    if (-not $resolved.FullComputerName) { throw "Could not resolve computer name for $Instance" }
+    $resolved.FullComputerName
 }
 
-function Update-SqlServicePassword {
+function Get-TargetTopology {
+    <#
+      Returns:
+        Mode            = Standalone | AvailabilityGroup
+        SeedSqlInstance = caller seed
+        Nodes           = @( @{ ComputerName; SqlInstance } )
+        AgNames         = string[]
+        OriginalPrimary = sql instance name of current primary (AG only)
+    #>
     param(
-        [object[]]$Services,
-        [securestring]$SecurePassword,
+        [string]$SqlInstance,
+        [string[]]$AvailabilityGroup,
+        [PSCredential]$SqlCredential,
         [PSCredential]$Credential
     )
+
+    $agParams = @{ SqlInstance = $SqlInstance; EnableException = $true }
+    if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
+    if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
+
+    # Connection errors bubble up. Empty result => standalone (no AG on this instance).
+    $ags = @(Get-DbaAvailabilityGroup @agParams)
+
+    if (-not $ags) {
+        $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential
+        return [pscustomobject]@{
+            Mode            = 'Standalone'
+            SeedSqlInstance = $SqlInstance
+            Nodes           = @([pscustomobject]@{ ComputerName = $computer; SqlInstance = $SqlInstance })
+            AgNames         = @()
+            OriginalPrimary = $SqlInstance
+        }
+    }
+
+    $agNames = @($ags.Name | Select-Object -Unique)
+    $replicaSql = @(
+        $ags |
+            ForEach-Object { $_.AvailabilityReplicas.Name } |
+            Select-Object -Unique
+    )
+    if ($replicaSql.Count -lt 1) { throw "AGs found ($($agNames -join ', ')) but no replicas." }
+
+    $nodes = foreach ($rep in $replicaSql) {
+        [pscustomobject]@{
+            ComputerName = (Get-NodeComputer -Instance $rep -Credential $Credential)
+            SqlInstance  = $rep
+        }
+    }
+
+    # De-dupe computers (rare: multiple instances same host)
+    $nodes = @($nodes | Group-Object ComputerName | ForEach-Object {
+            $_.Group | Select-Object -First 1
+        })
+
+    [pscustomobject]@{
+        Mode            = 'AvailabilityGroup'
+        SeedSqlInstance = $SqlInstance
+        Nodes           = $nodes
+        AgNames         = $agNames
+        OriginalPrimary = $ags[0].PrimaryReplicaServerName
+    }
+}
+
+function Reset-DomainAccountPassword {
+    param([string]$Account, [securestring]$SecurePassword, [string]$LocalComputer)
+    if (-not (Test-IsDomainAccount -Account $Account -Computer $LocalComputer)) { return }
+
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+        throw @"
+Domain account '$Account' needs Set-ADAccountPassword, but ActiveDirectory module is missing.
+Install RSAT ActiveDirectory, or reset AD yourself and re-run with -SkipAdPasswordReset.
+"@
+    }
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $sam = $Account.Split('\')[-1]
+    Write-Host "  AD: Set-ADAccountPassword $sam" -ForegroundColor DarkCyan
+    Set-ADAccountPassword -Identity $sam -NewPassword $SecurePassword -Reset -ErrorAction Stop
+}
+
+function Update-NodeServicePassword {
+    param([object[]]$Services, [securestring]$SecurePassword, [PSCredential]$Credential)
     $p = @{
         InputObject     = $Services
         SecurePassword  = $SecurePassword
@@ -285,110 +313,53 @@ function Update-SqlServicePassword {
     Update-DbaServiceAccount @p
 }
 
-function Reset-DomainAccountPassword {
-    <#
-      Update-DbaServiceAccount only refreshes the Windows service logon cache.
-      Domain accounts also need the AD password changed (once) or SQL won't start.
-    #>
-    param(
-        [string]$Account,
-        [securestring]$SecurePassword,
-        [string]$LocalComputer
-    )
-
-    $isDomain = ($Account -match '\\') -and ($Account -notmatch "^$([regex]::Escape($LocalComputer))\\|^\.\\")
-    if (-not $isDomain) { return }
-
-    $sam = $Account.Split('\')[-1]
-    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-        throw @"
-Domain account '$Account' needs an AD password reset, but the ActiveDirectory
-module is not available. Either:
-  - Install RSAT ActiveDirectory and re-run, or
-  - Reset the AD password yourself, then re-run with -SkipAdPasswordReset
-"@
-    }
-
-    Import-Module ActiveDirectory -ErrorAction Stop
-    Write-Host "  Set-ADAccountPassword -Identity $sam -Reset" -ForegroundColor DarkCyan
-    Set-ADAccountPassword -Identity $sam -NewPassword $SecurePassword -Reset -ErrorAction Stop
-}
-
 function Restart-SqlEngineAgent {
-    param(
-        [string]$Computer,
-        [string[]]$InstanceName,
-        [object[]]$InputObject,
-        [PSCredential]$Credential
-    )
+    param([string]$Computer, [string[]]$InstanceName, [PSCredential]$Credential)
     $p = @{
+        ComputerName    = $Computer
+        Type            = 'Engine', 'Agent'
         Force           = $true
         Confirm         = $false
         EnableException = $true
     }
-    if ($InputObject) {
-        $p.InputObject = $InputObject
-    } else {
-        $p.ComputerName = $Computer
-        $p.Type = 'Engine', 'Agent'
-        if ($InstanceName) { $p.InstanceName = $InstanceName }
-    }
+    if ($InstanceName) { $p.InstanceName = $InstanceName }
     if ($Credential) { $p.Credential = $Credential }
-
-    Write-Host "  Restarting Engine/Agent on $Computer ..." -ForegroundColor Cyan
+    Write-Host "  Restart Engine/Agent on $Computer" -ForegroundColor Cyan
     $result = Restart-DbaService @p
-    $failed = @($result | Where-Object { $_.Status -eq 'Failed' -or $_.State -ne 'Running' })
-    if ($failed.Count) {
-        throw "Restart failed/not Running on ${Computer}: $(($failed.ServiceName) -join ', ')"
-    }
+    $bad = @($result | Where-Object { $_.Status -eq 'Failed' -or $_.State -ne 'Running' })
+    if ($bad) { throw "Restart failed on ${Computer}: $(($bad.ServiceName) -join ', ')" }
 }
 
-function Test-ReplicaNameMatch {
+function Test-ReplicaMatch {
     param([string]$ReplicaName, [string]$SqlInstance)
     if (-not $ReplicaName -or -not $SqlInstance) { return $false }
     if ($ReplicaName -eq $SqlInstance) { return $true }
-    # Compare host part case-insensitively (named instances: HOST\INST)
-    $rHost = $ReplicaName.Split('\')[0]
-    $sHost = $SqlInstance.Split('\')[0]
-    if ($rHost -eq $sHost -and $ReplicaName.Contains('\') -eq $SqlInstance.Contains('\')) {
-        if (-not $ReplicaName.Contains('\')) { return $true }
-        return $ReplicaName.Split('\')[1] -eq $SqlInstance.Split('\')[1]
-    }
-    return ($rHost -eq $sHost)
+    $r = $ReplicaName.Split('\'); $s = $SqlInstance.Split('\')
+    if ($r[0] -ne $s[0]) { return $false }
+    if ($r.Count -eq 1 -and $s.Count -eq 1) { return $true }
+    if ($r.Count -gt 1 -and $s.Count -gt 1) { return $r[1] -eq $s[1] }
+    $true
 }
 
-function Wait-AgReplicaReady {
+function Wait-AgReady {
     param(
         [string]$SqlInstance,
-        [PSCredential]$SqlCredential,
-        [string[]]$AvailabilityGroup,
+        [string[]]$AgNames,
         [string]$SecondarySqlInstance,
+        [PSCredential]$SqlCredential,
         [int]$TimeoutSeconds
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        $agParams = @{
-            SqlInstance     = $SqlInstance
-            EnableException = $true
-        }
-        if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
-        if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
-
-        $ags = @(Get-DbaAvailabilityGroup @agParams)
-        if (-not $ags) { throw "No availability groups found on $SqlInstance." }
-
+        $p = @{ SqlInstance = $SqlInstance; AvailabilityGroup = $AgNames; EnableException = $true }
+        if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
+        $ags = @(Get-DbaAvailabilityGroup @p)
         $pending = foreach ($ag in $ags) {
-            $replicas = @($ag.AvailabilityReplicas)
-            $target = $replicas | Where-Object {
-                Test-ReplicaNameMatch -ReplicaName $_.Name -SqlInstance $SecondarySqlInstance
-            } | Select-Object -First 1
-
+            $target = $ag.AvailabilityReplicas | Where-Object { Test-ReplicaMatch $_.Name $SecondarySqlInstance } | Select-Object -First 1
             if (-not $target) {
-                [pscustomobject]@{ Ag = $ag.Name; Why = "replica $SecondarySqlInstance not found" }
+                [pscustomobject]@{ Ag = $ag.Name; Why = "missing $SecondarySqlInstance" }
                 continue
             }
-
-            # Prefer Synchronized (safe failover). Synchronizing allowed for async replicas.
             $sync = [string]$target.RollupSynchronizationState
             $conn = [string]$target.ConnectionState
             $mode = [string]$target.AvailabilityMode
@@ -397,34 +368,22 @@ function Wait-AgReplicaReady {
                 ($mode -match 'Asynchronous' -and $sync -eq 'Synchronizing')
             )
             if (-not $ok) {
-                [pscustomobject]@{ Ag = $ag.Name; Why = "$($target.Name) conn=$conn sync=$sync mode=$mode" }
+                [pscustomobject]@{ Ag = $ag.Name; Why = "$($target.Name) $conn/$sync" }
             }
         }
-
-        if (-not $pending) { return $ags }
-
-        Write-Host ("  Waiting for AG sync: " + (($pending | ForEach-Object { "$($_.Ag) ($($_.Why))" }) -join '; ')) -ForegroundColor DarkYellow
+        if (-not $pending) { return }
+        Write-Host ("  Wait sync: " + (($pending | ForEach-Object { "$($_.Ag)=$($_.Why)" }) -join '; ')) -ForegroundColor DarkYellow
         Start-Sleep -Seconds 5
     } while ((Get-Date) -lt $deadline)
-
-    throw "Timed out after ${TimeoutSeconds}s waiting for AG sync toward $SecondarySqlInstance."
+    throw "AG sync timeout (${TimeoutSeconds}s) waiting on $SecondarySqlInstance"
 }
 
-function Invoke-AgRollingRestart {
-    <#
-      Graceful apply sequence (password already set with -NoRestart on both nodes):
-        1) Restart SECONDARY services
-        2) Failover to secondary (Invoke-DbaAgFailover, no -Force)
-        3) Restart FORMER PRIMARY (now secondary)
-        4) Fail back to original primary (unless -SkipFailback)
-    #>
+function Invoke-GracefulAgApply {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param(
-        [string]$HomeComputer,
-        [string]$PartnerComputer,
-        [string]$HomeSqlInstance,
-        [string]$PartnerSqlInstance,
-        [string[]]$AvailabilityGroup,
+        [object[]]$Nodes,
+        [string[]]$AgNames,
+        [string]$OriginalPrimary,
         [string[]]$InstanceName,
         [PSCredential]$Credential,
         [PSCredential]$SqlCredential,
@@ -432,100 +391,79 @@ function Invoke-AgRollingRestart {
         [switch]$SkipFailback
     )
 
-    Write-Host "`n=== AG rolling apply ===" -ForegroundColor Cyan
-    Write-Host "Home (preferred primary): $HomeComputer ($HomeSqlInstance)" -ForegroundColor Cyan
-    Write-Host "Partner:                  $PartnerComputer ($PartnerSqlInstance)" -ForegroundColor Cyan
-
-    # Discover current primary from home instance
-    $getAg = @{ SqlInstance = $HomeSqlInstance; EnableException = $true }
-    if ($SqlCredential) { $getAg.SqlCredential = $SqlCredential }
-    if ($AvailabilityGroup) { $getAg.AvailabilityGroup = $AvailabilityGroup }
-    $ags = @(Get-DbaAvailabilityGroup @getAg)
-    if (-not $ags) { throw "No AGs on $HomeSqlInstance. Pass -AvailabilityGroup or omit Partner for standalone." }
-
-    $agNames = @($ags.Name | Select-Object -Unique)
-    Write-Host "Availability groups: $($agNames -join ', ')" -ForegroundColor Cyan
-
-    # Resolve which computer is currently secondary (restart that one first)
-    $primaryName = $ags[0].PrimaryReplicaServerName
-    $homeIsPrimary = $primaryName -eq $HomeSqlInstance -or
-        $primaryName.Split('\')[0] -eq $HomeComputer -or
-        $primaryName -eq $HomeComputer
-
-    if ($homeIsPrimary) {
-        $currentPrimarySql = $HomeSqlInstance
-        $currentSecondarySql = $PartnerSqlInstance
-        $currentSecondaryComputer = $PartnerComputer
-        $currentPrimaryComputer = $HomeComputer
-    } else {
-        $currentPrimarySql = $PartnerSqlInstance
-        $currentSecondarySql = $HomeSqlInstance
-        $currentSecondaryComputer = $HomeComputer
-        $currentPrimaryComputer = $PartnerComputer
-        Write-Warning "Home node is not primary right now (primary=$primaryName). Continuing with actual roles."
+    $bySql = @{}; foreach ($n in $Nodes) { $bySql[$n.SqlInstance] = $n }
+    # Map original primary / find a secondary
+    $primarySql = $OriginalPrimary
+    if (-not $bySql.ContainsKey($primarySql)) {
+        $mapped = $Nodes | Where-Object {
+            (Test-ReplicaMatch -ReplicaName $OriginalPrimary -SqlInstance $_.SqlInstance) -or
+            ($_.ComputerName -eq $OriginalPrimary.Split('\')[0])
+        } | Select-Object -First 1
+        $primarySql = $mapped.SqlInstance
     }
+    if (-not $primarySql) { throw "Could not map primary '$OriginalPrimary' to discovered nodes." }
 
-    # Remember original primary so failback restores topology (not always -ComputerName).
-    $originalPrimarySql = $currentPrimarySql
-    $originalSecondarySql = $currentSecondarySql
+    $secondary = $Nodes | Where-Object { $_.SqlInstance -ne $primarySql } | Select-Object -First 1
+    if (-not $secondary) { throw 'AG mode requires at least two replicas.' }
+    $primary = $bySql[$primarySql]
 
-    if (-not $PSCmdlet.ShouldProcess($currentSecondaryComputer, 'Restart SQL Engine/Agent (secondary first)')) { return }
+    Write-Host "`n=== AG apply ===" -ForegroundColor Cyan
+    Write-Host "AGs: $($AgNames -join ', ')" -ForegroundColor Cyan
+    Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
+    Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
-    # 1) Restart secondary
-    Restart-SqlEngineAgent -Computer $currentSecondaryComputer -InstanceName $InstanceName -Credential $Credential
-    Wait-AgReplicaReady -SqlInstance $currentPrimarySql -SqlCredential $SqlCredential `
-        -AvailabilityGroup $agNames -SecondarySqlInstance $currentSecondarySql -TimeoutSeconds $SyncTimeoutSeconds
+    if (-not $PSCmdlet.ShouldProcess($secondary.ComputerName, 'Restart secondary')) { return }
+    Restart-SqlEngineAgent -Computer $secondary.ComputerName -InstanceName $InstanceName -Credential $Credential
+    Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
+        -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    # 2) Failover to secondary
-    if (-not $PSCmdlet.ShouldProcess($currentSecondarySql, "Graceful failover AG(s): $($agNames -join ', ')")) { return }
-    Write-Host "  Failing over to $currentSecondarySql ..." -ForegroundColor Cyan
+    if (-not $PSCmdlet.ShouldProcess($secondary.SqlInstance, "Failover $($AgNames -join ', ')")) { return }
+    Write-Host "  Failover -> $($secondary.SqlInstance)" -ForegroundColor Cyan
     $fo = @{
-        SqlInstance       = $currentSecondarySql
-        AvailabilityGroup = $agNames
-        Confirm           = $false
-        EnableException   = $true
+        SqlInstance = $secondary.SqlInstance; AvailabilityGroup = $AgNames
+        Confirm = $false; EnableException = $true
     }
     if ($SqlCredential) { $fo.SqlCredential = $SqlCredential }
     Invoke-DbaAgFailover @fo | Out-Null
-
     Start-Sleep -Seconds 3
-    Wait-AgReplicaReady -SqlInstance $currentSecondarySql -SqlCredential $SqlCredential `
-        -AvailabilityGroup $agNames -SecondarySqlInstance $currentPrimarySql -TimeoutSeconds $SyncTimeoutSeconds
+    Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
+        -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    # 3) Restart former primary (now secondary)
-    if (-not $PSCmdlet.ShouldProcess($currentPrimaryComputer, 'Restart SQL Engine/Agent (former primary)')) { return }
-    Restart-SqlEngineAgent -Computer $currentPrimaryComputer -InstanceName $InstanceName -Credential $Credential
-    Wait-AgReplicaReady -SqlInstance $currentSecondarySql -SqlCredential $SqlCredential `
-        -AvailabilityGroup $agNames -SecondarySqlInstance $currentPrimarySql -TimeoutSeconds $SyncTimeoutSeconds
+    if (-not $PSCmdlet.ShouldProcess($primary.ComputerName, 'Restart former primary')) { return }
+    Restart-SqlEngineAgent -Computer $primary.ComputerName -InstanceName $InstanceName -Credential $Credential
+    Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
+        -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
     if ($SkipFailback) {
-        Write-Warning "SkipFailback set - primary remains on $currentSecondarySql."
+        Write-Warning "SkipFailback: primary left on $($secondary.SqlInstance)"
         return
     }
 
-    # 4) Fail back to the primary we started with
-    if (-not $PSCmdlet.ShouldProcess($originalPrimarySql, "Graceful failback AG(s): $($agNames -join ', ')")) { return }
-    Write-Host "  Failing back to $originalPrimarySql ..." -ForegroundColor Cyan
+    if (-not $PSCmdlet.ShouldProcess($primary.SqlInstance, "Failback $($AgNames -join ', ')")) { return }
+    Write-Host "  Failback -> $($primary.SqlInstance)" -ForegroundColor Cyan
     $fb = @{
-        SqlInstance       = $originalPrimarySql
-        AvailabilityGroup = $agNames
-        Confirm           = $false
-        EnableException   = $true
+        SqlInstance = $primary.SqlInstance; AvailabilityGroup = $AgNames
+        Confirm = $false; EnableException = $true
     }
     if ($SqlCredential) { $fb.SqlCredential = $SqlCredential }
     Invoke-DbaAgFailover @fb | Out-Null
-
-    Wait-AgReplicaReady -SqlInstance $originalPrimarySql -SqlCredential $SqlCredential `
-        -AvailabilityGroup $agNames -SecondarySqlInstance $originalSecondarySql -TimeoutSeconds $SyncTimeoutSeconds
-
-    Write-Host "  AG rolling apply complete (primary restored on $originalPrimarySql)." -ForegroundColor Green
+    Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
+        -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
+    Write-Host "  Done. Primary restored on $($primary.SqlInstance)." -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-if (-not (Test-Path -Path $OutputFolder)) {
-    New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+if ($OutputFolder -match '^\\\\') {
+    Write-Warning @"
+OutputFolder is a UNC path. DPAPI key is bound to THIS machine ($env:COMPUTERNAME).
+Always run rotation from the same host, or vault recovery will fail. Prefer a local ProgramData path.
+"@
+}
+
+if (-not (Test-Path $OutputFolder)) {
+    New-Item $OutputFolder -ItemType Directory -Force | Out-Null
     Set-RestrictedAcl -Path $OutputFolder -Container
 }
 
@@ -533,10 +471,7 @@ Start-Transcript -Path (Join-Path $OutputFolder "RotateSqlServiceAccount_$timest
 
 try {
     if (-not (Get-Module -ListAvailable -Name dbatools)) {
-        if (-not $InstallModule) {
-            throw 'dbatools not found. Install it, or re-run with -InstallModule.'
-        }
-        Write-Host 'Installing dbatools (CurrentUser)...' -ForegroundColor Cyan
+        if (-not $InstallModule) { throw 'dbatools missing. Install it or pass -InstallModule.' }
         Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
     }
     Import-Module dbatools -ErrorAction Stop
@@ -545,91 +480,84 @@ try {
     $mutex = [Threading.Mutex]::new($false, $mutexName)
     $gotLock = $false
     try {
-        try {
-            $gotLock = $mutex.WaitOne([TimeSpan]::FromSeconds(60))
-        } catch [Threading.AbandonedMutexException] {
-            Write-Warning 'Recovered abandoned vault lock from a previous run.'
+        try { $gotLock = $mutex.WaitOne([TimeSpan]::FromSeconds(60)) }
+        catch [Threading.AbandonedMutexException] {
+            Write-Warning 'Recovered abandoned vault lock.'
             $gotLock = $true
         }
-        if (-not $gotLock) { throw 'Could not acquire vault lock within 60s.' }
+        if (-not $gotLock) { throw 'Vault lock timeout (60s).' }
 
+        # ---- 1) Topology (standalone or AG) ----
+        $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
+            -SqlCredential $SqlCredential -Credential $Credential
+
+        Write-Host "`nMode: $($topo.Mode)" -ForegroundColor Cyan
+        $topo.Nodes | Format-Table ComputerName, SqlInstance -AutoSize
+        if ($topo.AgNames) { Write-Host "AGs: $($topo.AgNames -join ', ')" -ForegroundColor Cyan }
+
+        $computers = @($topo.Nodes.ComputerName | Select-Object -Unique)
         $machineKey = Get-OrCreateMachineKey -Path $keyPath
         $vault = Read-Vault -Path $vaultPath
 
-        # Discover services on all nodes in scope
-        $allServices = foreach ($node in $nodes) {
+        # ---- 2) Discover services on all nodes ----
+        $allServices = foreach ($node in $topo.Nodes) {
             $svcCred = $null
-            $isRemote = $node -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-            if ($Credential -and $isRemote) { $svcCred = $Credential }
-            Get-SqlServices -Computer $node -InstanceName $InstanceName -Credential $svcCred
+            $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+            if ($Credential -and $remote) { $svcCred = $Credential }
+            $gp = @{
+                ComputerName = $node.ComputerName; Type = 'Engine', 'Agent'; EnableException = $true
+            }
+            if ($InstanceName) { $gp.InstanceName = $InstanceName }
+            if ($svcCred) { $gp.Credential = $svcCred }
+            Get-DbaService @gp
         }
         $allServices = @($allServices)
-        if (-not $allServices) { throw "No SQL Engine/Agent services found on: $($nodes -join ', ')" }
+        if (-not $allServices) { throw "No Engine/Agent services on: $($computers -join ', ')" }
 
-        Write-Host "`nDetected SQL services:" -ForegroundColor Cyan
+        Write-Host "`nServices:" -ForegroundColor Cyan
         $allServices | Select-Object ComputerName, ServiceName, State, StartName | Format-Table -AutoSize
 
-        # Eligible accounts (grouped across nodes so one password covers the AG pair)
         $groups = $allServices | Group-Object StartName | Where-Object {
-            $sampleComputer = @($_.Group.ComputerName)[0]
-            $check = Test-AccountEligible -StartName $_.Name -ForComputer $sampleComputer -IncludeDomain $IncludeDomain
-            if (-not $check.Ok) {
-                Write-Host "Skipping $($_.Name): $($check.Reason)" -ForegroundColor Yellow
-                return $false
-            }
+            $c = Test-AccountEligible -StartName $_.Name -ForComputer @($_.Group.ComputerName)[0] -IncludeDomain $IncludeDomain
+            if (-not $c.Ok) { Write-Host "Skip $($_.Name): $($c.Reason)" -ForegroundColor Yellow; return $false }
             $true
         }
+        if (-not $groups) { Write-Warning 'No eligible accounts.'; return }
 
-        if (-not $groups) {
-            Write-Warning 'No eligible accounts to rotate.'
-            return
-        }
-
-        # Shared-account warning (ignore AG partner — expected to share domain accounts)
-        $allowedComputers = [System.Collections.Generic.HashSet[string]]::new(
-            [string[]]$nodes, [StringComparer]::OrdinalIgnoreCase)
-
+        # Shared account outside this topology?
+        $allowed = [Collections.Generic.HashSet[string]]::new([string[]]$computers, [StringComparer]::OrdinalIgnoreCase)
         $conflicts = foreach ($g in $groups) {
             if (-not $vault.ContainsKey($g.Name)) { continue }
             $prev = $vault[$g.Name].LastComputerName
-            if ($prev -and -not $allowedComputers.Contains($prev)) {
-                [pscustomobject]@{
-                    Account         = $g.Name
-                    PreviousServer  = $prev
-                    PreviousRotated = $vault[$g.Name].LastRotatedUtc
-                }
+            if ($prev -and -not $allowed.Contains($prev)) {
+                [pscustomobject]@{ Account = $g.Name; PreviousServer = $prev; PreviousRotated = $vault[$g.Name].LastRotatedUtc }
             }
         }
 
         $skippedConflicts = @()
         if ($conflicts) {
-            Write-Host "`n*** SHARED ACCOUNT WARNING (outside this AG pair) ***" -ForegroundColor Red
+            Write-Host "`n*** SHARED ACCOUNT (outside this topology) ***" -ForegroundColor Red
             $conflicts | Format-Table -AutoSize
             if ($Unattended) {
                 $names = @($conflicts.Account)
-                $skippedConflicts = @($groups | Where-Object { $_.Name -in $names })
-                $groups = @($groups | Where-Object { $_.Name -notin $names })
-                Write-Warning "Unattended: skipped shared account(s): $($names -join ', ')"
-            } elseif (-not $PSCmdlet.ShouldProcess(($conflicts.Account -join ', '), 'Rotate shared account used on another server')) {
+                $skippedConflicts = @($groups | Where-Object Name -in $names)
+                $groups = @($groups | Where-Object Name -notin $names)
+                Write-Warning "Unattended: skipped $($names -join ', ')"
+            } elseif (-not $PSCmdlet.ShouldProcess(($conflicts.Account -join ', '), 'Rotate shared account')) {
                 return
             }
         }
-
         if (-not $groups) {
-            Write-Warning 'Nothing left to rotate after conflict filtering.'
             if ($skippedConflicts) { exit 2 }
-            return
+            Write-Warning 'Nothing to rotate.'; return
         }
 
-        Write-Host "`nPlan: rotate $($groups.Count) account(s) on $($nodes -join ', ')." -ForegroundColor Cyan
-        $groups | Select-Object Name, @{
-            N = 'Services'
-            E = { ($_.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ' }
-        } | Format-Table -AutoSize
-
+        Write-Host "`nPlan: $($groups.Count) account(s) on $($computers -join ', ')" -ForegroundColor Cyan
         if (-not $PSCmdlet.ShouldProcess("$($groups.Count) account(s)", 'Rotate password')) { return }
 
+        # ---- 3) Rotate ----
         $anyFailures = $false
+        $seedComputer = $topo.Nodes[0].ComputerName
 
         foreach ($g in $groups) {
             $account = $g.Name
@@ -637,117 +565,101 @@ try {
 
             Write-Host "`nRotating: $account" -ForegroundColor Green
             $securePwd = ConvertTo-SecureString (New-StrongPassword -Length $PasswordLength) -AsPlainText -Force
-            $updateOk = $true
+            $ok = $true
 
-            # Domain accounts: reset AD once before touching service configs
+            # Domain: AD first (required). Service cache second.
             if (-not $SkipAdPasswordReset) {
                 try {
-                    Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $ComputerName
+                    Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
                 } catch {
-                    Write-Host "  FAILED (AD password): $_" -ForegroundColor Red
-                    $updateOk = $false
-                    $anyFailures = $true
+                    Write-Host "  FAILED (AD): $_" -ForegroundColor Red
+                    $ok = $false; $anyFailures = $true
                 }
             }
 
-            # One password, every node that uses this StartName
-            foreach ($nodeName in @($g.Group.ComputerName | Select-Object -Unique)) {
-                if (-not $updateOk) { break }
-                $nodeServices = @($g.Group | Where-Object ComputerName -eq $nodeName)
+            foreach ($computer in @($g.Group.ComputerName | Select-Object -Unique)) {
+                if (-not $ok) { break }
+                $nodeServices = @($g.Group | Where-Object ComputerName -eq $computer)
                 $svcCred = $null
-                $isRemote = $nodeName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                if ($Credential -and $isRemote) { $svcCred = $Credential }
-
+                $remote = $computer -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+                if ($Credential -and $remote) { $svcCred = $Credential }
                 try {
-                    Write-Host "  Update-DbaServiceAccount -NoRestart on $nodeName" -ForegroundColor DarkCyan
-                    $result = Update-SqlServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
+                    Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer" -ForegroundColor DarkCyan
+                    $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
                     if ($result.Status -contains 'Failed') {
-                        $msg = ($result | Where-Object Status -eq 'Failed').Message -join '; '
-                        Write-Host "  FAILED on ${nodeName}: $msg" -ForegroundColor Red
-                        $updateOk = $false
-                        $anyFailures = $true
+                        Write-Host "  FAILED @ ${computer}: $((($result | Where-Object Status -eq Failed).Message) -join '; ')" -ForegroundColor Red
+                        $ok = $false; $anyFailures = $true
                     }
                 } catch {
-                    Write-Host "  FAILED on ${nodeName}: $_" -ForegroundColor Red
-                    $updateOk = $false
-                    $anyFailures = $true
+                    Write-Host "  FAILED @ ${computer}: $_" -ForegroundColor Red
+                    $ok = $false; $anyFailures = $true
                 }
             }
 
-            if ($updateOk) {
+            if ($ok) {
                 $vault[$account] = @{
                     EncryptedPassword = ConvertFrom-SecureString -SecureString $securePwd -Key $machineKey
-                    LastComputerName  = $ComputerName
-                    LastPartnerName   = $PartnerComputerName
+                    LastComputerName  = $seedComputer
+                    LastTopology      = $topo.Mode
+                    LastNodes         = ($computers -join ', ')
                     LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
                     LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
                     LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
                 }
                 Write-VaultAtomic -Vault $vault -Path $vaultPath
-                Write-Host '  Password updated (services not restarted yet).' -ForegroundColor Green
+                Write-Host '  Cached in vault (not restarted yet).' -ForegroundColor Green
             }
 
-            if ($securePwd) {
-                $securePwd.Dispose()
-                Remove-Variable securePwd -ErrorAction SilentlyContinue
-            }
+            if ($securePwd) { $securePwd.Dispose(); Remove-Variable securePwd -EA SilentlyContinue }
         }
 
-        # Controlled apply
+        # ---- 4) Apply restart / failover ----
         if (-not $SkipRestart -and -not $anyFailures) {
-            if ($agPair) {
+            if ($topo.Mode -eq 'AvailabilityGroup') {
                 $roll = @{
-                    HomeComputer        = $ComputerName
-                    PartnerComputer     = $PartnerComputerName
-                    HomeSqlInstance     = $SqlInstance
-                    PartnerSqlInstance  = $PartnerSqlInstance
-                    AvailabilityGroup   = $AvailabilityGroup
-                    InstanceName        = $InstanceName
-                    Credential          = $Credential
-                    SqlCredential       = $SqlCredential
-                    SyncTimeoutSeconds  = $SyncTimeoutSeconds
-                    SkipFailback        = $SkipFailback
+                    Nodes              = $topo.Nodes
+                    AgNames            = $topo.AgNames
+                    OriginalPrimary    = $topo.OriginalPrimary
+                    InstanceName       = $InstanceName
+                    Credential         = $Credential
+                    SqlCredential      = $SqlCredential
+                    SyncTimeoutSeconds = $SyncTimeoutSeconds
+                    SkipFailback       = $SkipFailback
                 }
-                # Propagate non-interactive confirm to nested advanced function
                 if ($Unattended -or $ConfirmPreference -eq 'None') { $roll.Confirm = $false }
-                Invoke-AgRollingRestart @roll
+                Invoke-GracefulAgApply @roll
             } else {
-                if ($PSCmdlet.ShouldProcess($ComputerName, 'Restart SQL Engine/Agent')) {
+                $node = $topo.Nodes[0]
+                if ($PSCmdlet.ShouldProcess($node.ComputerName, 'Restart Engine/Agent')) {
                     $svcCred = $null
-                    $isRemote = $ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                    if ($Credential -and $isRemote) { $svcCred = $Credential }
-                    Restart-SqlEngineAgent -Computer $ComputerName -InstanceName $InstanceName -Credential $svcCred
+                    $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+                    if ($Credential -and $remote) { $svcCred = $Credential }
+                    Restart-SqlEngineAgent -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
                 }
             }
         } elseif ($SkipRestart) {
-            Write-Warning 'SkipRestart set - password changed in the service config only. Restart/failover later to apply.'
+            Write-Warning 'SkipRestart: password updated; restart/failover later to apply.'
         }
 
-        # Non-secret history
         $reportPath = Join-Path $OutputFolder 'SqlServiceAccountVault_History.csv'
         $vault.Keys | ForEach-Object {
             $e = $vault[$_]
             [pscustomobject]@{
                 Account          = $_
                 LastComputerName = $e.LastComputerName
-                LastPartnerName  = $e.LastPartnerName
+                LastTopology     = $e.LastTopology
+                LastNodes        = $e.LastNodes
                 LastServices     = $e.LastServices
                 LastRotatedUtc   = $e.LastRotatedUtc
                 LastRotatedBy    = $e.LastRotatedBy
             }
-        } | Sort-Object Account | Export-Csv -Path $reportPath -NoTypeInformation -Force
+        } | Sort-Object Account | Export-Csv $reportPath -NoTypeInformation -Force
 
         Write-Host "`nVault:   $vaultPath" -ForegroundColor Cyan
         Write-Host "History: $reportPath (no secrets)" -ForegroundColor Cyan
 
-        if ($anyFailures) {
-            Write-Warning 'One or more updates failed.'
-            exit 1
-        }
-        if ($skippedConflicts) {
-            Write-Warning "$($skippedConflicts.Count) shared account(s) skipped - needs a coordinated pass."
-            exit 2
-        }
+        if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
+        if ($skippedConflicts) { Write-Warning "$($skippedConflicts.Count) shared account(s) skipped."; exit 2 }
     } finally {
         if ($gotLock) { [void]$mutex.ReleaseMutex() }
         $mutex.Dispose()
