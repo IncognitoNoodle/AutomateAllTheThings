@@ -7,102 +7,109 @@
 
       1. Connect and detect topology (standalone vs AG replicas)
       2. For domain accounts: reset AD password once, then Update-DbaServiceAccount -NoRestart on every node
-      3. Save ciphertext to a DPAPI-backed vault
+      3. Save ciphertext to a password-protected vault (one team password, no key file)
       4. Apply:
            Standalone -> Restart-DbaService
            AG        -> restart secondary -> Invoke-DbaAgFailover -> restart former primary -> fail back
 
-    Why AD reset is required for domain accounts
-      Update-DbaServiceAccount password mode calls SMO Service.ChangePassword only.
-      That updates the Windows service logon cache - it does NOT change Active Directory.
-      So for a newly generated password: Set-ADAccountPassword first, then Update-DbaServiceAccount.
-      Use -SkipAdPasswordReset only when AD was already rotated out-of-band.
-
-    Vault security (honest model)
-      - Ciphertext: ConvertFrom-SecureString -Key <32-byte AES key>
-      - Key file: DPAPI LocalMachine (decryptable by any admin/SYSTEM on the machine that created it)
-      - ACL: Administrators + SYSTEM only
-      - NOT a secrets manager. Equivalent to "any local admin on the vault host can recover passwords."
-      - Prefer a local path (default: $env:ProgramData\SqlServiceAccountVault). A UNC works, but the
-        DPAPI key is still bound to the machine that runs the script - run it from one dedicated host.
-      - Prefer gMSA when possible (script skips those; AD manages the secret).
+    Vault (KISS)
+      - One file: SqlServiceAccountVault.xml
+      - Secrets encrypted with AES key = SHA256(password + salt)
+      - Salt + password-check canary stored in the file
+      - ACL: Administrators + SYSTEM
+      - Open from any machine if you know the vault password
+      - Prefer gMSA when possible (script skips those)
 
 .PARAMETER SqlInstance
     Any replica or standalone instance. AG partner nodes are discovered automatically.
+    Not required with -ListVault / -RevealAccount.
 
-.PARAMETER AvailabilityGroup
-    Limit to specific AG name(s). Default: all AGs on the instance (if any).
+.PARAMETER VaultPassword
+    Password that protects the vault. Prompted if omitted.
+    Required for -Unattended (cannot prompt).
 
-.PARAMETER InstanceName
-    Limit Engine/Agent services to these SQL instance names.
+.PARAMETER ListVault
+    List vault account metadata (no secrets) and exit.
 
-.PARAMETER Credential
-    Windows cred for remote Get/Update/Restart-DbaService.
-
-.PARAMETER SqlCredential
-    SQL login for AG discovery / failover.
-
-.PARAMETER IncludeDomain
-    Rotate domain accounts (default $true). Built-in / gMSA always skipped.
-
-.PARAMETER SkipAdPasswordReset
-    AD already has the new password; only refresh service caches.
-
-.PARAMETER SkipRestart
-    Update + vault only (no restart/failover).
-
-.PARAMETER SkipFailback
-    After AG failover + both restarts, leave primary on the partner.
-
-.PARAMETER Unattended
-    Skip shared-account conflicts automatically.
-
-.PARAMETER InstallModule
-    Allow Install-Module dbatools -Scope CurrentUser if missing.
-
-.PARAMETER OutputFolder
-    Vault / key / history / transcript. Default: local ProgramData (not a share).
+.PARAMETER RevealAccount
+    Decrypt and print one account password, then exit.
 
 .EXAMPLE
-    # Standalone or AG - topology auto-detected
-    .\RotateSqlServiceAccount.ps1 -SqlInstance SQL01 -Confirm:$false
+    .\RotateSqlServiceAccount.ps1 -SqlInstance SQL01
 
 .EXAMPLE
-    .\RotateSqlServiceAccount.ps1 -SqlInstance SQL01\INST1 -AvailabilityGroup AG1 -Unattended -Confirm:$false
+    $vp = Read-Host 'Vault password' -AsSecureString
+    .\RotateSqlServiceAccount.ps1 -SqlInstance SQL01 -AvailabilityGroup AG1 -VaultPassword $vp -Unattended -Confirm:$false
+
+.EXAMPLE
+    .\RotateSqlServiceAccount.ps1 -ListVault
+    .\RotateSqlServiceAccount.ps1 -RevealAccount 'CONTOSO\sqlsvc'
 #>
 # Interactive ops script: Write-Host is intentional. Helpers are gated by script-level ShouldProcess.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+[CmdletBinding(DefaultParameterSetName = 'Rotate', SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
-    [Parameter(Mandatory)]
+    [Parameter(Mandatory, ParameterSetName = 'Rotate')]
     [string]$SqlInstance,
 
+    [Parameter(ParameterSetName = 'Rotate')]
     [string[]]$AvailabilityGroup,
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [string[]]$InstanceName,
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [PSCredential]$Credential,
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [PSCredential]$SqlCredential,
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [bool]$IncludeDomain = $true,
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [switch]$SkipAdPasswordReset,
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [switch]$SkipRestart,
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [switch]$SkipFailback,
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [switch]$Unattended,
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [switch]$InstallModule,
-    [string]$OutputFolder = $(Join-Path $env:ProgramData 'SqlServiceAccountVault'),
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [ValidateRange(12, 128)]
     [int]$PasswordLength = 18,
+
+    [Parameter(ParameterSetName = 'Rotate')]
     [ValidateRange(30, 3600)]
-    [int]$SyncTimeoutSeconds = 300
+    [int]$SyncTimeoutSeconds = 300,
+
+    [Parameter(ParameterSetName = 'ListVault', Mandatory)]
+    [switch]$ListVault,
+
+    [Parameter(ParameterSetName = 'Reveal', Mandatory)]
+    [string]$RevealAccount,
+
+    [SecureString]$VaultPassword,
+
+    [string]$OutputFolder = $(Join-Path $env:ProgramData 'SqlServiceAccountVault')
 )
 
 $ErrorActionPreference = 'Stop'
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $vaultPath = Join-Path $OutputFolder 'SqlServiceAccountVault.xml'
-$keyPath   = Join-Path $OutputFolder 'vault.key'
 $mutexName = 'Global\SqlServiceAccountVault'
+$vaultCanary = 'SqlServiceAccountVault.v2'
 
 # ---------------------------------------------------------------------------
-# Small helpers
+# Helpers
 # ---------------------------------------------------------------------------
 function Set-RestrictedAcl {
     param([string]$Path, [switch]$Container)
@@ -124,35 +131,139 @@ function Set-RestrictedAcl {
     }
 }
 
-function Get-OrCreateMachineKey {
-    param([string]$Path)
-    Add-Type -AssemblyName System.Security -ErrorAction Stop
-    if (Test-Path -Path $Path) {
-        try {
-            return [Security.Cryptography.ProtectedData]::Unprotect(
-                [IO.File]::ReadAllBytes($Path), $null,
-                [Security.Cryptography.DataProtectionScope]::LocalMachine)
-        } catch {
-            throw "Vault key unreadable at $Path (wrong host / OS rebuilt?). $_"
-        }
+function Get-VaultPasswordInput {
+    param([SecureString]$VaultPassword, [switch]$ConfirmNew, [switch]$Unattended)
+    if ($VaultPassword -and $VaultPassword.Length -gt 0) { return $VaultPassword }
+    if ($Unattended) { throw 'Unattended requires -VaultPassword.' }
+
+    $p1 = Read-Host 'Vault password' -AsSecureString
+    if ($p1.Length -lt 12) { throw 'Vault password must be at least 12 characters.' }
+    if ($ConfirmNew) {
+        $p2 = Read-Host 'Confirm vault password' -AsSecureString
+        $a = [Net.NetworkCredential]::new('', $p1).Password
+        $b = [Net.NetworkCredential]::new('', $p2).Password
+        if ($a -ne $b) { throw 'Vault passwords do not match.' }
+    }
+    return $p1
+}
+
+function Get-VaultAesKey {
+    param([SecureString]$VaultPassword, [string]$SaltBase64)
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($VaultPassword)
+    try {
+        $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        if ([string]::IsNullOrWhiteSpace($plain)) { throw 'Vault password is empty.' }
+        if ($plain.Length -lt 12) { throw 'Vault password must be at least 12 characters.' }
+
+        $pwdBytes = [Text.Encoding]::UTF8.GetBytes($plain)
+        $saltBytes = [Convert]::FromBase64String($SaltBase64)
+        $combined = New-Object byte[] ($pwdBytes.Length + $saltBytes.Length)
+        [Array]::Copy($pwdBytes, 0, $combined, 0, $pwdBytes.Length)
+        [Array]::Copy($saltBytes, 0, $combined, $pwdBytes.Length, $saltBytes.Length)
+
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { return $sha.ComputeHash($combined) }
+        finally { $sha.Dispose() }
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+function New-VaultSalt {
+    $bytes = New-Object byte[] 16
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    [Convert]::ToBase64String($bytes)
+}
+
+function Protect-Secret {
+    param([SecureString]$Secret, [byte[]]$Key)
+    ConvertFrom-SecureString -SecureString $Secret -Key $Key
+}
+
+function Unprotect-Secret {
+    param([string]$CipherText, [byte[]]$Key)
+    ConvertTo-SecureString -String $CipherText -Key $Key
+}
+
+function Open-PasswordVault {
+    <#
+      Returns @{ Doc = hashtable; Key = byte[]; Password = SecureString }
+      Doc shape:
+        Version, Salt, Check, Accounts = @{ account = @{ EncryptedPassword; ... } }
+    #>
+    param(
+        [string]$Path,
+        [SecureString]$VaultPassword,
+        [switch]$Unattended
+    )
+
+    $legacyKey = Join-Path (Split-Path $Path -Parent) 'vault.key'
+    if ((Test-Path $Path) -and (Test-Path $legacyKey)) {
+        throw @"
+Found legacy DPAPI vault.key next to the vault.
+Delete vault.key (and preferably recreate the vault) - this script now uses a password only.
+"@
     }
 
-    Write-Host 'Creating LocalMachine DPAPI vault key (first run).' -ForegroundColor Cyan
-    $key = New-Object byte[] 32
-    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($key) } finally { $rng.Dispose() }
-    [IO.File]::WriteAllBytes(
-        $Path,
-        [Security.Cryptography.ProtectedData]::Protect(
-            $key, $null, [Security.Cryptography.DataProtectionScope]::LocalMachine))
+    if (-not (Test-Path $Path)) {
+        Write-Host 'No vault yet - creating a new password-protected vault.' -ForegroundColor Cyan
+        $vaultPwd = Get-VaultPasswordInput -VaultPassword $VaultPassword -ConfirmNew -Unattended:$Unattended
+        $salt = New-VaultSalt
+        $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $salt
+        $checkSecret = [System.Security.SecureString]::new()
+        foreach ($ch in $vaultCanary.ToCharArray()) { $checkSecret.AppendChar($ch) }
+        $checkSecret.MakeReadOnly()
+        $doc = @{
+            Version  = 2
+            Salt     = $salt
+            Check    = (Protect-Secret -Secret $checkSecret -Key $key)
+            Accounts = @{}
+        }
+        return @{ Doc = $doc; Key = $key; Password = $vaultPwd; IsNew = $true }
+    }
+
+    $raw = Import-Clixml -Path $Path
+    # Normalize
+    if ($raw -isnot [hashtable]) { $raw = @{} + $raw }
+
+    if (-not $raw.Version -or -not $raw.Salt -or -not $raw.Check) {
+        throw @"
+Vault at $Path is not password-protected (missing Version/Salt/Check).
+This is likely a legacy vault. Back it up, remove it, and let the script create a new one.
+"@
+    }
+    if (-not $raw.Accounts) { $raw.Accounts = @{} }
+    if ($raw.Accounts -isnot [hashtable]) { $raw.Accounts = @{} + $raw.Accounts }
+
+    $vaultPwd = Get-VaultPasswordInput -VaultPassword $VaultPassword -Unattended:$Unattended
+    $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $raw.Salt
+    try {
+        $probe = Unprotect-Secret -CipherText $raw.Check -Key $key
+        $probePlain = [Net.NetworkCredential]::new('', $probe).Password
+        if ($probePlain -ne $vaultCanary) { throw 'Vault password check failed.' }
+    } catch {
+        throw 'Wrong vault password (or vault is corrupt).'
+    }
+
+    return @{ Doc = $raw; Key = $key; Password = $vaultPwd; IsNew = $false }
+}
+
+function Write-VaultAtomic {
+    param([hashtable]$Doc, [string]$Path)
+    $temp = "$Path.tmp"
+    $Doc | Export-Clixml -Path $temp -Force
+    $round = Import-Clixml -Path $temp
+    if (-not $round.Accounts -or -not $round.Check -or -not $round.Salt) {
+        Remove-Item $temp -Force -ErrorAction SilentlyContinue
+        throw 'Vault integrity check failed - previous vault untouched.'
+    }
+    if (Test-Path $Path) { Copy-Item $Path "$Path.bak" -Force }
+    Move-Item $temp $Path -Force
     Set-RestrictedAcl -Path $Path
-    return $key
 }
 
 function Get-StrongPassword {
-    <#
-      Returns a SecureString (no plaintext ConvertTo-SecureString).
-    #>
     param([int]$Length = 18)
     $sets = @(
         'ABCDEFGHJKLMNPQRSTUVWXYZ'
@@ -212,25 +323,6 @@ function Test-IsDomainAccount {
     ($Account -match '\\') -and ($Account -notmatch "^$([regex]::Escape($Computer))\\|^\.\\")
 }
 
-function Read-Vault {
-    param([string]$Path)
-    if (-not (Test-Path -Path $Path)) { return @{} }
-    @{} + (Import-Clixml -Path $Path)
-}
-
-function Write-VaultAtomic {
-    param([hashtable]$Vault, [string]$Path)
-    $temp = "$Path.tmp"
-    $Vault | Export-Clixml -Path $temp -Force
-    if (@((Import-Clixml -Path $temp).Keys).Count -ne @($Vault.Keys).Count) {
-        Remove-Item $temp -Force -ErrorAction SilentlyContinue
-        throw 'Vault integrity check failed - previous vault untouched.'
-    }
-    if (Test-Path $Path) { Copy-Item $Path "$Path.bak" -Force }
-    Move-Item $temp $Path -Force
-    Set-RestrictedAcl -Path $Path
-}
-
 function Get-NodeComputer {
     param([string]$Instance, [PSCredential]$Credential)
     $p = @{ ComputerName = $Instance }
@@ -241,14 +333,6 @@ function Get-NodeComputer {
 }
 
 function Get-TargetTopology {
-    <#
-      Returns:
-        Mode            = Standalone | AvailabilityGroup
-        SeedSqlInstance = caller seed
-        Nodes           = @( @{ ComputerName; SqlInstance } )
-        AgNames         = string[]
-        OriginalPrimary = sql instance name of current primary (AG only)
-    #>
     param(
         [string]$SqlInstance,
         [string[]]$AvailabilityGroup,
@@ -260,7 +344,6 @@ function Get-TargetTopology {
     if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
     if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
 
-    # Connection errors bubble up. Empty result => standalone (no AG on this instance).
     $ags = @(Get-DbaAvailabilityGroup @agParams)
 
     if (-not $ags) {
@@ -289,7 +372,6 @@ function Get-TargetTopology {
         }
     }
 
-    # De-dupe computers (rare: multiple instances same host)
     $nodes = @($nodes | Group-Object ComputerName | ForEach-Object {
             $_.Group | Select-Object -First 1
         })
@@ -413,7 +495,6 @@ function Invoke-GracefulAgApply {
     $bySql = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($n in $Nodes) { $bySql[$n.SqlInstance] = $n }
 
-    # Map original primary / find a secondary
     $primarySql = $OriginalPrimary
     if (-not $bySql.ContainsKey($primarySql)) {
         $mapped = $Nodes | Where-Object {
@@ -473,31 +554,57 @@ function Invoke-GracefulAgApply {
     Write-Host "  Done. Primary restored on $($primary.SqlInstance)." -ForegroundColor Green
 }
 
+function Show-VaultAccount {
+    param([hashtable]$Doc)
+    $accounts = $Doc.Accounts
+    if (-not $accounts.Keys.Count) {
+        Write-Host 'Vault is empty.' -ForegroundColor Yellow
+        return
+    }
+    $accounts.Keys | Sort-Object | ForEach-Object {
+        $e = $accounts[$_]
+        [pscustomobject]@{
+            Account          = $_
+            LastComputerName = $e.LastComputerName
+            LastTopology     = $e.LastTopology
+            LastNodes        = $e.LastNodes
+            LastServices     = $e.LastServices
+            LastRotatedUtc   = $e.LastRotatedUtc
+            LastRotatedBy    = $e.LastRotatedBy
+        }
+    } | Format-Table -AutoSize
+}
+
+function Write-VaultHistoryCsv {
+    param([hashtable]$Doc, [string]$Path)
+    $Doc.Accounts.Keys | ForEach-Object {
+        $e = $Doc.Accounts[$_]
+        [pscustomobject]@{
+            Account          = $_
+            LastComputerName = $e.LastComputerName
+            LastTopology     = $e.LastTopology
+            LastNodes        = $e.LastNodes
+            LastServices     = $e.LastServices
+            LastRotatedUtc   = $e.LastRotatedUtc
+            LastRotatedBy    = $e.LastRotatedBy
+        }
+    } | Sort-Object Account | Export-Csv -Path $Path -NoTypeInformation -Force
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-if ($OutputFolder -match '^\\\\') {
-    Write-Warning @"
-OutputFolder is a UNC path. DPAPI key is bound to THIS machine ($env:COMPUTERNAME).
-Always run rotation from the same host, or vault recovery will fail. Prefer a local ProgramData path.
-"@
-}
-
 if (-not (Test-Path $OutputFolder)) {
     New-Item $OutputFolder -ItemType Directory -Force | Out-Null
     Set-RestrictedAcl -Path $OutputFolder -Container
 }
 
-Start-Transcript -Path (Join-Path $OutputFolder "RotateSqlServiceAccount_$timestamp.log") -NoClobber | Out-Null
+$transcript = $PSCmdlet.ParameterSetName -eq 'Rotate'
+if ($transcript) {
+    Start-Transcript -Path (Join-Path $OutputFolder "RotateSqlServiceAccount_$timestamp.log") -NoClobber | Out-Null
+}
 
 try {
-    if (-not (Get-Module -ListAvailable -Name dbatools)) {
-        if (-not $InstallModule) { throw 'dbatools missing. Install it or pass -InstallModule.' }
-        Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
-    }
-    Import-Module dbatools -ErrorAction Stop
-    Add-Type -AssemblyName System.Security -ErrorAction Stop
-
     $mutex = [Threading.Mutex]::new($false, $mutexName)
     $gotLock = $false
     try {
@@ -508,7 +615,41 @@ try {
         }
         if (-not $gotLock) { throw 'Vault lock timeout (60s).' }
 
-        # ---- 1) Topology (standalone or AG) ----
+        $unattend = $PSBoundParameters.ContainsKey('Unattended') -and $Unattended
+        $opened = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
+        $vaultDoc = $opened.Doc
+        $vaultKey = $opened.Key
+
+        if ($opened.IsNew) {
+            Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+            Write-Host "Vault created: $vaultPath" -ForegroundColor Cyan
+        }
+
+        # ---- Vault-only modes ----
+        if ($ListVault) {
+            Show-VaultAccount -Doc $vaultDoc
+            return
+        }
+
+        if ($RevealAccount) {
+            if (-not $vaultDoc.Accounts.ContainsKey($RevealAccount)) {
+                throw "Account '$RevealAccount' not found in vault. Use -ListVault."
+            }
+            $secure = Unprotect-Secret -CipherText $vaultDoc.Accounts[$RevealAccount].EncryptedPassword -Key $vaultKey
+            $plain = [Net.NetworkCredential]::new('', $secure).Password
+            Write-Host "Account: $RevealAccount" -ForegroundColor Cyan
+            Write-Output $plain
+            $secure.Dispose()
+            return
+        }
+
+        # ---- Rotate mode ----
+        if (-not (Get-Module -ListAvailable -Name dbatools)) {
+            if (-not $InstallModule) { throw 'dbatools missing. Install it or pass -InstallModule.' }
+            Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
+        }
+        Import-Module dbatools -ErrorAction Stop
+
         $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
             -SqlCredential $SqlCredential -Credential $Credential
 
@@ -517,10 +658,7 @@ try {
         if ($topo.AgNames) { Write-Host "AGs: $($topo.AgNames -join ', ')" -ForegroundColor Cyan }
 
         $computers = @($topo.Nodes.ComputerName | Select-Object -Unique)
-        $machineKey = Get-OrCreateMachineKey -Path $keyPath
-        $vault = Read-Vault -Path $vaultPath
 
-        # ---- 2) Discover services on all nodes ----
         $allServices = foreach ($node in $topo.Nodes) {
             $svcCred = $null
             $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
@@ -545,13 +683,16 @@ try {
         }
         if (-not $groups) { Write-Warning 'No eligible accounts.'; return }
 
-        # Shared account outside this topology?
         $allowed = [Collections.Generic.HashSet[string]]::new([string[]]$computers, [StringComparer]::OrdinalIgnoreCase)
         $conflicts = foreach ($g in $groups) {
-            if (-not $vault.ContainsKey($g.Name)) { continue }
-            $prev = $vault[$g.Name].LastComputerName
+            if (-not $vaultDoc.Accounts.ContainsKey($g.Name)) { continue }
+            $prev = $vaultDoc.Accounts[$g.Name].LastComputerName
             if ($prev -and -not $allowed.Contains($prev)) {
-                [pscustomobject]@{ Account = $g.Name; PreviousServer = $prev; PreviousRotated = $vault[$g.Name].LastRotatedUtc }
+                [pscustomobject]@{
+                    Account         = $g.Name
+                    PreviousServer  = $prev
+                    PreviousRotated = $vaultDoc.Accounts[$g.Name].LastRotatedUtc
+                }
             }
         }
 
@@ -576,7 +717,6 @@ try {
         Write-Host "`nPlan: $($groups.Count) account(s) on $($computers -join ', ')" -ForegroundColor Cyan
         if (-not $PSCmdlet.ShouldProcess("$($groups.Count) account(s)", 'Rotate password')) { return }
 
-        # ---- 3) Rotate ----
         $anyFailures = $false
         $seedComputer = $topo.Nodes[0].ComputerName
 
@@ -588,7 +728,6 @@ try {
             $securePwd = Get-StrongPassword -Length $PasswordLength
             $ok = $true
 
-            # Domain: AD first (required). Service cache second.
             if (-not $SkipAdPasswordReset) {
                 try {
                     Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
@@ -618,8 +757,8 @@ try {
             }
 
             if ($ok) {
-                $vault[$account] = @{
-                    EncryptedPassword = ConvertFrom-SecureString -SecureString $securePwd -Key $machineKey
+                $vaultDoc.Accounts[$account] = @{
+                    EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
                     LastComputerName  = $seedComputer
                     LastTopology      = $topo.Mode
                     LastNodes         = ($computers -join ', ')
@@ -627,14 +766,13 @@ try {
                     LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
                     LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
                 }
-                Write-VaultAtomic -Vault $vault -Path $vaultPath
-                Write-Host '  Cached in vault (not restarted yet).' -ForegroundColor Green
+                Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+                Write-Host '  Saved to password-protected vault (not restarted yet).' -ForegroundColor Green
             }
 
             if ($securePwd) { $securePwd.Dispose(); Remove-Variable securePwd -EA SilentlyContinue }
         }
 
-        # ---- 4) Apply restart / failover ----
         if (-not $SkipRestart -and -not $anyFailures) {
             if ($topo.Mode -eq 'AvailabilityGroup') {
                 $roll = @{
@@ -663,20 +801,9 @@ try {
         }
 
         $reportPath = Join-Path $OutputFolder 'SqlServiceAccountVault_History.csv'
-        $vault.Keys | ForEach-Object {
-            $e = $vault[$_]
-            [pscustomobject]@{
-                Account          = $_
-                LastComputerName = $e.LastComputerName
-                LastTopology     = $e.LastTopology
-                LastNodes        = $e.LastNodes
-                LastServices     = $e.LastServices
-                LastRotatedUtc   = $e.LastRotatedUtc
-                LastRotatedBy    = $e.LastRotatedBy
-            }
-        } | Sort-Object Account | Export-Csv $reportPath -NoTypeInformation -Force
+        Write-VaultHistoryCsv -Doc $vaultDoc -Path $reportPath
 
-        Write-Host "`nVault:   $vaultPath" -ForegroundColor Cyan
+        Write-Host "`nVault:   $vaultPath (password-protected)" -ForegroundColor Cyan
         Write-Host "History: $reportPath (no secrets)" -ForegroundColor Cyan
 
         if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
@@ -686,5 +813,5 @@ try {
         $mutex.Dispose()
     }
 } finally {
-    Stop-Transcript | Out-Null
+    if ($transcript) { Stop-Transcript | Out-Null }
 }
