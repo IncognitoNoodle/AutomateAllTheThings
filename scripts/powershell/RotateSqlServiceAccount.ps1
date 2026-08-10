@@ -302,7 +302,20 @@ function Get-TargetTopology {
     if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
     if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
 
-    $ags = @(Get-DbaAvailabilityGroup @agParams)
+    # Standalone instances throw from Get-DbaAvailabilityGroup ("HADR is not configured").
+    # Treat that as Mode=Standalone. Real connection failures still bubble up.
+    $ags = @()
+    try {
+        $ags = @(Get-DbaAvailabilityGroup @agParams)
+    } catch {
+        $msg = [string]$_
+        $isNoHadr = $msg -match 'HADR|Availability Group|not configured|is not enabled'
+        if (-not $isNoHadr) { throw }
+        if ($AvailabilityGroup) {
+            throw "Instance $SqlInstance has no HADR/AG configured, but -AvailabilityGroup was specified."
+        }
+        $ags = @()
+    }
 
     if (-not $ags) {
         $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential
