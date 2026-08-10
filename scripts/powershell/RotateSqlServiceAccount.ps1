@@ -1,59 +1,10 @@
 <#
 .SYNOPSIS
     Rotate SQL Engine/Agent service account passwords (standalone or Always On).
-
-.DESCRIPTION
-    One entry point: -SqlInstance.
-
-      1. Connect and detect topology (standalone vs AG replicas)
-      2. For domain accounts: reset AD password once, then Update-DbaServiceAccount -NoRestart on every node
-      3. Save ciphertext to a password-protected vault (one team password, no key file)
-      4. Apply:
-           Standalone -> Restart-DbaService
-           AG        -> restart secondary -> Invoke-DbaAgFailover -> restart former primary -> fail back
-
-    Vault (KISS)
-      - Path: static $script:OutputFolder (UNC) near top of script - edit once
-      - One file: SqlServiceAccountVault.xml
-      - Secrets encrypted with AES key = SHA256(password + salt)
-      - Salt + password-check canary stored in the file
-      - ACL: Administrators + SYSTEM
-      - Open from any machine if you know the vault password
-      - Prefer gMSA when possible (script skips those)
-
-.PARAMETER SqlInstance
-    Any replica or standalone instance. AG partner nodes are discovered automatically.
-    Not required with -ListVault / -RevealAccount.
-
-.PARAMETER VaultPassword
-    Password that protects the vault. Prompted if omitted.
-    Required for -Unattended (cannot prompt).
-
-.PARAMETER ListVault
-    List vault account metadata (no secrets) and exit.
-
-.PARAMETER RevealAccount
-    Decrypt and print one account password, then exit.
-
-.EXAMPLE
-    # Standalone
-    .\RotateSqlServiceAccount.ps1 -SqlInstance '<SqlInstance>'
-
-.EXAMPLE
-    # Availability Group (seed any replica; partners auto-discovered)
-    $vp = Read-Host 'Vault password' -AsSecureString
-    .\RotateSqlServiceAccount.ps1 -SqlInstance '<SqlInstance>' -AvailabilityGroup '<AgName>' `
-        -VaultPassword $vp -Unattended -Confirm:$false
-
-.EXAMPLE
-    # Open vault
-    .\RotateSqlServiceAccount.ps1 -ListVault
-    .\RotateSqlServiceAccount.ps1 -RevealAccount '<DOMAIN\svcAccount>'
 #>
-# Interactive ops script: Write-Host is intentional. Helpers are gated by script-level ShouldProcess.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
-[CmdletBinding(DefaultParameterSetName = 'Rotate', SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+[CmdletBinding(DefaultParameterSetName = 'Rotate')]
 param(
     [Parameter(Mandatory, ParameterSetName = 'Rotate')]
     [string]$SqlInstance,
@@ -487,7 +438,6 @@ function Wait-AgReady {
 }
 
 function Invoke-GracefulAgApply {
-    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param(
         [object[]]$Nodes,
         [string[]]$AgNames,
@@ -521,12 +471,10 @@ function Invoke-GracefulAgApply {
     Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
-    if (-not $PSCmdlet.ShouldProcess($secondary.ComputerName, 'Restart secondary')) { return }
     Restart-SqlEngineAgent -Computer $secondary.ComputerName -InstanceName $InstanceName -Credential $Credential
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    if (-not $PSCmdlet.ShouldProcess($secondary.SqlInstance, "Failover $($AgNames -join ', ')")) { return }
     Write-Host "  Failover -> $($secondary.SqlInstance)" -ForegroundColor Cyan
     $fo = @{
         SqlInstance = $secondary.SqlInstance; AvailabilityGroup = $AgNames
@@ -538,7 +486,6 @@ function Invoke-GracefulAgApply {
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    if (-not $PSCmdlet.ShouldProcess($primary.ComputerName, 'Restart former primary')) { return }
     Restart-SqlEngineAgent -Computer $primary.ComputerName -InstanceName $InstanceName -Credential $Credential
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -548,7 +495,6 @@ function Invoke-GracefulAgApply {
         return
     }
 
-    if (-not $PSCmdlet.ShouldProcess($primary.SqlInstance, "Failback $($AgNames -join ', ')")) { return }
     Write-Host "  Failback -> $($primary.SqlInstance)" -ForegroundColor Cyan
     $fb = @{
         SqlInstance = $primary.SqlInstance; AvailabilityGroup = $AgNames
@@ -712,8 +658,8 @@ try {
                 $skippedConflicts = @($groups | Where-Object Name -in $names)
                 $groups = @($groups | Where-Object Name -notin $names)
                 Write-Warning "Unattended: skipped $($names -join ', ')"
-            } elseif (-not $PSCmdlet.ShouldProcess(($conflicts.Account -join ', '), 'Rotate shared account')) {
-                return
+            } else {
+                Write-Warning 'Proceeding with shared account rotation (maintenance).'
             }
         }
         if (-not $groups) {
@@ -722,15 +668,12 @@ try {
         }
 
         Write-Host "`nPlan: $($groups.Count) account(s) on $($computers -join ', ')" -ForegroundColor Cyan
-        if (-not $PSCmdlet.ShouldProcess("$($groups.Count) account(s)", 'Rotate password')) { return }
 
         $anyFailures = $false
         $seedComputer = $topo.Nodes[0].ComputerName
 
         foreach ($g in $groups) {
             $account = $g.Name
-            if (-not $PSCmdlet.ShouldProcess($account, 'Rotate password')) { continue }
-
             Write-Host "`nRotating: $account" -ForegroundColor Green
             $securePwd = Get-StrongPassword -Length $PasswordLength
             $ok = $true
@@ -782,26 +725,21 @@ try {
 
         if (-not $SkipRestart -and -not $anyFailures) {
             if ($topo.Mode -eq 'AvailabilityGroup') {
-                $roll = @{
-                    Nodes              = $topo.Nodes
-                    AgNames            = $topo.AgNames
-                    OriginalPrimary    = $topo.OriginalPrimary
-                    InstanceName       = $InstanceName
-                    Credential         = $Credential
-                    SqlCredential      = $SqlCredential
-                    SyncTimeoutSeconds = $SyncTimeoutSeconds
-                    SkipFailback       = $SkipFailback
-                }
-                if ($Unattended -or $ConfirmPreference -eq 'None') { $roll.Confirm = $false }
-                Invoke-GracefulAgApply @roll
+                Invoke-GracefulAgApply `
+                    -Nodes $topo.Nodes `
+                    -AgNames $topo.AgNames `
+                    -OriginalPrimary $topo.OriginalPrimary `
+                    -InstanceName $InstanceName `
+                    -Credential $Credential `
+                    -SqlCredential $SqlCredential `
+                    -SyncTimeoutSeconds $SyncTimeoutSeconds `
+                    -SkipFailback:$SkipFailback
             } else {
                 $node = $topo.Nodes[0]
-                if ($PSCmdlet.ShouldProcess($node.ComputerName, 'Restart Engine/Agent')) {
-                    $svcCred = $null
-                    $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                    if ($Credential -and $remote) { $svcCred = $Credential }
-                    Restart-SqlEngineAgent -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
-                }
+                $svcCred = $null
+                $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+                if ($Credential -and $remote) { $svcCred = $Credential }
+                Restart-SqlEngineAgent -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
             }
         } elseif ($SkipRestart) {
             Write-Warning 'SkipRestart: password updated; restart/failover later to apply.'
