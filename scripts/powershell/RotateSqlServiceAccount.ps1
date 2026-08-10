@@ -103,7 +103,7 @@ param(
 
 # === CONFIG (edit here) ===
 # Shared UNC for vault + history + transcripts. Change once for the environment.
-$script:OutputFolder = '\\DBAPRDAG03\C$\Temp\SecureCreds'
+$script:OutputFolder = '\\FILESERVER\Share\SqlServiceAccountVault'
 
 $ErrorActionPreference = 'Stop'
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
