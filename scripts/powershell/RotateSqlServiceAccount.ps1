@@ -51,14 +51,14 @@ param(
     [switch]$ListVault,
 
     [Parameter(ParameterSetName = 'Reveal', Mandatory)]
-    [string]$RevealAccount,
-
-    [SecureString]$VaultPassword
+    [string]$RevealAccount
 )
 
 # === CONFIG (edit here) ===
-# Shared UNC for vault + history + transcripts. Change once for the environment.
+# Shared UNC for vault + history + transcripts.
 $script:OutputFolder = '\\FILESERVER\Share\SqlServiceAccountVault'
+# Password that encrypts the vault (min 12 chars). Change once for the environment.
+$script:VaultPasswordPlain = 'ChangeMe-VaultPassword'
 
 $ErrorActionPreference = 'Stop'
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -89,30 +89,24 @@ function Set-RestrictedAcl {
     }
 }
 
-function Get-VaultPasswordInput {
-    param([SecureString]$VaultPassword, [switch]$ConfirmNew, [switch]$Unattended)
-    if ($VaultPassword -and $VaultPassword.Length -gt 0) { return $VaultPassword }
-    if ($Unattended) { throw 'Unattended requires -VaultPassword.' }
-
-    $p1 = Read-Host 'Vault password' -AsSecureString
-    if ($p1.Length -lt 12) { throw 'Vault password must be at least 12 characters.' }
-    if ($ConfirmNew) {
-        $p2 = Read-Host 'Confirm vault password' -AsSecureString
-        $a = [Net.NetworkCredential]::new('', $p1).Password
-        $b = [Net.NetworkCredential]::new('', $p2).Password
-        if ($a -ne $b) { throw 'Vault passwords do not match.' }
+function Get-ConfiguredVaultSecureString {
+    if ([string]::IsNullOrWhiteSpace($script:VaultPasswordPlain)) {
+        throw 'Set $script:VaultPasswordPlain in the CONFIG section.'
     }
-    return $p1
+    if ($script:VaultPasswordPlain.Length -lt 12) {
+        throw 'CONFIG vault password must be at least 12 characters.'
+    }
+    $secure = [System.Security.SecureString]::new()
+    foreach ($ch in $script:VaultPasswordPlain.ToCharArray()) { $secure.AppendChar($ch) }
+    $secure.MakeReadOnly()
+    return $secure
 }
 
 function Get-VaultAesKey {
-    param([SecureString]$VaultPassword, [string]$SaltBase64)
+    param([securestring]$VaultPassword, [string]$SaltBase64)
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($VaultPassword)
     try {
         $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-        if ([string]::IsNullOrWhiteSpace($plain)) { throw 'Vault password is empty.' }
-        if ($plain.Length -lt 12) { throw 'Vault password must be at least 12 characters.' }
-
         $pwdBytes = [Text.Encoding]::UTF8.GetBytes($plain)
         $saltBytes = [Convert]::FromBase64String($SaltBase64)
         $combined = New-Object byte[] ($pwdBytes.Length + $saltBytes.Length)
@@ -146,15 +140,10 @@ function Unprotect-Secret {
 
 function Open-PasswordVault {
     <#
-      Returns @{ Doc = hashtable; Key = byte[]; Password = SecureString }
-      Doc shape:
-        Version, Salt, Check, Accounts = @{ account = @{ EncryptedPassword; ... } }
+      Returns @{ Doc = hashtable; Key = byte[]; IsNew = bool }
+      Uses static $script:VaultPasswordPlain from CONFIG.
     #>
-    param(
-        [string]$Path,
-        [SecureString]$VaultPassword,
-        [switch]$Unattended
-    )
+    param([string]$Path)
 
     $legacyKey = Join-Path (Split-Path $Path -Parent) 'vault.key'
     if ((Test-Path $Path) -and (Test-Path $legacyKey)) {
@@ -164,9 +153,10 @@ Delete vault.key (and preferably recreate the vault) - this script now uses a pa
 "@
     }
 
+    $vaultPwd = Get-ConfiguredVaultSecureString
+
     if (-not (Test-Path $Path)) {
-        Write-Host 'No vault yet - creating a new password-protected vault.' -ForegroundColor Cyan
-        $vaultPwd = Get-VaultPasswordInput -VaultPassword $VaultPassword -ConfirmNew -Unattended:$Unattended
+        Write-Host 'No vault yet - creating vault with CONFIG password.' -ForegroundColor Cyan
         $salt = New-VaultSalt
         $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $salt
         $checkSecret = [System.Security.SecureString]::new()
@@ -178,11 +168,10 @@ Delete vault.key (and preferably recreate the vault) - this script now uses a pa
             Check    = (Protect-Secret -Secret $checkSecret -Key $key)
             Accounts = @{}
         }
-        return @{ Doc = $doc; Key = $key; Password = $vaultPwd; IsNew = $true }
+        return @{ Doc = $doc; Key = $key; IsNew = $true }
     }
 
     $raw = Import-Clixml -Path $Path
-    # Normalize
     if ($raw -isnot [hashtable]) { $raw = @{} + $raw }
 
     if (-not $raw.Version -or -not $raw.Salt -or -not $raw.Check) {
@@ -194,17 +183,16 @@ This is likely a legacy vault. Back it up, remove it, and let the script create 
     if (-not $raw.Accounts) { $raw.Accounts = @{} }
     if ($raw.Accounts -isnot [hashtable]) { $raw.Accounts = @{} + $raw.Accounts }
 
-    $vaultPwd = Get-VaultPasswordInput -VaultPassword $VaultPassword -Unattended:$Unattended
     $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $raw.Salt
     try {
         $probe = Unprotect-Secret -CipherText $raw.Check -Key $key
         $probePlain = [Net.NetworkCredential]::new('', $probe).Password
         if ($probePlain -ne $vaultCanary) { throw 'Vault password check failed.' }
     } catch {
-        throw 'Wrong vault password (or vault is corrupt).'
+        throw 'Wrong CONFIG vault password (or vault is corrupt). Update $script:VaultPasswordPlain.'
     }
 
-    return @{ Doc = $raw; Key = $key; Password = $vaultPwd; IsNew = $false }
+    return @{ Doc = $raw; Key = $key; IsNew = $false }
 }
 
 function Write-VaultAtomic {
@@ -581,8 +569,7 @@ try {
         }
         if (-not $gotLock) { throw 'Vault lock timeout (60s).' }
 
-        $unattend = $PSBoundParameters.ContainsKey('Unattended') -and $Unattended
-        $opened = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
+        $opened = Open-PasswordVault -Path $vaultPath
         $vaultDoc = $opened.Doc
         $vaultKey = $opened.Key
 
