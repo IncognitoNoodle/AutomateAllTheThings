@@ -13,6 +13,7 @@
            AG        -> restart secondary -> Invoke-DbaAgFailover -> restart former primary -> fail back
 
     Vault (KISS)
+      - Path: static $script:OutputFolder (UNC) near top of script - edit once
       - One file: SqlServiceAccountVault.xml
       - Secrets encrypted with AES key = SHA256(password + salt)
       - Salt + password-check canary stored in the file
@@ -97,14 +98,16 @@ param(
     [Parameter(ParameterSetName = 'Reveal', Mandatory)]
     [string]$RevealAccount,
 
-    [SecureString]$VaultPassword,
-
-    [string]$OutputFolder = $(Join-Path $env:ProgramData 'SqlServiceAccountVault')
+    [SecureString]$VaultPassword
 )
+
+# === CONFIG (edit here) ===
+# Shared UNC for vault + history + transcripts. Change once for the environment.
+$script:OutputFolder = '\\DBAPRDAG03\C$\Temp\SecureCreds'
 
 $ErrorActionPreference = 'Stop'
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$vaultPath = Join-Path $OutputFolder 'SqlServiceAccountVault.xml'
+$vaultPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault.xml'
 $mutexName = 'Global\SqlServiceAccountVault'
 $vaultCanary = 'SqlServiceAccountVault.v2'
 
@@ -594,14 +597,14 @@ function Write-VaultHistoryCsv {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-if (-not (Test-Path $OutputFolder)) {
-    New-Item $OutputFolder -ItemType Directory -Force | Out-Null
-    Set-RestrictedAcl -Path $OutputFolder -Container
+if (-not (Test-Path $script:OutputFolder)) {
+    New-Item $script:OutputFolder -ItemType Directory -Force | Out-Null
+    Set-RestrictedAcl -Path $script:OutputFolder -Container
 }
 
 $transcript = $PSCmdlet.ParameterSetName -eq 'Rotate'
 if ($transcript) {
-    Start-Transcript -Path (Join-Path $OutputFolder "RotateSqlServiceAccount_$timestamp.log") -NoClobber | Out-Null
+    Start-Transcript -Path (Join-Path $script:OutputFolder "RotateSqlServiceAccount_$timestamp.log") -NoClobber | Out-Null
 }
 
 try {
@@ -800,7 +803,7 @@ try {
             Write-Warning 'SkipRestart: password updated; restart/failover later to apply.'
         }
 
-        $reportPath = Join-Path $OutputFolder 'SqlServiceAccountVault_History.csv'
+        $reportPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault_History.csv'
         Write-VaultHistoryCsv -Doc $vaultDoc -Path $reportPath
 
         Write-Host "`nVault:   $vaultPath (password-protected)" -ForegroundColor Cyan
