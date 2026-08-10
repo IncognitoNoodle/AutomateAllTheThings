@@ -40,7 +40,8 @@ param(
     [switch]$InstallModule,
 
     [Parameter(ParameterSetName = 'Rotate')]
-    [int]$PasswordLength = 0,
+    [ValidateRange(12, 128)]
+    [int]$PasswordLength = 24,
 
     [Parameter(ParameterSetName = 'Rotate')]
     [ValidateRange(30, 3600)]
@@ -50,19 +51,14 @@ param(
     [switch]$ListVault,
 
     [Parameter(ParameterSetName = 'Reveal', Mandatory)]
-    [string]$RevealAccount
+    [string]$RevealAccount,
+
+    [SecureString]$VaultPassword
 )
 
 # === CONFIG (edit here) ===
-# Shared UNC for vault + history + transcripts.
-$script:OutputFolder = '\\FILESERVER\Share\SqlServiceAccountVault'
-# Password that encrypts the vault (min 12 chars). Change once for the environment.
-$script:VaultPasswordPlain = 'ChangeMe-VaultPassword'
-# Generated service-account password length (raise if domain policy requires more).
-$script:PasswordLength = 24
-
-if ($PasswordLength -lt 12) { $PasswordLength = $script:PasswordLength }
-if ($PasswordLength -gt 128) { throw 'PasswordLength must be <= 128.' }
+# Shared UNC for vault + history + transcripts. Change once for the environment.
+$script:OutputFolder = '\\SERVERNAME\C$\Temp\'
 
 $ErrorActionPreference = 'Stop'
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -93,24 +89,30 @@ function Set-RestrictedAcl {
     }
 }
 
-function Get-ConfiguredVaultSecureString {
-    if ([string]::IsNullOrWhiteSpace($script:VaultPasswordPlain)) {
-        throw 'Set $script:VaultPasswordPlain in the CONFIG section.'
+function Get-VaultPasswordInput {
+    param([SecureString]$VaultPassword, [switch]$ConfirmNew, [switch]$Unattended)
+    if ($VaultPassword -and $VaultPassword.Length -gt 0) { return $VaultPassword }
+    if ($Unattended) { throw 'Unattended requires -VaultPassword.' }
+
+    $p1 = Read-Host 'Vault password' -AsSecureString
+    if ($p1.Length -lt 12) { throw 'Vault password must be at least 12 characters.' }
+    if ($ConfirmNew) {
+        $p2 = Read-Host 'Confirm vault password' -AsSecureString
+        $a = [Net.NetworkCredential]::new('', $p1).Password
+        $b = [Net.NetworkCredential]::new('', $p2).Password
+        if ($a -ne $b) { throw 'Vault passwords do not match.' }
     }
-    if ($script:VaultPasswordPlain.Length -lt 12) {
-        throw 'CONFIG vault password must be at least 12 characters.'
-    }
-    $secure = [System.Security.SecureString]::new()
-    foreach ($ch in $script:VaultPasswordPlain.ToCharArray()) { $secure.AppendChar($ch) }
-    $secure.MakeReadOnly()
-    return $secure
+    return $p1
 }
 
 function Get-VaultAesKey {
-    param([securestring]$VaultPassword, [string]$SaltBase64)
+    param([SecureString]$VaultPassword, [string]$SaltBase64)
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($VaultPassword)
     try {
         $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        if ([string]::IsNullOrWhiteSpace($plain)) { throw 'Vault password is empty.' }
+        if ($plain.Length -lt 12) { throw 'Vault password must be at least 12 characters.' }
+
         $pwdBytes = [Text.Encoding]::UTF8.GetBytes($plain)
         $saltBytes = [Convert]::FromBase64String($SaltBase64)
         $combined = New-Object byte[] ($pwdBytes.Length + $saltBytes.Length)
@@ -144,10 +146,15 @@ function Unprotect-Secret {
 
 function Open-PasswordVault {
     <#
-      Returns @{ Doc = hashtable; Key = byte[]; IsNew = bool }
-      Uses static $script:VaultPasswordPlain from CONFIG.
+      Returns @{ Doc = hashtable; Key = byte[]; Password = SecureString }
+      Doc shape:
+        Version, Salt, Check, Accounts = @{ account = @{ EncryptedPassword; ... } }
     #>
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [SecureString]$VaultPassword,
+        [switch]$Unattended
+    )
 
     $legacyKey = Join-Path (Split-Path $Path -Parent) 'vault.key'
     if ((Test-Path $Path) -and (Test-Path $legacyKey)) {
@@ -157,10 +164,9 @@ Delete vault.key (and preferably recreate the vault) - this script now uses a pa
 "@
     }
 
-    $vaultPwd = Get-ConfiguredVaultSecureString
-
     if (-not (Test-Path $Path)) {
-        Write-Host 'No vault yet - creating vault with CONFIG password.' -ForegroundColor Cyan
+        Write-Host 'No vault yet - creating a new password-protected vault.' -ForegroundColor Cyan
+        $vaultPwd = Get-VaultPasswordInput -VaultPassword $VaultPassword -ConfirmNew -Unattended:$Unattended
         $salt = New-VaultSalt
         $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $salt
         $checkSecret = [System.Security.SecureString]::new()
@@ -172,10 +178,11 @@ Delete vault.key (and preferably recreate the vault) - this script now uses a pa
             Check    = (Protect-Secret -Secret $checkSecret -Key $key)
             Accounts = @{}
         }
-        return @{ Doc = $doc; Key = $key; IsNew = $true }
+        return @{ Doc = $doc; Key = $key; Password = $vaultPwd; IsNew = $true }
     }
 
     $raw = Import-Clixml -Path $Path
+    # Normalize
     if ($raw -isnot [hashtable]) { $raw = @{} + $raw }
 
     if (-not $raw.Version -or -not $raw.Salt -or -not $raw.Check) {
@@ -187,16 +194,17 @@ This is likely a legacy vault. Back it up, remove it, and let the script create 
     if (-not $raw.Accounts) { $raw.Accounts = @{} }
     if ($raw.Accounts -isnot [hashtable]) { $raw.Accounts = @{} + $raw.Accounts }
 
+    $vaultPwd = Get-VaultPasswordInput -VaultPassword $VaultPassword -Unattended:$Unattended
     $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $raw.Salt
     try {
         $probe = Unprotect-Secret -CipherText $raw.Check -Key $key
         $probePlain = [Net.NetworkCredential]::new('', $probe).Password
         if ($probePlain -ne $vaultCanary) { throw 'Vault password check failed.' }
     } catch {
-        throw 'Wrong CONFIG vault password (or vault is corrupt). Update $script:VaultPasswordPlain.'
+        throw 'Wrong vault password (or vault is corrupt).'
     }
 
-    return @{ Doc = $raw; Key = $key; IsNew = $false }
+    return @{ Doc = $raw; Key = $key; Password = $vaultPwd; IsNew = $false }
 }
 
 function Write-VaultAtomic {
@@ -213,30 +221,13 @@ function Write-VaultAtomic {
     Set-RestrictedAcl -Path $Path
 }
 
-function Test-PasswordAvoidsAccountName {
-    param([string]$Candidate, [string]$Account)
-    if ([string]::IsNullOrWhiteSpace($Account)) { return $true }
-    $sam = ($Account.Split('\')[-1]).ToLowerInvariant()
-    $text = $Candidate.ToLowerInvariant()
-    if ($sam.Length -ge 3 -and $text.Contains($sam)) { return $false }
-    # Domain complexity also rejects 3+ char tokens from the account name
-    for ($i = 0; $i -le $sam.Length - 3; $i++) {
-        if ($text.Contains($sam.Substring($i, 3))) { return $false }
-    }
-    return $true
-}
-
 function Get-StrongPassword {
-    param(
-        [int]$Length = 24,
-        [string]$Account
-    )
-    # Domain-friendly specials (avoid quotes/slashes that break service configs)
+    param([int]$Length = 24)
     $sets = @(
         'ABCDEFGHJKLMNPQRSTUVWXYZ'
         'abcdefghijkmnopqrstuvwxyz'
         '23456789'
-        '!@#$%*?-_+='
+        '!@#$%^&*_-+='
     )
     $all = -join $sets
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -249,39 +240,27 @@ function Get-StrongPassword {
             [int]($v % [uint32]$Max)
         }
 
-        for ($attempt = 1; $attempt -le 50; $attempt++) {
-            $chars = [System.Collections.Generic.List[char]]::new()
-            # At least 2 from each class for stricter domain policies
-            foreach ($s in $sets) {
-                $chars.Add($s[(& $nextIndex $s.Length)])
-                $chars.Add($s[(& $nextIndex $s.Length)])
-            }
-            while ($chars.Count -lt $Length) {
-                $chars.Add($all[(& $nextIndex $all.Length)])
-            }
-            for ($i = $chars.Count - 1; $i -gt 0; $i--) {
-                $j = & $nextIndex ($i + 1)
-                $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t
-            }
-
-            $plain = -join $chars
-            if (-not (Test-PasswordAvoidsAccountName -Candidate $plain -Account $Account)) { continue }
-
-            $secure = [System.Security.SecureString]::new()
-            foreach ($ch in $chars) { $secure.AppendChar($ch) }
-            $secure.MakeReadOnly()
-            return $secure
+        $chars = [System.Collections.Generic.List[char]]::new()
+        foreach ($s in $sets) {
+            $idx = & $nextIndex $s.Length
+            $chars.Add($s[$idx])
         }
-        throw "Could not generate a domain-safe password for '$Account' after 50 attempts."
+        while ($chars.Count -lt $Length) {
+            $idx = & $nextIndex $all.Length
+            $chars.Add($all[$idx])
+        }
+        for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+            $j = & $nextIndex ($i + 1)
+            $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t
+        }
+
+        $secure = [System.Security.SecureString]::new()
+        foreach ($ch in $chars) { $secure.AppendChar($ch) }
+        $secure.MakeReadOnly()
+        return $secure
     } finally {
         $rng.Dispose()
     }
-}
-
-function Test-IsPasswordPolicyError {
-    param($ErrorRecord)
-    $msg = [string]$ErrorRecord
-    return [bool]($msg -match 'length|complexity|history|password.*requir|does not meet|password.*policy')
 }
 
 function Test-AccountEligible {
@@ -319,61 +298,27 @@ function Get-TargetTopology {
         [PSCredential]$Credential
     )
 
-    # Connect first so we can use IsHadrEnabled (avoids Get-DbaAvailabilityGroup throw on standalone).
-    $conn = @{ SqlInstance = $SqlInstance; EnableException = $true }
-    if ($SqlCredential) { $conn.SqlCredential = $SqlCredential }
-
-    try {
-        $server = Connect-DbaInstance @conn
-    } catch {
-        throw @"
-Cannot connect to SQL instance '$SqlInstance'.
-For a named instance use Host\Instance (e.g. sdeposq403\SQL01), not just the instance name.
-Original error: $_
-"@
-    }
-
-    $computer = $server.ComputerName
-    if (-not $computer) {
-        try { $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential }
-        catch { $computer = $SqlInstance.Split('\')[0] }
-    }
-
-    $hadrOn = $false
-    try { $hadrOn = [bool]$server.IsHadrEnabled } catch { $hadrOn = $false }
-
-    if (-not $hadrOn) {
-        if ($AvailabilityGroup) {
-            throw "Instance $SqlInstance has HADR disabled, but -AvailabilityGroup was specified."
-        }
-        return [pscustomobject]@{
-            Mode            = 'Standalone'
-            SeedSqlInstance = $SqlInstance
-            Nodes           = @([pscustomobject]@{ ComputerName = $computer; SqlInstance = $SqlInstance })
-            AgNames         = @()
-            OriginalPrimary = $SqlInstance
-        }
-    }
-
-    $agParams = @{ SqlInstance = $server; EnableException = $true }
+    $agParams = @{ SqlInstance = $SqlInstance; EnableException = $true }
+    if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
     if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
 
+    # Standalone instances throw from Get-DbaAvailabilityGroup ("HADR is not configured").
+    # Treat that as Mode=Standalone. Real connection failures still bubble up.
     $ags = @()
     try {
         $ags = @(Get-DbaAvailabilityGroup @agParams)
     } catch {
         $msg = [string]$_
-        if ($msg -match 'HADR|Availability Group|not configured|is not enabled') {
-            if ($AvailabilityGroup) {
-                throw "Instance $SqlInstance has no AG configured, but -AvailabilityGroup was specified."
-            }
-            $ags = @()
-        } else {
-            throw
+        $isNoHadr = $msg -match 'HADR|Availability Group|not configured|is not enabled'
+        if (-not $isNoHadr) { throw }
+        if ($AvailabilityGroup) {
+            throw "Instance $SqlInstance has no HADR/AG configured, but -AvailabilityGroup was specified."
         }
+        $ags = @()
     }
 
     if (-not $ags) {
+        $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential
         return [pscustomobject]@{
             Mode            = 'Standalone'
             SeedSqlInstance = $SqlInstance
@@ -636,7 +581,8 @@ try {
         }
         if (-not $gotLock) { throw 'Vault lock timeout (60s).' }
 
-        $opened = Open-PasswordVault -Path $vaultPath
+        $unattend = $PSBoundParameters.ContainsKey('Unattended') -and $Unattended
+        $opened = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
         $vaultDoc = $opened.Doc
         $vaultKey = $opened.Key
 
@@ -669,6 +615,8 @@ try {
             Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
         }
         Import-Module dbatools -ErrorAction Stop
+        Set-DbatoolsConfig -FullName sql.connection.encrypt -Value $true
+        Set-DbatoolsConfig -FullName sql.connection.trustcert -Value $true
 
         $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
             -SqlCredential $SqlCredential -Credential $Credential
@@ -742,27 +690,15 @@ try {
         foreach ($g in $groups) {
             $account = $g.Name
             Write-Host "`nRotating: $account" -ForegroundColor Green
+            $securePwd = Get-StrongPassword -Length $PasswordLength
             $ok = $true
-            $securePwd = $null
-            $maxPwdAttempts = 5
 
-            for ($pwdAttempt = 1; $pwdAttempt -le $maxPwdAttempts; $pwdAttempt++) {
-                if ($securePwd) { $securePwd.Dispose(); Remove-Variable securePwd -EA SilentlyContinue }
-                $securePwd = Get-StrongPassword -Length $PasswordLength -Account $account
-
-                if ($SkipAdPasswordReset) { break }
-
+            if (-not $SkipAdPasswordReset) {
                 try {
                     Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
-                    break
                 } catch {
-                    if ((Test-IsPasswordPolicyError $_) -and $pwdAttempt -lt $maxPwdAttempts) {
-                        Write-Warning "AD rejected password (policy). Retry $($pwdAttempt + 1)/$maxPwdAttempts ..."
-                        continue
-                    }
                     Write-Host "  FAILED (AD): $_" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
-                    break
                 }
             }
 
