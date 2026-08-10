@@ -36,15 +36,19 @@
     Decrypt and print one account password, then exit.
 
 .EXAMPLE
-    .\RotateSqlServiceAccount.ps1 -SqlInstance SQL01
+    # Standalone
+    .\RotateSqlServiceAccount.ps1 -SqlInstance '<SqlInstance>'
 
 .EXAMPLE
+    # Availability Group (seed any replica; partners auto-discovered)
     $vp = Read-Host 'Vault password' -AsSecureString
-    .\RotateSqlServiceAccount.ps1 -SqlInstance SQL01 -AvailabilityGroup AG1 -VaultPassword $vp -Unattended -Confirm:$false
+    .\RotateSqlServiceAccount.ps1 -SqlInstance '<SqlInstance>' -AvailabilityGroup '<AgName>' `
+        -VaultPassword $vp -Unattended -Confirm:$false
 
 .EXAMPLE
+    # Open vault
     .\RotateSqlServiceAccount.ps1 -ListVault
-    .\RotateSqlServiceAccount.ps1 -RevealAccount 'CONTOSO\sqlsvc'
+    .\RotateSqlServiceAccount.ps1 -RevealAccount '<DOMAIN\svcAccount>'
 #>
 # Interactive ops script: Write-Host is intentional. Helpers are gated by script-level ShouldProcess.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
