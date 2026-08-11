@@ -534,38 +534,6 @@ try {
             throw ("Multiple eligible accounts found ({0}). Pass -Account to select which one receives the SecOps password." -f ((@($groups).Name) -join ', '))
         }
 
-        # Same shared-account guard as RotateSqlServiceAccount
-        $allowed = [Collections.Generic.HashSet[string]]::new([string[]]$computers, [StringComparer]::OrdinalIgnoreCase)
-        $conflicts = foreach ($g in $groups) {
-            if (-not $vaultDoc.Accounts.ContainsKey($g.Name)) { continue }
-            $prev = $vaultDoc.Accounts[$g.Name].LastComputerName
-            if ($prev -and -not $allowed.Contains($prev)) {
-                [pscustomobject]@{
-                    Account         = $g.Name
-                    PreviousServer  = $prev
-                    PreviousRotated = $vaultDoc.Accounts[$g.Name].LastRotatedUtc
-                }
-            }
-        }
-
-        $skippedConflicts = @()
-        if ($conflicts) {
-            Write-Host "`n*** SHARED ACCOUNT (outside this topology) ***" -ForegroundColor Red
-            $conflicts | Format-Table -AutoSize
-            if ($Unattended) {
-                $names = @($conflicts.Account)
-                $skippedConflicts = @($groups | Where-Object Name -in $names)
-                $groups = @($groups | Where-Object Name -notin $names)
-                Write-Warning "Unattended: skipped $($names -join ', ')"
-            } else {
-                Write-Warning 'Proceeding with shared account update (maintenance).'
-            }
-        }
-        if (-not $groups) {
-            if ($skippedConflicts) { exit 2 }
-            Write-Warning 'Nothing to update.'; return
-        }
-
         Write-Host "`nPlan: apply SecOps password to $($groups.Count) account(s) on $($computers -join ', ')" -ForegroundColor Cyan
         Write-Host 'No AD password change will be performed.' -ForegroundColor Yellow
 
@@ -644,7 +612,6 @@ try {
         }
 
         if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
-        if ($skippedConflicts) { Write-Warning "$($skippedConflicts.Count) shared account(s) skipped."; exit 2 }
     } finally {
         if ($gotLock) { [void]$mutex.ReleaseMutex() }
         $mutex.Dispose()
