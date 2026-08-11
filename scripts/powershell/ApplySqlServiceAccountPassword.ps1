@@ -4,9 +4,9 @@
 
 .DESCRIPTION
     Use when SecOps already reset the domain account password.
-    This script only updates the Windows service logon cache on the target server(s),
-    optionally restarts (standalone) or does AG rolling restart/failover, and stores
-    the password in the shared vault.
+    Same apply path as RotateSqlServiceAccount: update service logon cache,
+    vault the password, then always restart (standalone) or AG
+    secondary-restart / failover / former-primary-restart / failback.
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
@@ -34,10 +34,6 @@ param(
 
     [bool]$IncludeDomain = $true,
 
-    [switch]$SkipRestart,
-
-    [switch]$SkipFailback,
-
     [switch]$Unattended,
 
     [switch]$InstallModule,
@@ -49,6 +45,7 @@ param(
 )
 
 # === CONFIG (edit here) ===
+# Shared UNC for vault + history + transcripts. Change once for the environment.
 $script:OutputFolder = '\\SERVERNAME\C$\Temp\'
 
 $ErrorActionPreference = 'Stop'
@@ -136,6 +133,11 @@ function Unprotect-Secret {
 }
 
 function Open-PasswordVault {
+    <#
+      Returns @{ Doc = hashtable; Key = byte[]; Password = SecureString }
+      Doc shape:
+        Version, Salt, Check, Accounts = @{ account = @{ EncryptedPassword; ... } }
+    #>
     param(
         [string]$Path,
         [SecureString]$VaultPassword,
@@ -144,7 +146,10 @@ function Open-PasswordVault {
 
     $legacyKey = Join-Path (Split-Path $Path -Parent) 'vault.key'
     if ((Test-Path $Path) -and (Test-Path $legacyKey)) {
-        throw 'Found legacy DPAPI vault.key. Delete it and recreate the vault (password-only).'
+        throw @"
+Found legacy DPAPI vault.key next to the vault.
+Delete vault.key (and preferably recreate the vault) - this script now uses a password only.
+"@
     }
 
     if (-not (Test-Path $Path)) {
@@ -161,14 +166,18 @@ function Open-PasswordVault {
             Check    = (Protect-Secret -Secret $checkSecret -Key $key)
             Accounts = @{}
         }
-        return @{ Doc = $doc; Key = $key; IsNew = $true }
+        return @{ Doc = $doc; Key = $key; Password = $vaultPwd; IsNew = $true }
     }
 
     $raw = Import-Clixml -Path $Path
+    # Normalize
     if ($raw -isnot [hashtable]) { $raw = @{} + $raw }
 
     if (-not $raw.Version -or -not $raw.Salt -or -not $raw.Check) {
-        throw "Vault at $Path is not password-protected. Back it up, remove it, and recreate."
+        throw @"
+Vault at $Path is not password-protected (missing Version/Salt/Check).
+This is likely a legacy vault. Back it up, remove it, and let the script create a new one.
+"@
     }
     if (-not $raw.Accounts) { $raw.Accounts = @{} }
     if ($raw.Accounts -isnot [hashtable]) { $raw.Accounts = @{} + $raw.Accounts }
@@ -183,7 +192,7 @@ function Open-PasswordVault {
         throw 'Wrong vault password (or vault is corrupt).'
     }
 
-    return @{ Doc = $raw; Key = $key; IsNew = $false }
+    return @{ Doc = $raw; Key = $key; Password = $vaultPwd; IsNew = $false }
 }
 
 function Write-VaultAtomic {
@@ -234,6 +243,8 @@ function Get-TargetTopology {
     if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
     if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
 
+    # Standalone instances throw from Get-DbaAvailabilityGroup ("HADR is not configured").
+    # Treat that as Mode=Standalone. Real connection failures still bubble up.
     $ags = @()
     try {
         $ags = @(Get-DbaAvailabilityGroup @agParams)
@@ -372,8 +383,7 @@ function Invoke-GracefulAgApply {
         [string[]]$InstanceName,
         [PSCredential]$Credential,
         [PSCredential]$SqlCredential,
-        [int]$SyncTimeoutSeconds,
-        [switch]$SkipFailback
+        [int]$SyncTimeoutSeconds
     )
 
     $bySql = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
@@ -416,11 +426,6 @@ function Invoke-GracefulAgApply {
     Restart-SqlEngineAgent -Computer $primary.ComputerName -InstanceName $InstanceName -Credential $Credential
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
-
-    if ($SkipFailback) {
-        Write-Warning "SkipFailback: primary left on $($secondary.SqlInstance)"
-        return
-    }
 
     Write-Host "  Failback -> $($primary.SqlInstance)" -ForegroundColor Cyan
     $fb = @{
@@ -474,7 +479,7 @@ try {
         }
         if (-not $gotLock) { throw 'Vault lock timeout (60s).' }
 
-        $unattend = [bool]$Unattended
+        $unattend = $PSBoundParameters.ContainsKey('Unattended') -and $Unattended
         $opened = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
         $vaultDoc = $opened.Doc
         $vaultKey = $opened.Key
@@ -535,7 +540,7 @@ try {
         $groups = $allServices | Group-Object StartName | Where-Object {
             $c = Test-AccountEligible -StartName $_.Name -ForComputer @($_.Group.ComputerName)[0] -IncludeDomain $IncludeDomain
             if (-not $c.Ok) { Write-Host "Skip $($_.Name): $($c.Reason)" -ForegroundColor Yellow; return $false }
-            if ($Account -and ($_.Name -ne $Account) -and ($_.Name -notlike $Account)) {
+            if ($Account -and ($_.Name -ne $Account)) {
                 Write-Host "Skip $($_.Name): not -Account $Account" -ForegroundColor Yellow
                 return $false
             }
@@ -545,6 +550,38 @@ try {
 
         if (-not $Account -and @($groups).Count -gt 1) {
             throw ("Multiple eligible accounts found ({0}). Pass -Account to select which one receives the SecOps password." -f ((@($groups).Name) -join ', '))
+        }
+
+        # Same shared-account guard as RotateSqlServiceAccount
+        $allowed = [Collections.Generic.HashSet[string]]::new([string[]]$computers, [StringComparer]::OrdinalIgnoreCase)
+        $conflicts = foreach ($g in $groups) {
+            if (-not $vaultDoc.Accounts.ContainsKey($g.Name)) { continue }
+            $prev = $vaultDoc.Accounts[$g.Name].LastComputerName
+            if ($prev -and -not $allowed.Contains($prev)) {
+                [pscustomobject]@{
+                    Account         = $g.Name
+                    PreviousServer  = $prev
+                    PreviousRotated = $vaultDoc.Accounts[$g.Name].LastRotatedUtc
+                }
+            }
+        }
+
+        $skippedConflicts = @()
+        if ($conflicts) {
+            Write-Host "`n*** SHARED ACCOUNT (outside this topology) ***" -ForegroundColor Red
+            $conflicts | Format-Table -AutoSize
+            if ($Unattended) {
+                $names = @($conflicts.Account)
+                $skippedConflicts = @($groups | Where-Object Name -in $names)
+                $groups = @($groups | Where-Object Name -notin $names)
+                Write-Warning "Unattended: skipped $($names -join ', ')"
+            } else {
+                Write-Warning 'Proceeding with shared account update (maintenance).'
+            }
+        }
+        if (-not $groups) {
+            if ($skippedConflicts) { exit 2 }
+            Write-Warning 'Nothing to update.'; return
         }
 
         Write-Host "`nPlan: apply SecOps password to $($groups.Count) account(s) on $($computers -join ', ')" -ForegroundColor Cyan
@@ -591,11 +628,12 @@ try {
                 }
                 Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
                 $updatedAccounts.Add($acct)
-                Write-Host '  Service password updated and saved to vault (not restarted yet).' -ForegroundColor Green
+                Write-Host '  Saved to password-protected vault (not restarted yet).' -ForegroundColor Green
             }
         }
 
-        if (-not $SkipRestart -and -not $anyFailures) {
+        # Restart / AG failover+failback is mandatory (no skip switches)
+        if (-not $anyFailures) {
             if ($topo.Mode -eq 'AvailabilityGroup') {
                 Invoke-GracefulAgApply `
                     -Nodes $topo.Nodes `
@@ -604,18 +642,23 @@ try {
                     -InstanceName $InstanceName `
                     -Credential $Credential `
                     -SqlCredential $SqlCredential `
-                    -SyncTimeoutSeconds $SyncTimeoutSeconds `
-                    -SkipFailback:$SkipFailback
-            } else {
+                    -SyncTimeoutSeconds $SyncTimeoutSeconds
+            } elseif ($PSCmdlet.ParameterSetName -eq 'ByComputer') {
+                # Explicit server list: restart each listed computer
                 foreach ($node in $topo.Nodes) {
                     $svcCred = $null
                     $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
                     if ($Credential -and $remote) { $svcCred = $Credential }
                     Restart-SqlEngineAgent -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
                 }
+            } else {
+                # Match RotateSqlServiceAccount standalone: restart seed node only
+                $node = $topo.Nodes[0]
+                $svcCred = $null
+                $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+                if ($Credential -and $remote) { $svcCred = $Credential }
+                Restart-SqlEngineAgent -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
             }
-        } elseif ($SkipRestart) {
-            Write-Warning 'SkipRestart: service password updated; restart/failover later to apply.'
         }
 
         $reportPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault_History.csv'
@@ -628,6 +671,7 @@ try {
         }
 
         if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
+        if ($skippedConflicts) { Write-Warning "$($skippedConflicts.Count) shared account(s) skipped."; exit 2 }
     } finally {
         if ($gotLock) { [void]$mutex.ReleaseMutex() }
         $mutex.Dispose()
