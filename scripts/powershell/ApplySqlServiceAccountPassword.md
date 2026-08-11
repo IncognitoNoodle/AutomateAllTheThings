@@ -1,6 +1,6 @@
 # ApplySqlServiceAccountPassword.ps1
 
-SecOps already reset the domain password. This script updates SQL Windows services and restarts once. **No AD change. No password generation.**
+SecOps already reset the domain password. This script updates SQL Windows services and restarts once. **No AD change. No password generation. No vault.**
 
 ## What it does
 
@@ -10,10 +10,10 @@ SecOps already reset the domain password. This script updates SQL Windows servic
 - `-ListAccounts` — show those service accounts
 - `-Account` + `-SecurePassword` — one or many pairs (same count/order)
 - Updates all supplied service logon caches (`Update-DbaServiceAccount -NoRestart`)
-- Saves passwords to the shared vault
 - Restarts **once**:
   - Standalone → restart updated service types
   - AG → secondary restart → failover → former primary restart → failback
+- Transcript log only (no password vault / history CSV)
 
 ## Examples
 
@@ -45,4 +45,4 @@ Edit in script:
 $script:OutputFolder = '\\SERVERNAME\C$\Temp\'
 ```
 
-Vault + history + transcript land there (same vault as `RotateSqlServiceAccount.ps1`).
+Transcripts are written there.
