@@ -6,6 +6,7 @@
     Discovers domain AD service accounts for Engine/Agent/SSRS/SSIS (not local users).
     Applies one or more SecOps passwords in a single pass, then restarts once
     (standalone) or AG secondary-restart / failover / former-primary-restart / failback.
+    Does not update AD and does not store passwords in a vault.
 
 .EXAMPLE
     # List domain AD service accounts on a SQL instance
@@ -48,14 +49,10 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'ListAccounts')]
     [switch]$ListAccounts,
 
-    [switch]$Unattended,
-
     [switch]$InstallModule,
 
     [ValidateRange(30, 3600)]
-    [int]$SyncTimeoutSeconds = 300,
-
-    [SecureString]$VaultPassword
+    [int]$SyncTimeoutSeconds = 300
 )
 
 # === CONFIG (edit here) ===
@@ -64,153 +61,10 @@ $script:ServiceTypes = @('Engine', 'Agent', 'SSRS', 'SSIS')
 
 $ErrorActionPreference = 'Stop'
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$vaultPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault.xml'
-$mutexName = 'Global\SqlServiceAccountVault'
-$vaultCanary = 'SqlServiceAccountVault.v2'
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-function Set-RestrictedAcl {
-    param([string]$Path, [switch]$Container)
-    try {
-        $acl = Get-Acl -Path $Path
-        $acl.SetAccessRuleProtection($true, $false)
-        foreach ($id in 'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM') {
-            $rule = if ($Container) {
-                [Security.AccessControl.FileSystemAccessRule]::new(
-                    $id, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-            } else {
-                [Security.AccessControl.FileSystemAccessRule]::new($id, 'FullControl', 'Allow')
-            }
-            $acl.AddAccessRule($rule)
-        }
-        Set-Acl -Path $Path -AclObject $acl
-    } catch {
-        Write-Warning "Could not harden ACLs on $Path : $_"
-    }
-}
-
-function Get-VaultPasswordInput {
-    param([SecureString]$VaultPassword, [switch]$ConfirmNew, [switch]$Unattended)
-    if ($VaultPassword -and $VaultPassword.Length -gt 0) { return $VaultPassword }
-    if ($Unattended) { throw 'Unattended requires -VaultPassword.' }
-
-    $p1 = Read-Host 'Vault password' -AsSecureString
-    if ($p1.Length -lt 12) { throw 'Vault password must be at least 12 characters.' }
-    if ($ConfirmNew) {
-        $p2 = Read-Host 'Confirm vault password' -AsSecureString
-        $a = [Net.NetworkCredential]::new('', $p1).Password
-        $b = [Net.NetworkCredential]::new('', $p2).Password
-        if ($a -ne $b) { throw 'Vault passwords do not match.' }
-    }
-    return $p1
-}
-
-function Get-VaultAesKey {
-    param([SecureString]$VaultPassword, [string]$SaltBase64)
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($VaultPassword)
-    try {
-        $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-        if ([string]::IsNullOrWhiteSpace($plain)) { throw 'Vault password is empty.' }
-        if ($plain.Length -lt 12) { throw 'Vault password must be at least 12 characters.' }
-
-        $pwdBytes = [Text.Encoding]::UTF8.GetBytes($plain)
-        $saltBytes = [Convert]::FromBase64String($SaltBase64)
-        $combined = New-Object byte[] ($pwdBytes.Length + $saltBytes.Length)
-        [Array]::Copy($pwdBytes, 0, $combined, 0, $pwdBytes.Length)
-        [Array]::Copy($saltBytes, 0, $combined, $pwdBytes.Length, $saltBytes.Length)
-
-        $sha = [Security.Cryptography.SHA256]::Create()
-        try { return $sha.ComputeHash($combined) }
-        finally { $sha.Dispose() }
-    } finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-    }
-}
-
-function New-VaultSalt {
-    $bytes = New-Object byte[] 16
-    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-    [Convert]::ToBase64String($bytes)
-}
-
-function Protect-Secret {
-    param([SecureString]$Secret, [byte[]]$Key)
-    ConvertFrom-SecureString -SecureString $Secret -Key $Key
-}
-
-function Unprotect-Secret {
-    param([string]$CipherText, [byte[]]$Key)
-    ConvertTo-SecureString -String $CipherText -Key $Key
-}
-
-function Open-PasswordVault {
-    param(
-        [string]$Path,
-        [SecureString]$VaultPassword,
-        [switch]$Unattended
-    )
-
-    $legacyKey = Join-Path (Split-Path $Path -Parent) 'vault.key'
-    if ((Test-Path $Path) -and (Test-Path $legacyKey)) {
-        throw 'Found legacy DPAPI vault.key. Delete it and recreate the vault (password-only).'
-    }
-
-    if (-not (Test-Path $Path)) {
-        Write-Host 'No vault yet - creating a new password-protected vault.' -ForegroundColor Cyan
-        $vaultPwd = Get-VaultPasswordInput -VaultPassword $VaultPassword -ConfirmNew -Unattended:$Unattended
-        $salt = New-VaultSalt
-        $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $salt
-        $checkSecret = [System.Security.SecureString]::new()
-        foreach ($ch in $vaultCanary.ToCharArray()) { $checkSecret.AppendChar($ch) }
-        $checkSecret.MakeReadOnly()
-        $doc = @{
-            Version  = 2
-            Salt     = $salt
-            Check    = (Protect-Secret -Secret $checkSecret -Key $key)
-            Accounts = @{}
-        }
-        return @{ Doc = $doc; Key = $key; IsNew = $true }
-    }
-
-    $raw = Import-Clixml -Path $Path
-    if ($raw -isnot [hashtable]) { $raw = @{} + $raw }
-
-    if (-not $raw.Version -or -not $raw.Salt -or -not $raw.Check) {
-        throw "Vault at $Path is not password-protected. Back it up, remove it, and recreate."
-    }
-    if (-not $raw.Accounts) { $raw.Accounts = @{} }
-    if ($raw.Accounts -isnot [hashtable]) { $raw.Accounts = @{} + $raw.Accounts }
-
-    $vaultPwd = Get-VaultPasswordInput -VaultPassword $VaultPassword -Unattended:$Unattended
-    $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $raw.Salt
-    try {
-        $probe = Unprotect-Secret -CipherText $raw.Check -Key $key
-        $probePlain = [Net.NetworkCredential]::new('', $probe).Password
-        if ($probePlain -ne $vaultCanary) { throw 'Vault password check failed.' }
-    } catch {
-        throw 'Wrong vault password (or vault is corrupt).'
-    }
-
-    return @{ Doc = $raw; Key = $key; IsNew = $false }
-}
-
-function Write-VaultAtomic {
-    param([hashtable]$Doc, [string]$Path)
-    $temp = "$Path.tmp"
-    $Doc | Export-Clixml -Path $temp -Force
-    $round = Import-Clixml -Path $temp
-    if (-not $round.Accounts -or -not $round.Check -or -not $round.Salt) {
-        Remove-Item $temp -Force -ErrorAction SilentlyContinue
-        throw 'Vault integrity check failed - previous vault untouched.'
-    }
-    if (Test-Path $Path) { Copy-Item $Path "$Path.bak" -Force }
-    Move-Item $temp $Path -Force
-    Set-RestrictedAcl -Path $Path
-}
-
 function Test-IsDomainServiceAccount {
     # Domain AD service accounts only. Rejects built-ins, gMSA, local MACHINE\user, .\user, bare names.
     param([string]$StartName, [string]$ForComputer)
@@ -527,29 +381,11 @@ function Invoke-GracefulAgApply {
     Write-Host "  Done. Primary restored on $($primary.SqlInstance)." -ForegroundColor Green
 }
 
-function Write-VaultHistoryCsv {
-    param([hashtable]$Doc, [string]$Path)
-    $Doc.Accounts.Keys | ForEach-Object {
-        $e = $Doc.Accounts[$_]
-        [pscustomobject]@{
-            Account          = $_
-            LastComputerName = $e.LastComputerName
-            LastTopology     = $e.LastTopology
-            LastNodes        = $e.LastNodes
-            LastServices     = $e.LastServices
-            LastRotatedUtc   = $e.LastRotatedUtc
-            LastRotatedBy    = $e.LastRotatedBy
-            Source           = $e.Source
-        }
-    } | Sort-Object Account | Export-Csv -Path $Path -NoTypeInformation -Force
-}
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 if (-not (Test-Path $script:OutputFolder)) {
     New-Item $script:OutputFolder -ItemType Directory -Force | Out-Null
-    Set-RestrictedAcl -Path $script:OutputFolder -Container
 }
 
 $passwordMap = $null
@@ -618,112 +454,71 @@ try {
     }
 
     Write-Host "`nPlan: apply SecOps password(s) to $($targets.Count) account(s), then restart once" -ForegroundColor Cyan
-    Write-Host 'No AD password change will be performed.' -ForegroundColor Yellow
+    Write-Host 'No AD password change will be performed. Passwords are not stored in a vault.' -ForegroundColor Yellow
 
-    $mutex = [Threading.Mutex]::new($false, $mutexName)
-    $gotLock = $false
-    try {
-        try { $gotLock = $mutex.WaitOne([TimeSpan]::FromSeconds(60)) }
-        catch [Threading.AbandonedMutexException] {
-            Write-Warning 'Recovered abandoned vault lock.'
-            $gotLock = $true
-        }
-        if (-not $gotLock) { throw 'Vault lock timeout (60s).' }
+    $anyFailures = $false
+    $updatedAccounts = [System.Collections.Generic.List[string]]::new()
 
-        $unattend = [bool]$Unattended
-        $opened = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
-        $vaultDoc = $opened.Doc
-        $vaultKey = $opened.Key
+    foreach ($row in $targets) {
+        $acct = $row.Account
+        $securePwd = $passwordMap[$acct]
+        Write-Host "`nApplying password: $acct" -ForegroundColor Green
+        $ok = $true
 
-        if ($opened.IsNew) {
-            Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
-            Write-Host "Vault created: $vaultPath" -ForegroundColor Cyan
-        }
-
-        $anyFailures = $false
-        $seedComputer = $topo.Nodes[0].ComputerName
-        $updatedAccounts = [System.Collections.Generic.List[string]]::new()
-
-        foreach ($row in $targets) {
-            $acct = $row.Account
-            $securePwd = $passwordMap[$acct]
-            Write-Host "`nApplying password: $acct" -ForegroundColor Green
-            $ok = $true
-
-            foreach ($computer in @($row.Group.ComputerName | Select-Object -Unique)) {
-                if (-not $ok) { break }
-                $nodeServices = @($row.Group | Where-Object ComputerName -eq $computer)
-                $svcCred = Get-RemoteCredential -Computer $computer -Credential $Credential
-                try {
-                    Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer ($(($nodeServices.ServiceName) -join ', '))" -ForegroundColor DarkCyan
-                    $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
-                    if ($result.Status -contains 'Failed') {
-                        Write-Host "  FAILED @ ${computer}: $((($result | Where-Object Status -eq Failed).Message) -join '; ')" -ForegroundColor Red
-                        $ok = $false; $anyFailures = $true
-                    }
-                } catch {
-                    Write-Host "  FAILED @ ${computer}: $_" -ForegroundColor Red
+        foreach ($computer in @($row.Group.ComputerName | Select-Object -Unique)) {
+            if (-not $ok) { break }
+            $nodeServices = @($row.Group | Where-Object ComputerName -eq $computer)
+            $svcCred = Get-RemoteCredential -Computer $computer -Credential $Credential
+            try {
+                Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer ($(($nodeServices.ServiceName) -join ', '))" -ForegroundColor DarkCyan
+                $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
+                if ($result.Status -contains 'Failed') {
+                    Write-Host "  FAILED @ ${computer}: $((($result | Where-Object Status -eq Failed).Message) -join '; ')" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
                 }
-            }
-
-            if ($ok) {
-                $vaultDoc.Accounts[$acct] = @{
-                    EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
-                    LastComputerName  = $seedComputer
-                    LastTopology      = $topo.Mode
-                    LastNodes         = ($computers -join ', ')
-                    LastServices      = (($row.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
-                    LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
-                    LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
-                    Source            = 'SecOpsProvided'
-                }
-                Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
-                $updatedAccounts.Add($acct)
-                Write-Host '  Saved to vault (not restarted yet).' -ForegroundColor Green
+            } catch {
+                Write-Host "  FAILED @ ${computer}: $_" -ForegroundColor Red
+                $ok = $false; $anyFailures = $true
             }
         }
 
-        if (-not $anyFailures) {
-            # Restart only service types we actually updated (avoids touching unrelated SSRS/SSIS).
-            $typesToRestart = @(
-                $targets |
-                    ForEach-Object { $_.Group } |
-                    ForEach-Object { [string]$_.ServiceType } |
-                    Sort-Object -Unique
-            )
-            if (-not $typesToRestart) { $typesToRestart = $script:ServiceTypes }
-
-            if ($topo.Mode -eq 'AvailabilityGroup') {
-                Invoke-GracefulAgApply `
-                    -Nodes $topo.Nodes `
-                    -AgNames $topo.AgNames `
-                    -OriginalPrimary $topo.OriginalPrimary `
-                    -ServiceType $typesToRestart `
-                    -Credential $Credential `
-                    -SqlCredential $SqlCredential `
-                    -SyncTimeoutSeconds $SyncTimeoutSeconds
-            } else {
-                $node = $topo.Nodes[0]
-                Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart `
-                    -Credential (Get-RemoteCredential $node.ComputerName $Credential)
-            }
+        if ($ok) {
+            $updatedAccounts.Add($acct)
+            Write-Host '  Service password updated (not restarted yet).' -ForegroundColor Green
         }
-
-        $reportPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault_History.csv'
-        Write-VaultHistoryCsv -Doc $vaultDoc -Path $reportPath
-
-        Write-Host "`nVault:   $vaultPath (password-protected)" -ForegroundColor Cyan
-        Write-Host "History: $reportPath (no secrets)" -ForegroundColor Cyan
-        if ($updatedAccounts.Count) {
-            Write-Host "`nUpdated account(s): $($updatedAccounts -join ', ')" -ForegroundColor Green
-        }
-
-        if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
-    } finally {
-        if ($gotLock) { [void]$mutex.ReleaseMutex() }
-        $mutex.Dispose()
     }
+
+    if (-not $anyFailures) {
+        # Restart only service types we actually updated (avoids touching unrelated SSRS/SSIS).
+        $typesToRestart = @(
+            $targets |
+                ForEach-Object { $_.Group } |
+                ForEach-Object { [string]$_.ServiceType } |
+                Sort-Object -Unique
+        )
+        if (-not $typesToRestart) { $typesToRestart = $script:ServiceTypes }
+
+        if ($topo.Mode -eq 'AvailabilityGroup') {
+            Invoke-GracefulAgApply `
+                -Nodes $topo.Nodes `
+                -AgNames $topo.AgNames `
+                -OriginalPrimary $topo.OriginalPrimary `
+                -ServiceType $typesToRestart `
+                -Credential $Credential `
+                -SqlCredential $SqlCredential `
+                -SyncTimeoutSeconds $SyncTimeoutSeconds
+        } else {
+            $node = $topo.Nodes[0]
+            Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart `
+                -Credential (Get-RemoteCredential $node.ComputerName $Credential)
+        }
+    }
+
+    if ($updatedAccounts.Count) {
+        Write-Host "`nUpdated account(s): $($updatedAccounts -join ', ')" -ForegroundColor Green
+    }
+
+    if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
 } finally {
     Stop-Transcript | Out-Null
 }
