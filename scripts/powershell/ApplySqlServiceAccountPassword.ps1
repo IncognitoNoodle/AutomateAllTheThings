@@ -10,21 +10,12 @@
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
-[CmdletBinding(DefaultParameterSetName = 'BySqlInstance')]
+[CmdletBinding()]
 param(
-    [Parameter(Mandatory, ParameterSetName = 'BySqlInstance')]
+    [Parameter(Mandatory)]
     [string]$SqlInstance,
 
-    [Parameter(ParameterSetName = 'BySqlInstance')]
     [string[]]$AvailabilityGroup,
-
-    [Parameter(Mandatory, ParameterSetName = 'ByComputer')]
-    [string[]]$ComputerName,
-
-    [Parameter(Mandatory)]
-    [SecureString]$SecurePassword,
-
-    [string]$Account,
 
     [string[]]$InstanceName,
 
@@ -33,6 +24,11 @@ param(
     [PSCredential]$SqlCredential,
 
     [bool]$IncludeDomain = $true,
+
+    [Parameter(Mandatory)]
+    [SecureString]$SecurePassword,
+
+    [string]$Account,
 
     [switch]$Unattended,
 
@@ -497,22 +493,8 @@ try {
         Set-DbatoolsConfig -FullName sql.connection.encrypt -Value $true
         Set-DbatoolsConfig -FullName sql.connection.trustcert -Value $true
 
-        # Topology: SqlInstance (+ AG discover) OR explicit ComputerName (server-level only)
-        if ($PSCmdlet.ParameterSetName -eq 'ByComputer') {
-            $nodes = foreach ($c in $ComputerName) {
-                [pscustomobject]@{ ComputerName = $c; SqlInstance = $c }
-            }
-            $topo = [pscustomobject]@{
-                Mode            = 'Standalone'
-                SeedSqlInstance = $ComputerName[0]
-                Nodes           = @($nodes)
-                AgNames         = @()
-                OriginalPrimary = $ComputerName[0]
-            }
-        } else {
-            $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
-                -SqlCredential $SqlCredential -Credential $Credential
-        }
+        $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
+            -SqlCredential $SqlCredential -Credential $Credential
 
         Write-Host "`nMode: $($topo.Mode)  |  AD update: skipped (SecOps-provided password)" -ForegroundColor Cyan
         $topo.Nodes | Format-Table ComputerName, SqlInstance -AutoSize
@@ -632,7 +614,7 @@ try {
             }
         }
 
-        # Restart / AG failover+failback is mandatory (no skip switches)
+        # Restart / AG failover+failback is mandatory (same path as RotateSqlServiceAccount)
         if (-not $anyFailures) {
             if ($topo.Mode -eq 'AvailabilityGroup') {
                 Invoke-GracefulAgApply `
@@ -643,16 +625,7 @@ try {
                     -Credential $Credential `
                     -SqlCredential $SqlCredential `
                     -SyncTimeoutSeconds $SyncTimeoutSeconds
-            } elseif ($PSCmdlet.ParameterSetName -eq 'ByComputer') {
-                # Explicit server list: restart each listed computer
-                foreach ($node in $topo.Nodes) {
-                    $svcCred = $null
-                    $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                    if ($Credential -and $remote) { $svcCred = $Credential }
-                    Restart-SqlEngineAgent -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
-                }
             } else {
-                # Match RotateSqlServiceAccount standalone: restart seed node only
                 $node = $topo.Nodes[0]
                 $svcCred = $null
                 $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
