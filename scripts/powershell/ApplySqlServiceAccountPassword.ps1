@@ -600,7 +600,7 @@ try {
     }
 
     if (-not $targets) {
-        throw 'No matching domain accounts to update. Use -ListAccounts, then pass matching -Account/-SecurePassword pairs.'
+        throw 'No matching domain AD service accounts to update. Use -ListAccounts, then pass matching -Account/-SecurePassword pairs.'
     }
 
     Write-Host "`nPlan: apply SecOps password(s) to $($targets.Count) account(s), then restart once" -ForegroundColor Cyan
