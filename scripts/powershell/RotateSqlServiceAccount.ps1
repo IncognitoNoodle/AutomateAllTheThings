@@ -686,6 +686,7 @@ try {
 
         $anyFailures = $false
         $seedComputer = $topo.Nodes[0].ComputerName
+        $rotatedSecrets = [System.Collections.Generic.List[object]]::new()
 
         foreach ($g in $groups) {
             $account = $g.Name
@@ -732,6 +733,8 @@ try {
                     LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
                 }
                 Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+                $plainPwd = [Net.NetworkCredential]::new('', $securePwd).Password
+                $rotatedSecrets.Add([pscustomobject]@{ Account = $account; Password = $plainPwd })
                 Write-Host '  Saved to password-protected vault (not restarted yet).' -ForegroundColor Green
             }
 
@@ -765,6 +768,18 @@ try {
 
         Write-Host "`nVault:   $vaultPath (password-protected)" -ForegroundColor Cyan
         Write-Host "History: $reportPath (no secrets)" -ForegroundColor Cyan
+
+        if ($rotatedSecrets.Count) {
+            Write-Host "`n===== ROTATED PASSWORDS (copy) =====" -ForegroundColor Yellow
+            foreach ($row in $rotatedSecrets) {
+                Write-Host "$($row.Account)" -ForegroundColor Cyan
+                Write-Host $row.Password -ForegroundColor Green
+                Write-Host ''
+            }
+            Write-Host '====================================' -ForegroundColor Yellow
+            # Also emit as objects for clipboard / piping:  ... | Set-Clipboard
+            $rotatedSecrets | Write-Output
+        }
 
         if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
         if ($skippedConflicts) { Write-Warning "$($skippedConflicts.Count) shared account(s) skipped."; exit 2 }
