@@ -1,20 +1,28 @@
 <#
 .SYNOPSIS
-    Apply SecOps-provided passwords to domain SQL service accounts (no AD change).
+    Apply SecOps-provided passwords to domain AD SQL service accounts (no AD change).
 
 .DESCRIPTION
-    Discovers domain AD accounts for Engine/Agent/SSRS/SSIS (not local users).
+    Discovers domain AD service accounts for Engine/Agent/SSRS/SSIS (not local users).
     Applies one or more SecOps passwords in a single pass, then restarts once
     (standalone) or AG secondary-restart / failover / former-primary-restart / failback.
 
 .EXAMPLE
+    # List domain AD service accounts on a SQL instance
     .\ApplySqlServiceAccountPassword.ps1 -SqlInstance 'HOST\SQL01' -ListAccounts
 
 .EXAMPLE
+    # Standalone: update one or more service account passwords, then restart once
     $p1 = ConvertTo-SecureString 'PwForSql' -AsPlainText -Force
     $p2 = ConvertTo-SecureString 'PwForSsrs' -AsPlainText -Force
     .\ApplySqlServiceAccountPassword.ps1 -SqlInstance 'HOST\SQL01' `
         -Account 'DOMAIN\svcSql','DOMAIN\svcSsrs' -SecurePassword $p1,$p2
+
+.EXAMPLE
+    # Availability Group: same params; script discovers replicas and does failover/failback
+    $p1 = ConvertTo-SecureString 'PwForSql' -AsPlainText -Force
+    .\ApplySqlServiceAccountPassword.ps1 -SqlInstance 'HOST\SQL01' `
+        -AvailabilityGroup 'AgName' -Account 'DOMAIN\svcSql' -SecurePassword $p1
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
@@ -204,7 +212,7 @@ function Write-VaultAtomic {
 }
 
 function Test-IsDomainServiceAccount {
-    # Domain AD only. Rejects built-ins, gMSA, local MACHINE\user, .\user, bare names.
+    # Domain AD service accounts only. Rejects built-ins, gMSA, local MACHINE\user, .\user, bare names.
     param([string]$StartName, [string]$ForComputer)
 
     if ([string]::IsNullOrWhiteSpace($StartName)) { return @{ Ok = $false; Reason = 'empty' } }
@@ -566,7 +574,7 @@ try {
     }
 
     if ($ListAccounts) {
-        Write-Host "`nDomain AD SQL service accounts (Engine/Agent/SSRS/SSIS):" -ForegroundColor Cyan
+        Write-Host "`nDomain AD service accounts (Engine/Agent/SSRS/SSIS):" -ForegroundColor Cyan
         if (-not $domainAccounts) {
             Write-Warning 'No domain AD service accounts found.'
             return
