@@ -385,18 +385,28 @@ function Update-NodeServicePassword {
 }
 
 function Restart-SqlTargetService {
-    param([string]$Computer, [PSCredential]$Credential)
+    param(
+        [string]$Computer,
+        [string[]]$Type = $script:ServiceTypes,
+        [PSCredential]$Credential
+    )
+    $Type = @($Type | Sort-Object -Unique)
     $p = @{
         ComputerName    = $Computer
-        Type            = $script:ServiceTypes
+        Type            = $Type
         Force           = $true
         Confirm         = $false
         EnableException = $true
     }
     if ($Credential) { $p.Credential = $Credential }
-    Write-Host "  Restart $($script:ServiceTypes -join '/') on $Computer" -ForegroundColor Cyan
+    Write-Host "  Restart $($Type -join '/') on $Computer" -ForegroundColor Cyan
     $result = Restart-DbaService @p
-    $bad = @($result | Where-Object { $_.Status -eq 'Failed' -or $_.State -ne 'Running' })
+    # Engine/Agent must be Running; SSRS/SSIS may be intentionally stopped - fail only on Failed.
+    $bad = @($result | Where-Object {
+            $_.Status -eq 'Failed' -or (
+                [string]$_.ServiceType -in @('Engine', 'Agent') -and $_.State -ne 'Running'
+            )
+        })
     if ($bad) { throw "Restart failed on ${Computer}: $(($bad.ServiceName) -join ', ')" }
 }
 
@@ -453,10 +463,13 @@ function Invoke-GracefulAgApply {
         [object[]]$Nodes,
         [string[]]$AgNames,
         [string]$OriginalPrimary,
+        [string[]]$ServiceType,
         [PSCredential]$Credential,
         [PSCredential]$SqlCredential,
         [int]$SyncTimeoutSeconds
     )
+
+    if (-not $ServiceType) { $ServiceType = $script:ServiceTypes }
 
     $bySql = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($n in $Nodes) { $bySql[$n.SqlInstance] = $n }
@@ -467,6 +480,7 @@ function Invoke-GracefulAgApply {
             (Test-ReplicaMatch -ReplicaName $OriginalPrimary -SqlInstance $_.SqlInstance) -or
             ($_.ComputerName -eq $OriginalPrimary.Split('\')[0])
         } | Select-Object -First 1
+        if (-not $mapped) { throw "Could not map primary '$OriginalPrimary' to discovered nodes." }
         $primarySql = $mapped.SqlInstance
     }
     if (-not $primarySql) { throw "Could not map primary '$OriginalPrimary' to discovered nodes." }
@@ -480,7 +494,8 @@ function Invoke-GracefulAgApply {
     Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
-    Restart-SqlTargetService -Computer $secondary.ComputerName -Credential (Get-RemoteCredential $secondary.ComputerName $Credential)
+    Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType `
+        -Credential (Get-RemoteCredential $secondary.ComputerName $Credential)
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
@@ -495,7 +510,8 @@ function Invoke-GracefulAgApply {
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    Restart-SqlTargetService -Computer $primary.ComputerName -Credential (Get-RemoteCredential $primary.ComputerName $Credential)
+    Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType `
+        -Credential (Get-RemoteCredential $primary.ComputerName $Credential)
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
@@ -569,9 +585,6 @@ try {
     $allServices | Select-Object ComputerName, ServiceName, ServiceType, State, StartName | Format-Table -AutoSize
 
     $domainAccounts = @(Get-DomainSqlServiceAccount -Services $allServices)
-    $listView = {
-        $domainAccounts | Select-Object Account, ServiceTypes, ServiceCount, Computers, Services
-    }
 
     if ($ListAccounts) {
         Write-Host "`nDomain AD service accounts (Engine/Agent/SSRS/SSIS):" -ForegroundColor Cyan
@@ -579,8 +592,9 @@ try {
             Write-Warning 'No domain AD service accounts found.'
             return
         }
-        & $listView | Format-Table -AutoSize
-        & $listView | Write-Output
+        $listView = @($domainAccounts | Select-Object Account, ServiceTypes, ServiceCount, Computers, Services)
+        $listView | Format-Table -AutoSize
+        $listView | Write-Output
         return
     }
 
@@ -595,7 +609,7 @@ try {
 
     foreach ($name in @($passwordMap.Keys)) {
         if (-not ($domainAccounts | Where-Object Account -eq $name)) {
-            Write-Warning "Password supplied for '$name' but account not found on this topology."
+            Write-Warning "Password supplied for '$name' but that AD service account was not found on this topology."
         }
     }
 
@@ -671,17 +685,27 @@ try {
         }
 
         if (-not $anyFailures) {
+            # Restart only service types we actually updated (avoids touching unrelated SSRS/SSIS).
+            $typesToRestart = @(
+                $targets |
+                    ForEach-Object { $_.Group } |
+                    ForEach-Object { [string]$_.ServiceType } |
+                    Sort-Object -Unique
+            )
+            if (-not $typesToRestart) { $typesToRestart = $script:ServiceTypes }
+
             if ($topo.Mode -eq 'AvailabilityGroup') {
                 Invoke-GracefulAgApply `
                     -Nodes $topo.Nodes `
                     -AgNames $topo.AgNames `
                     -OriginalPrimary $topo.OriginalPrimary `
+                    -ServiceType $typesToRestart `
                     -Credential $Credential `
                     -SqlCredential $SqlCredential `
                     -SyncTimeoutSeconds $SyncTimeoutSeconds
             } else {
                 $node = $topo.Nodes[0]
-                Restart-SqlTargetService -Computer $node.ComputerName `
+                Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart `
                     -Credential (Get-RemoteCredential $node.ComputerName $Credential)
             }
         }
