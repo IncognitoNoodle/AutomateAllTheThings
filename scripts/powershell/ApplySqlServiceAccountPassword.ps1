@@ -1,16 +1,24 @@
 <#
 .SYNOPSIS
-    Apply a SecOps-provided password to SQL Engine/Agent services (no AD change, no password generation).
+    Apply SecOps-provided passwords to domain SQL service accounts (no AD change).
 
 .DESCRIPTION
-    Use when SecOps already reset the domain account password.
-    Same apply path as RotateSqlServiceAccount: update service logon cache,
-    vault the password, then always restart (standalone) or AG
-    secondary-restart / failover / former-primary-restart / failback.
+    Discovers domain AD service accounts for Engine/Agent/SSRS/SSIS (not local users).
+    Applies one or more SecOps passwords in a single pass, then restarts once
+    (standalone) or does AG secondary-restart / failover / former-primary-restart / failback.
+
+.EXAMPLE
+    .\ApplySqlServiceAccountPassword.ps1 -SqlInstance 'HOST\SQL01' -ListAccounts
+
+.EXAMPLE
+    $p1 = ConvertTo-SecureString 'PwForSql' -AsPlainText -Force
+    $p2 = ConvertTo-SecureString 'PwForSsrs' -AsPlainText -Force
+    .\ApplySqlServiceAccountPassword.ps1 -SqlInstance 'HOST\SQL01' `
+        -Account 'DOMAIN\svcSql','DOMAIN\svcSsrs' -SecurePassword $p1,$p2
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Apply')]
 param(
     [Parameter(Mandatory)]
     [string]$SqlInstance,
@@ -23,12 +31,14 @@ param(
 
     [PSCredential]$SqlCredential,
 
-    [bool]$IncludeDomain = $true,
+    [Parameter(Mandatory, ParameterSetName = 'Apply')]
+    [string[]]$Account,
 
-    [Parameter(Mandatory)]
-    [SecureString]$SecurePassword,
+    [Parameter(Mandatory, ParameterSetName = 'Apply')]
+    [SecureString[]]$SecurePassword,
 
-    [string]$Account,
+    [Parameter(Mandatory, ParameterSetName = 'ListAccounts')]
+    [switch]$ListAccounts,
 
     [switch]$Unattended,
 
@@ -43,6 +53,7 @@ param(
 # === CONFIG (edit here) ===
 # Shared UNC for vault + history + transcripts. Change once for the environment.
 $script:OutputFolder = '\\SERVERNAME\C$\Temp\'
+$script:ServiceTypes = @('Engine', 'Agent', 'SSRS', 'SSIS')
 
 $ErrorActionPreference = 'Stop'
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -129,11 +140,6 @@ function Unprotect-Secret {
 }
 
 function Open-PasswordVault {
-    <#
-      Returns @{ Doc = hashtable; Key = byte[]; Password = SecureString }
-      Doc shape:
-        Version, Salt, Check, Accounts = @{ account = @{ EncryptedPassword; ... } }
-    #>
     param(
         [string]$Path,
         [SecureString]$VaultPassword,
@@ -166,7 +172,6 @@ Delete vault.key (and preferably recreate the vault) - this script now uses a pa
     }
 
     $raw = Import-Clixml -Path $Path
-    # Normalize
     if ($raw -isnot [hashtable]) { $raw = @{} + $raw }
 
     if (-not $raw.Version -or -not $raw.Salt -or -not $raw.Check) {
@@ -205,16 +210,31 @@ function Write-VaultAtomic {
     Set-RestrictedAcl -Path $Path
 }
 
-function Test-AccountEligible {
-    param([string]$StartName, [string]$ForComputer, [bool]$IncludeDomain)
+function Test-IsDomainServiceAccount {
+    <#
+      Domain AD account only. Rejects built-ins, gMSA, local MACHINE\user, .\user, bare local names.
+    #>
+    param([string]$StartName, [string]$ForComputer)
+    if ([string]::IsNullOrWhiteSpace($StartName)) {
+        return @{ Ok = $false; Reason = 'empty' }
+    }
     if ($StartName -match '^(LocalSystem|NT AUTHORITY\\|NT SERVICE\\)') {
         return @{ Ok = $false; Reason = 'built-in' }
     }
     if ($StartName -match '\$$') { return @{ Ok = $false; Reason = 'gMSA' } }
-    $local = $StartName -match "^$([regex]::Escape($ForComputer))\\|^\.\\"
-    if (($StartName -match '\\') -and (-not $local) -and (-not $IncludeDomain)) {
-        return @{ Ok = $false; Reason = 'domain (pass -IncludeDomain)' }
+
+    # UPN domain account
+    if ($StartName -match '^[^\\]+@[^\\]+$') {
+        return @{ Ok = $true; Reason = $null }
     }
+
+    if ($StartName -notmatch '\\') {
+        return @{ Ok = $false; Reason = 'local/bare name' }
+    }
+
+    $local = $StartName -match "^$([regex]::Escape($ForComputer))\\|^\.\\"
+    if ($local) { return @{ Ok = $false; Reason = 'local user' } }
+
     @{ Ok = $true; Reason = $null }
 }
 
@@ -240,7 +260,6 @@ function Get-TargetTopology {
     if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
 
     # Standalone instances throw from Get-DbaAvailabilityGroup ("HADR is not configured").
-    # Treat that as Mode=Standalone. Real connection failures still bubble up.
     $ags = @()
     try {
         $ags = @(Get-DbaAvailabilityGroup @agParams)
@@ -293,6 +312,89 @@ function Get-TargetTopology {
     }
 }
 
+function Get-SqlTargetServices {
+    param(
+        [object[]]$Nodes,
+        [string[]]$InstanceName,
+        [PSCredential]$Credential
+    )
+
+    $all = foreach ($node in $Nodes) {
+        $svcCred = $null
+        $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+        if ($Credential -and $remote) { $svcCred = $Credential }
+        $gp = @{
+            ComputerName    = $node.ComputerName
+            Type            = $script:ServiceTypes
+            EnableException = $true
+        }
+        if ($svcCred) { $gp.Credential = $svcCred }
+        Get-DbaService @gp
+    }
+
+    $all = @($all)
+    if (-not $InstanceName) { return $all }
+
+    # Engine/Agent honor -InstanceName; SSRS/SSIS are usually host-level so keep them.
+    $all | Where-Object {
+        $type = [string]$_.ServiceType
+        if ($type -in @('SSRS', 'SSIS')) { $true }
+        else { $_.InstanceName -in $InstanceName }
+    }
+}
+
+function Get-DomainSqlServiceAccount {
+    <#
+      Lists domain AD accounts used by Engine/Agent/SSRS/SSIS on the topology.
+      Excludes local users, built-ins, and gMSA.
+    #>
+    param(
+        [object[]]$Services
+    )
+
+    $services = @($Services)
+    $domainServices = foreach ($svc in $services) {
+        $check = Test-IsDomainServiceAccount -StartName $svc.StartName -ForComputer $svc.ComputerName
+        if (-not $check.Ok) {
+            Write-Host ("Skip {0}\{1} ({2}): {3}" -f $svc.ComputerName, $svc.ServiceName, $svc.StartName, $check.Reason) -ForegroundColor Yellow
+            continue
+        }
+        $svc
+    }
+    $domainServices = @($domainServices)
+
+    $domainServices | Group-Object StartName | ForEach-Object {
+        [pscustomobject]@{
+            Account      = $_.Name
+            ServiceCount = $_.Count
+            Computers    = (@($_.Group.ComputerName | Sort-Object -Unique) -join ', ')
+            Services     = (@($_.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)[$($_.ServiceType)]" } | Sort-Object) -join ', ')
+            ServiceTypes = (@($_.Group | ForEach-Object { [string]$_.ServiceType } | Sort-Object -Unique) -join ', ')
+            Group        = $_.Group
+        }
+    } | Sort-Object Account
+}
+
+function Resolve-AccountPasswordMap {
+    param([string[]]$Account, [SecureString[]]$SecurePassword)
+
+    if ($Account.Count -ne $SecurePassword.Count) {
+        throw "-Account count ($($Account.Count)) must match -SecurePassword count ($($SecurePassword.Count))."
+    }
+
+    $map = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+    for ($i = 0; $i -lt $Account.Count; $i++) {
+        $name = $Account[$i]
+        if ([string]::IsNullOrWhiteSpace($name)) { throw "-Account[$i] is empty." }
+        if (-not $SecurePassword[$i] -or $SecurePassword[$i].Length -lt 1) {
+            throw "-SecurePassword for '$name' is empty."
+        }
+        if ($map.ContainsKey($name)) { throw "Duplicate -Account entry: $name" }
+        $map[$name] = $SecurePassword[$i]
+    }
+    $map
+}
+
 function Update-NodeServicePassword {
     param([object[]]$Services, [securestring]$SecurePassword, [PSCredential]$Credential)
     $p = @{
@@ -306,19 +408,26 @@ function Update-NodeServicePassword {
     Update-DbaServiceAccount @p
 }
 
-function Restart-SqlEngineAgent {
+function Restart-SqlTargetServices {
     param([string]$Computer, [string[]]$InstanceName, [PSCredential]$Credential)
     $p = @{
         ComputerName    = $Computer
-        Type            = 'Engine', 'Agent'
+        Type            = $script:ServiceTypes
         Force           = $true
         Confirm         = $false
         EnableException = $true
     }
-    if ($InstanceName) { $p.InstanceName = $InstanceName }
+    # InstanceName filters Engine/Agent; omit so SSRS/SSIS on the host also restart.
     if ($Credential) { $p.Credential = $Credential }
-    Write-Host "  Restart Engine/Agent on $Computer" -ForegroundColor Cyan
+    Write-Host "  Restart $($script:ServiceTypes -join '/') on $Computer" -ForegroundColor Cyan
     $result = Restart-DbaService @p
+    if ($InstanceName) {
+        $result = @($result | Where-Object {
+                $type = [string]$_.ServiceType
+                if ($type -in @('SSRS', 'SSIS')) { $true }
+                else { $_.InstanceName -in $InstanceName -or -not $_.InstanceName }
+            })
+    }
     $bad = @($result | Where-Object { $_.Status -eq 'Failed' -or $_.State -ne 'Running' })
     if ($bad) { throw "Restart failed on ${Computer}: $(($bad.ServiceName) -join ', ')" }
 }
@@ -404,7 +513,7 @@ function Invoke-GracefulAgApply {
     Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
-    Restart-SqlEngineAgent -Computer $secondary.ComputerName -InstanceName $InstanceName -Credential $Credential
+    Restart-SqlTargetServices -Computer $secondary.ComputerName -InstanceName $InstanceName -Credential $Credential
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
@@ -419,7 +528,7 @@ function Invoke-GracefulAgApply {
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    Restart-SqlEngineAgent -Computer $primary.ComputerName -InstanceName $InstanceName -Credential $Credential
+    Restart-SqlTargetServices -Computer $primary.ComputerName -InstanceName $InstanceName -Credential $Credential
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
@@ -455,16 +564,81 @@ function Write-VaultHistoryCsv {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-if ($SecurePassword.Length -lt 1) { throw '-SecurePassword is empty.' }
-
 if (-not (Test-Path $script:OutputFolder)) {
     New-Item $script:OutputFolder -ItemType Directory -Force | Out-Null
     Set-RestrictedAcl -Path $script:OutputFolder -Container
 }
 
+$isApply = $PSCmdlet.ParameterSetName -eq 'Apply'
+if ($isApply) {
+    $passwordMap = Resolve-AccountPasswordMap -Account $Account -SecurePassword $SecurePassword
+}
+
 Start-Transcript -Path (Join-Path $script:OutputFolder "ApplySqlServiceAccountPassword_$timestamp.log") -NoClobber | Out-Null
 
 try {
+    if (-not (Get-Module -ListAvailable -Name dbatools)) {
+        if (-not $InstallModule) { throw 'dbatools missing. Install it or pass -InstallModule.' }
+        Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
+    }
+    Import-Module dbatools -ErrorAction Stop
+    Set-DbatoolsConfig -FullName sql.connection.encrypt -Value $true
+    Set-DbatoolsConfig -FullName sql.connection.trustcert -Value $true
+
+    $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
+        -SqlCredential $SqlCredential -Credential $Credential
+
+    Write-Host "`nMode: $($topo.Mode)" -ForegroundColor Cyan
+    $topo.Nodes | Format-Table ComputerName, SqlInstance -AutoSize
+    if ($topo.AgNames) { Write-Host "AGs: $($topo.AgNames -join ', ')" -ForegroundColor Cyan }
+
+    $computers = @($topo.Nodes.ComputerName | Select-Object -Unique)
+    $allServices = @(Get-SqlTargetServices -Nodes $topo.Nodes -InstanceName $InstanceName -Credential $Credential)
+    if (-not $allServices) {
+        throw "No $($script:ServiceTypes -join '/') services on: $($computers -join ', ')"
+    }
+
+    Write-Host "`nServices:" -ForegroundColor Cyan
+    $allServices | Select-Object ComputerName, ServiceName, ServiceType, State, StartName | Format-Table -AutoSize
+
+    $domainAccounts = @(Get-DomainSqlServiceAccount -Services $allServices)
+
+    if ($ListAccounts) {
+        Write-Host "`nDomain AD SQL service accounts (Engine/Agent/SSRS/SSIS):" -ForegroundColor Cyan
+        if (-not $domainAccounts) {
+            Write-Warning 'No domain AD service accounts found.'
+            return
+        }
+        $domainAccounts | Select-Object Account, ServiceTypes, ServiceCount, Computers, Services | Format-Table -AutoSize
+        $domainAccounts | Select-Object Account, ServiceTypes, ServiceCount, Computers, Services | Write-Output
+        return
+    }
+
+    if (-not $domainAccounts) { Write-Warning 'No domain AD service accounts found.'; return }
+
+    # Apply only accounts that exist on this topology and were supplied with a password
+    $targets = foreach ($row in $domainAccounts) {
+        if ($passwordMap.ContainsKey($row.Account)) {
+            $row
+        } else {
+            Write-Host "Skip $($row.Account): no password supplied in -Account/-SecurePassword" -ForegroundColor Yellow
+        }
+    }
+    $targets = @($targets)
+
+    foreach ($name in @($passwordMap.Keys)) {
+        if (-not ($domainAccounts.Account -contains $name) -and -not ($domainAccounts | Where-Object Account -eq $name)) {
+            Write-Warning "Password supplied for '$name' but that domain account was not found on this topology."
+        }
+    }
+
+    if (-not $targets) {
+        throw 'No matching domain accounts to update. Use -ListAccounts, then pass matching -Account/-SecurePassword pairs.'
+    }
+
+    Write-Host "`nPlan: apply SecOps password(s) to $($targets.Count) account(s), then restart once" -ForegroundColor Cyan
+    Write-Host 'No AD password change will be performed.' -ForegroundColor Yellow
+
     $mutex = [Threading.Mutex]::new($false, $mutexName)
     $gotLock = $false
     try {
@@ -485,76 +659,25 @@ try {
             Write-Host "Vault created: $vaultPath" -ForegroundColor Cyan
         }
 
-        if (-not (Get-Module -ListAvailable -Name dbatools)) {
-            if (-not $InstallModule) { throw 'dbatools missing. Install it or pass -InstallModule.' }
-            Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
-        }
-        Import-Module dbatools -ErrorAction Stop
-        Set-DbatoolsConfig -FullName sql.connection.encrypt -Value $true
-        Set-DbatoolsConfig -FullName sql.connection.trustcert -Value $true
-
-        $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
-            -SqlCredential $SqlCredential -Credential $Credential
-
-        Write-Host "`nMode: $($topo.Mode)  |  AD update: skipped (SecOps-provided password)" -ForegroundColor Cyan
-        $topo.Nodes | Format-Table ComputerName, SqlInstance -AutoSize
-        if ($topo.AgNames) { Write-Host "AGs: $($topo.AgNames -join ', ')" -ForegroundColor Cyan }
-
-        $computers = @($topo.Nodes.ComputerName | Select-Object -Unique)
-
-        $allServices = foreach ($node in $topo.Nodes) {
-            $svcCred = $null
-            $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-            if ($Credential -and $remote) { $svcCred = $Credential }
-            $gp = @{
-                ComputerName = $node.ComputerName; Type = 'Engine', 'Agent'; EnableException = $true
-            }
-            if ($InstanceName) { $gp.InstanceName = $InstanceName }
-            if ($svcCred) { $gp.Credential = $svcCred }
-            Get-DbaService @gp
-        }
-        $allServices = @($allServices)
-        if (-not $allServices) { throw "No Engine/Agent services on: $($computers -join ', ')" }
-
-        Write-Host "`nServices:" -ForegroundColor Cyan
-        $allServices | Select-Object ComputerName, ServiceName, State, StartName | Format-Table -AutoSize
-
-        $groups = $allServices | Group-Object StartName | Where-Object {
-            $c = Test-AccountEligible -StartName $_.Name -ForComputer @($_.Group.ComputerName)[0] -IncludeDomain $IncludeDomain
-            if (-not $c.Ok) { Write-Host "Skip $($_.Name): $($c.Reason)" -ForegroundColor Yellow; return $false }
-            if ($Account -and ($_.Name -ne $Account)) {
-                Write-Host "Skip $($_.Name): not -Account $Account" -ForegroundColor Yellow
-                return $false
-            }
-            $true
-        }
-        if (-not $groups) { Write-Warning 'No eligible accounts to update.'; return }
-
-        if (-not $Account -and @($groups).Count -gt 1) {
-            throw ("Multiple eligible accounts found ({0}). Pass -Account to select which one receives the SecOps password." -f ((@($groups).Name) -join ', '))
-        }
-
-        Write-Host "`nPlan: apply SecOps password to $($groups.Count) account(s) on $($computers -join ', ')" -ForegroundColor Cyan
-        Write-Host 'No AD password change will be performed.' -ForegroundColor Yellow
-
         $anyFailures = $false
         $seedComputer = $topo.Nodes[0].ComputerName
         $updatedAccounts = [System.Collections.Generic.List[string]]::new()
 
-        foreach ($g in $groups) {
-            $acct = $g.Name
+        foreach ($row in $targets) {
+            $acct = $row.Account
+            $securePwd = $passwordMap[$acct]
             Write-Host "`nApplying password: $acct" -ForegroundColor Green
             $ok = $true
 
-            foreach ($computer in @($g.Group.ComputerName | Select-Object -Unique)) {
+            foreach ($computer in @($row.Group.ComputerName | Select-Object -Unique)) {
                 if (-not $ok) { break }
-                $nodeServices = @($g.Group | Where-Object ComputerName -eq $computer)
+                $nodeServices = @($row.Group | Where-Object ComputerName -eq $computer)
                 $svcCred = $null
                 $remote = $computer -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
                 if ($Credential -and $remote) { $svcCred = $Credential }
                 try {
-                    Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer" -ForegroundColor DarkCyan
-                    $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $SecurePassword -Credential $svcCred
+                    Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer ($(($nodeServices.ServiceName) -join ', '))" -ForegroundColor DarkCyan
+                    $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
                     if ($result.Status -contains 'Failed') {
                         Write-Host "  FAILED @ ${computer}: $((($result | Where-Object Status -eq Failed).Message) -join '; ')" -ForegroundColor Red
                         $ok = $false; $anyFailures = $true
@@ -567,11 +690,11 @@ try {
 
             if ($ok) {
                 $vaultDoc.Accounts[$acct] = @{
-                    EncryptedPassword = Protect-Secret -Secret $SecurePassword -Key $vaultKey
+                    EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
                     LastComputerName  = $seedComputer
                     LastTopology      = $topo.Mode
                     LastNodes         = ($computers -join ', ')
-                    LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
+                    LastServices      = (($row.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
                     LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
                     LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
                     Source            = 'SecOpsProvided'
@@ -582,7 +705,7 @@ try {
             }
         }
 
-        # Restart / AG failover+failback is mandatory (same path as RotateSqlServiceAccount)
+        # One restart / AG cycle after all account password updates
         if (-not $anyFailures) {
             if ($topo.Mode -eq 'AvailabilityGroup') {
                 Invoke-GracefulAgApply `
@@ -598,7 +721,7 @@ try {
                 $svcCred = $null
                 $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
                 if ($Credential -and $remote) { $svcCred = $Credential }
-                Restart-SqlEngineAgent -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
+                Restart-SqlTargetServices -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
             }
         }
 
@@ -614,7 +737,7 @@ try {
         if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
     } finally {
         if ($gotLock) { [void]$mutex.ReleaseMutex() }
-        $mutex.Dispose()
+        if ($mutex) { $mutex.Dispose() }
     }
 } finally {
     Stop-Transcript | Out-Null
