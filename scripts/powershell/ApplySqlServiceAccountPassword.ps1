@@ -573,49 +573,101 @@ function Test-SqlConnectRetryable {
     return [bool]($ErrorText -match 'SSPI|principal name|Cannot generate SSPI|Login timeout|network-related|error: 40|error: 0|connection.*fail|timeout|not allowed to connect|pipeline')
 }
 
+function Wait-SqlEngineServiceRunning {
+    param(
+        [string]$Computer,
+        [PSCredential]$Credential,
+        [int]$TimeoutSeconds = 180
+    )
+    if ([string]::IsNullOrWhiteSpace($Computer)) { return }
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $attempt = 0
+    Write-Host "  Node service: waiting for Engine Running on $Computer (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
+    do {
+        $attempt++
+        try {
+            $gp = @{
+                ComputerName    = $Computer
+                Type            = 'Engine'
+                EnableException = $true
+                ErrorAction     = 'Stop'
+            }
+            if ($Credential) { $gp.Credential = $Credential }
+            $engines = @(Get-DbaService @gp)
+            $running = @($engines | Where-Object { [string]$_.State -eq 'Running' })
+            if ($running.Count -gt 0) {
+                $names = ($running.ServiceName) -join ', '
+                Write-Host "  Node service: OK Engine Running on $Computer ($names)" -ForegroundColor Green
+                return
+            }
+            $states = if ($engines) { ($engines | ForEach-Object { "$($_.ServiceName)=$($_.State)" }) -join '; ' } else { 'no Engine services returned' }
+            Write-Host "  Node service: not ready on $Computer (attempt $attempt): $states" -ForegroundColor DarkYellow
+        } catch {
+            Write-Host ("  Node service: query failed on {0} (attempt {1}): {2}" -f $Computer, $attempt, (Get-SqlErrorSummary ([string]$_))) -ForegroundColor DarkYellow
+        }
+        Start-Sleep -Seconds 5
+    } while ((Get-Date) -lt $deadline)
+    throw "SQL Engine not Running on $Computer within ${TimeoutSeconds}s (node/service check — not Kerberos)."
+}
+
 function Wait-SqlInstanceReady {
     param(
+        [string]$Computer,
         [string[]]$SqlInstance,
+        [PSCredential]$Credential,
         [PSCredential]$SqlCredential,
-        [int]$TimeoutSeconds = 180
+        [int]$TimeoutSeconds = 180,
+        [int]$SqlAuthAttempts = 4
     )
     $targets = @($SqlInstance | Where-Object { $_ } | Select-Object -Unique)
     if ($targets.Count -eq 0) { throw 'Wait-SqlInstanceReady: no SqlInstance provided.' }
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    $attempt = 0
+    Wait-SqlEngineServiceRunning -Computer $Computer -Credential $Credential `
+        -TimeoutSeconds ([Math]::Max(60, [Math]::Min($TimeoutSeconds, 180)))
+
+    try {
+        $tnc = Test-NetConnection -ComputerName $Computer -Port 1433 -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+        if ($tnc -and $tnc.TcpTestSucceeded) {
+            Write-Host "  Node TCP: OK ${Computer}:1433" -ForegroundColor Green
+        } elseif ($tnc) {
+            Write-Host "  Node TCP: ${Computer}:1433 not open (named instance may use a different port)" -ForegroundColor DarkYellow
+        }
+    } catch {
+        $null = $_
+    }
+
+    $authLabel = if ($SqlCredential) { 'SQL auth' } else { 'Windows auth' }
+    Write-Host ("  SQL login: probing {0} via {1} (max {2} attempts)" -f ($targets -join ' | '), $authLabel, $SqlAuthAttempts) -ForegroundColor DarkCyan
+
     $sspiHits = 0
-    Write-Host ("  SQL connect: waiting for {0} (up to {1}s)" -f ($targets -join ' | '), $TimeoutSeconds) -ForegroundColor DarkCyan
-    do {
-        $attempt++
+    for ($attempt = 1; $attempt -le $SqlAuthAttempts; $attempt++) {
         foreach ($target in $targets) {
             try {
                 $p = @{ SqlInstance = $target; ErrorAction = 'Stop' }
                 if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
                 $null = Connect-DbaInstance @p
-                Write-Host "  SQL connect: OK $target (attempt $attempt)" -ForegroundColor Green
+                Write-Host "  SQL login: OK $target ($authLabel, attempt $attempt)" -ForegroundColor Green
                 return $target
             } catch {
                 $msg = [string]$_
                 if ($msg -match 'parameter cannot be found|NamedParameterNotFound|Cannot find a parameter') { throw }
                 $summary = Get-SqlErrorSummary -ErrorText $msg
-                Write-Host ("  SQL connect: not ready {0} (attempt {1}): {2}" -f $target, $attempt, $summary) -ForegroundColor DarkYellow
+                Write-Host ("  SQL login: not ready {0} (attempt {1}): {2}" -f $target, $attempt, $summary) -ForegroundColor DarkYellow
                 if ($summary -match 'SSPI|principal name') { $sspiHits++ }
-                if (-not (Test-SqlConnectRetryable -ErrorText $msg) -and $attempt -gt 3) { throw }
+                if (-not (Test-SqlConnectRetryable -ErrorText $msg) -and $attempt -ge 2) { throw }
             }
         }
         Start-Sleep -Seconds 5
-    } while ((Get-Date) -lt $deadline)
+    }
 
-    $hint = if ($sspiHits -gt 0 -and -not $SqlCredential) {
-        @"
-
-Persistent SSPI/Kerberos on: $($targets -join ', ').
-Check SPNs for the SQL service account (setspn -Q MSSQLSvc/hostname...), DNS, and clock skew.
-Or re-run AG steps with -SqlCredential (SQL auth) to bypass Kerberos during rotate.
+    if ($sspiHits -gt 0 -and -not $SqlCredential) {
+        throw @"
+Node ${Computer}: SQL Engine is Running, but Windows auth failed with SSPI/Kerberos on: $($targets -join ', ').
+This is not a "node down" problem — Kerberos/SPN for the SQL service account is broken (or still settling).
+Fix SPNs (setspn -Q MSSQLSvc/${Computer}...), or pass -SqlCredential so AG failover/wait uses SQL auth.
 "@
-    } else { '' }
-    throw "SQL instance not accepting connections within ${TimeoutSeconds}s ($($targets -join ' | ')).$hint"
+    }
+    throw "SQL login failed for $($targets -join ' | ') after Engine was Running on $Computer."
 }
 
 function Wait-AgReady {
@@ -717,9 +769,11 @@ function Invoke-GracefulAgApply {
     Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) `
         -Account $Account -AccountPassword $AccountPassword
-    $secondaryConnect = Wait-SqlInstanceReady -SqlInstance $secondaryCandidates -SqlCredential $SqlCredential `
+    $secondaryConnect = Wait-SqlInstanceReady -Computer $secondary.ComputerName -SqlInstance $secondaryCandidates `
+        -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) -SqlCredential $SqlCredential `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
-    $primaryConnect = Wait-SqlInstanceReady -SqlInstance $primaryCandidates -SqlCredential $SqlCredential `
+    $primaryConnect = Wait-SqlInstanceReady -Computer $primary.ComputerName -SqlInstance $primaryCandidates `
+        -Credential (Get-RemoteCredential $primary.ComputerName $Credential) -SqlCredential $SqlCredential `
         -TimeoutSeconds ([Math]::Min(120, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $primaryConnect -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -750,7 +804,8 @@ function Invoke-GracefulAgApply {
     Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $primary.ComputerName $Credential) `
         -Account $Account -AccountPassword $AccountPassword
-    $primaryConnect = Wait-SqlInstanceReady -SqlInstance $primaryCandidates -SqlCredential $SqlCredential `
+    $primaryConnect = Wait-SqlInstanceReady -Computer $primary.ComputerName -SqlInstance $primaryCandidates `
+        -Credential (Get-RemoteCredential $primary.ComputerName $Credential) -SqlCredential $SqlCredential `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $secondaryConnect -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
