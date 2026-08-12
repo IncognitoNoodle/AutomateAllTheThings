@@ -373,6 +373,65 @@ Install RSAT ActiveDirectory, or reset AD yourself and re-run with -SkipAdPasswo
     Set-ADAccountPassword -Identity $sam -NewPassword $SecurePassword -Reset -ErrorAction Stop
 }
 
+function Wait-AdCredentialReady {
+    <#
+      After Set-ADAccountPassword, wait until domain auth accepts the new password.
+      Prevents service restart lockouts when DC replication is slow.
+    #>
+    param(
+        [string]$Account,
+        [securestring]$SecurePassword,
+        [int]$TimeoutSeconds = 180
+    )
+
+    $sam = $Account.Split('\')[-1]
+    $domain = if ($Account -match '\\') { $Account.Split('\')[0] } else { $env:USERDOMAIN }
+
+    Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
+    if (Get-Module -ListAvailable -Name ActiveDirectory) {
+        Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+    }
+
+    $plain = [Net.NetworkCredential]::new('', $SecurePassword).Password
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    Write-Host "  AD: waiting until password is accepted for $Account (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
+
+    do {
+        try {
+            $adUser = $null
+            try { $adUser = Get-ADUser -Identity $sam -Properties LockedOut -ErrorAction Stop } catch { }
+
+            if ($adUser -and $adUser.LockedOut) {
+                Write-Warning "  AD account $sam is locked out - unlocking before retry"
+                Unlock-ADAccount -Identity $sam -ErrorAction Stop
+                Start-Sleep -Seconds 2
+            }
+
+            $ctx = [DirectoryServices.AccountManagement.PrincipalContext]::new(
+                [DirectoryServices.AccountManagement.ContextType]::Domain,
+                $domain
+            )
+            try {
+                if ($ctx.ValidateCredentials($sam, $plain)) {
+                    Write-Host "  AD: credential OK for $Account" -ForegroundColor Green
+                    return
+                }
+            } finally {
+                $ctx.Dispose()
+            }
+        } catch {
+            Write-Host ("  AD wait: {0}" -f $_) -ForegroundColor DarkYellow
+        }
+        Start-Sleep -Seconds 5
+    } while ((Get-Date) -lt $deadline)
+
+    throw @"
+AD password for '$Account' was not accepted within ${TimeoutSeconds}s.
+Likely DC replication delay or account lockout. Unlock the account, confirm AD replication, then re-run.
+Do not restart SQL services until ValidateCredentials succeeds for the new password.
+"@
+}
+
 function Update-NodeServicePassword {
     param([object[]]$Services, [securestring]$SecurePassword, [PSCredential]$Credential)
     $p = @{
@@ -707,26 +766,20 @@ try {
             Write-Warning 'Nothing to rotate.'; return
         }
 
-        Write-Host "`nPlan: $($groups.Count) account(s) on $($computers -join ', ')" -ForegroundColor Cyan
+        $groupList = @($groups)
+        Write-Host "`nPlan: $($groupList.Count) account(s) on $($computers -join ', ')" -ForegroundColor Cyan
 
         $anyFailures = $false
         $seedComputer = $topo.Nodes[0].ComputerName
 
-        foreach ($g in $groups) {
+        foreach ($g in $groupList) {
             $account = $g.Name
             Write-Host "`nRotating: $account" -ForegroundColor Green
             $securePwd = Get-StrongPassword -Length $PasswordLength
             $ok = $true
 
-            if (-not $SkipAdPasswordReset) {
-                try {
-                    Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
-                } catch {
-                    Write-Host "  FAILED (AD): $_" -ForegroundColor Red
-                    $ok = $false; $anyFailures = $true
-                }
-            }
-
+            # 1) Push new password to Windows service logon cache on every node first
+            #    (running services keep old credentials in memory until restart).
             foreach ($computer in @($g.Group.ComputerName | Select-Object -Unique)) {
                 if (-not $ok) { break }
                 $nodeServices = @($g.Group | Where-Object ComputerName -eq $computer)
@@ -742,6 +795,17 @@ try {
                     }
                 } catch {
                     Write-Host "  FAILED @ ${computer}: $_" -ForegroundColor Red
+                    $ok = $false; $anyFailures = $true
+                }
+            }
+
+            # 2) Change AD password, then wait until domain auth accepts it (replication).
+            if ($ok -and -not $SkipAdPasswordReset) {
+                try {
+                    Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
+                    Wait-AdCredentialReady -Account $account -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
+                } catch {
+                    Write-Host "  FAILED (AD): $_" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
                 }
             }
@@ -766,7 +830,7 @@ try {
         if (-not $SkipRestart -and -not $anyFailures) {
             # Restart only service types that were rotated.
             $typesToRestart = @(
-                $groups |
+                $groupList |
                     ForEach-Object { $_.Group } |
                     ForEach-Object { [string]$_.ServiceType } |
                     Sort-Object -Unique
