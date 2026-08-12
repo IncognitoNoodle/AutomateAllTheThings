@@ -778,6 +778,11 @@ function Wait-SqlTargetServiceRunning {
     throw "$label not Running on $Computer within ${TimeoutSeconds}s."
 }
 
+function Test-SqlAuthFailureMessage {
+    param([string]$Message)
+    $Message -match 'SSPI|Kerberos|login failed|Login failed|principal name|Cannot generate SSPI|A network-related|timeout|timed out|connection|Connection'
+}
+
 function Wait-AgReady {
     param(
         [string]$SqlInstance,
@@ -787,13 +792,30 @@ function Wait-AgReady {
         [int]$TimeoutSeconds
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $attempt = 0
+    $authWarned = $false
     do {
+        $attempt++
         try {
-            $p = @{ SqlInstance = $SqlInstance; AvailabilityGroup = $AgNames; EnableException = $true }
+            $p = @{
+                SqlInstance         = $SqlInstance
+                AvailabilityGroup   = $AgNames
+                EnableException     = $true
+                WarningAction       = 'SilentlyContinue'
+                ErrorAction         = 'Stop'
+            }
             if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
             $ags = @(Get-DbaAvailabilityGroup @p)
         } catch {
-            Write-Host ("  Wait sync: {0} - {1}" -f $SqlInstance, $_) -ForegroundColor DarkYellow
+            $msg = [string]$_
+            if ((Test-SqlAuthFailureMessage $msg)) {
+                if (-not $authWarned -or ($attempt % 6) -eq 0) {
+                    Write-Host "  Wait sync: $SqlInstance not accepting Windows/SQL login yet (retrying)" -ForegroundColor DarkYellow
+                    $authWarned = $true
+                }
+            } else {
+                Write-Host ("  Wait sync: {0} - {1}" -f $SqlInstance, $msg.Split("`n")[0]) -ForegroundColor DarkYellow
+            }
             Start-Sleep -Seconds 5
             continue
         }
