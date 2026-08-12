@@ -399,7 +399,8 @@ function Wait-AdCredentialReady {
     do {
         try {
             $adUser = $null
-            try { $adUser = Get-ADUser -Identity $sam -Properties LockedOut -ErrorAction Stop } catch { }
+            try { $adUser = Get-ADUser -Identity $sam -Properties LockedOut -ErrorAction Stop }
+            catch { $adUser = $null }
 
             if ($adUser -and $adUser.LockedOut) {
                 Write-Warning "  AD account $sam is locked out - unlocking before retry"
