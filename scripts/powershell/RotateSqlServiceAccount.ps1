@@ -673,9 +673,21 @@ function Write-VaultHistoryCsv {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+if ($script:OutputFolder -match 'SERVERNAME' -or [string]::IsNullOrWhiteSpace($script:OutputFolder)) {
+    throw @"
+OutputFolder is not configured.
+Edit CONFIG in this script and set a real shared path, for example:
+  `$script:OutputFolder = '\\YourFileServer\Share\SqlServiceAccountRotation\'
+Current value: $($script:OutputFolder)
+"@
+}
 if (-not (Test-Path $script:OutputFolder)) {
-    New-Item $script:OutputFolder -ItemType Directory -Force | Out-Null
-    Set-RestrictedAcl -Path $script:OutputFolder -Container
+    try {
+        New-Item $script:OutputFolder -ItemType Directory -Force | Out-Null
+        Set-RestrictedAcl -Path $script:OutputFolder -Container
+    } catch {
+        throw "Cannot create/access OutputFolder '$($script:OutputFolder)'. Check the UNC path and share permissions. $_"
+    }
 }
 
 $transcript = $PSCmdlet.ParameterSetName -eq 'Rotate'
