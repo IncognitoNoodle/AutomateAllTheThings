@@ -400,17 +400,55 @@ function Unlock-AdServiceAccount {
     }
 }
 
+function Resolve-AdAuthDomain {
+    # Prefer DNS domain for PrincipalContext; NETBIOS alone can make ValidateCredentials return false.
+    param([string]$Account)
+    if ($Account -match '@') { return $Account.Split('@')[-1] }
+    $netbios = if ($Account -match '\\') { $Account.Split('\')[0] } else { $env:USERDOMAIN }
+    if (Get-Module -ListAvailable -Name ActiveDirectory) {
+        try {
+            Import-Module ActiveDirectory -ErrorAction Stop
+            $d = Get-ADDomain -Identity $netbios -ErrorAction Stop
+            if ($d.DNSRoot) { return [string]$d.DNSRoot }
+        } catch {
+            $null = $_
+        }
+    }
+    return $netbios
+}
+
 function Test-AdCredentialHere {
+    # Asks this host's DC: does domain\user + password authenticate?
     # ValidateCredentials requires a plain string; SecureString is used at the call sites.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'PlainPassword')]
     param([string]$Domain, [string]$SamAccountName, [string]$PlainPassword)
     Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
-    $ctx = [DirectoryServices.AccountManagement.PrincipalContext]::new(
-        [DirectoryServices.AccountManagement.ContextType]::Domain,
-        $Domain
-    )
-    try { return [bool]$ctx.ValidateCredentials($SamAccountName, $PlainPassword) }
-    finally { $ctx.Dispose() }
+
+    $opts = [DirectoryServices.AccountManagement.ContextOptions]::Negotiate -bor
+        [DirectoryServices.AccountManagement.ContextOptions]::Signing -bor
+        [DirectoryServices.AccountManagement.ContextOptions]::Sealing
+
+    $users = [System.Collections.Generic.List[string]]::new()
+    [void]$users.Add($SamAccountName)
+    if ($SamAccountName -notmatch '\\|@') {
+        [void]$users.Add(('{0}\{1}' -f $Domain, $SamAccountName))
+    }
+
+    foreach ($user in $users) {
+        $ctx = [DirectoryServices.AccountManagement.PrincipalContext]::new(
+            [DirectoryServices.AccountManagement.ContextType]::Domain,
+            $Domain
+        )
+        try {
+            if ($ctx.ValidateCredentials($user, $PlainPassword, $opts)) { return $true }
+            if ($ctx.ValidateCredentials($user, $PlainPassword)) { return $true }
+        } catch {
+            $null = $_
+        } finally {
+            $ctx.Dispose()
+        }
+    }
+    return $false
 }
 
 function Wait-AdCredentialReady {
@@ -426,7 +464,8 @@ function Wait-AdCredentialReady {
     )
 
     $sam = $Account.Split('\')[-1]
-    $domain = if ($Account -match '\\') { $Account.Split('\')[0] } else { $env:USERDOMAIN }
+    if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    $domain = Resolve-AdAuthDomain -Account $Account
     $plain = [Net.NetworkCredential]::new('', $SecurePassword).Password
     $started = Get-Date
     $deadline = $started.AddSeconds($TimeoutSeconds)
@@ -477,7 +516,8 @@ function Test-AdCredentialOnComputer {
     )
 
     $sam = $Account.Split('\')[-1]
-    $domain = if ($Account -match '\\') { $Account.Split('\')[0] } else { $env:USERDOMAIN }
+    if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    $domain = Resolve-AdAuthDomain -Account $Account
     $localNames = @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
     if ($Computer -in $localNames) {
         return Test-AdCredentialHere -Domain $domain -SamAccountName $sam -PlainPassword $PlainPassword
@@ -486,12 +526,26 @@ function Test-AdCredentialOnComputer {
     $sb = {
         param($Domain, $Sam, $SecretText)
         Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
-        $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
-            [System.DirectoryServices.AccountManagement.ContextType]::Domain,
-            $Domain
-        )
-        try { return [bool]$ctx.ValidateCredentials($Sam, $SecretText) }
-        finally { $ctx.Dispose() }
+        $opts = [System.DirectoryServices.AccountManagement.ContextOptions]::Negotiate -bor
+            [System.DirectoryServices.AccountManagement.ContextOptions]::Signing -bor
+            [System.DirectoryServices.AccountManagement.ContextOptions]::Sealing
+        $users = @($Sam)
+        if ($Sam -notmatch '\\|@') { $users += ('{0}\{1}' -f $Domain, $Sam) }
+        foreach ($user in $users) {
+            $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
+                [System.DirectoryServices.AccountManagement.ContextType]::Domain,
+                $Domain
+            )
+            try {
+                if ($ctx.ValidateCredentials($user, $SecretText, $opts)) { return $true }
+                if ($ctx.ValidateCredentials($user, $SecretText)) { return $true }
+            } catch {
+                $null = $_
+            } finally {
+                $ctx.Dispose()
+            }
+        }
+        return $false
     }
 
     $ic = @{
@@ -1007,22 +1061,42 @@ try {
                 }
             }
 
-            # 2) Change AD password, then wait until BOTH mgmt host AND each SQL node accept it.
-            #    Mgmt-host OK alone is not enough: SQL nodes often use a different site DC.
+            # 2) Change AD password, vault immediately, then wait for mgmt host + each SQL node.
+            #    Vault BEFORE wait: if wait times out, AD/services already have the new password -
+            #    without an early vault write that password was disposed and lost (re-runs break).
             if ($ok -and -not $SkipAdPasswordReset) {
                 try {
                     $accountNodes = @($g.Group.ComputerName | Sort-Object -Unique)
                     Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
+
+                    $vaultDoc.Accounts[$account] = @{
+                        EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
+                        LastComputerName  = $seedComputer
+                        LastTopology      = $topo.Mode
+                        LastNodes         = ($computers -join ', ')
+                        LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
+                        LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
+                        LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
+                    }
+                    Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+                    Write-Host '  Saved to vault (AD changed; waiting for replication before restart).' -ForegroundColor Green
+
                     Wait-AdCredentialReady -Account $account -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
                     Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $securePwd `
                         -ComputerName $accountNodes -Credential $Credential -TimeoutSeconds $SyncTimeoutSeconds
+                    $rotatedAccounts.Add($account)
                 } catch {
                     Write-Host "  FAILED (AD): $_" -ForegroundColor Red
+                    if ($vaultDoc.Accounts.ContainsKey($account) -and $vaultDoc.Accounts[$account].EncryptedPassword) {
+                        Write-Warning @"
+AD/service password for '$account' may already be changed, and is saved in the vault.
+Do NOT rotate again blindly. Use -RevealAccount '$account' to recover it, fix AD/lockout/replication,
+then re-run with -SkipAdPasswordReset (or wait and re-run restart path) once ValidateCredentials works.
+"@
+                    }
                     $ok = $false; $anyFailures = $true
                 }
-            }
-
-            if ($ok) {
+            } elseif ($ok -and $SkipAdPasswordReset) {
                 $vaultDoc.Accounts[$account] = @{
                     EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
                     LastComputerName  = $seedComputer
@@ -1034,7 +1108,7 @@ try {
                 }
                 Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
                 $rotatedAccounts.Add($account)
-                Write-Host '  Saved to password-protected vault (not restarted yet).' -ForegroundColor Green
+                Write-Host '  Saved to password-protected vault (SkipAdPasswordReset; not restarted yet).' -ForegroundColor Green
             }
 
             if ($securePwd) { $securePwd.Dispose(); Remove-Variable securePwd -EA SilentlyContinue }

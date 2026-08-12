@@ -266,17 +266,54 @@ function Unlock-AdServiceAccount {
     }
 }
 
+function Resolve-AdAuthDomain {
+    # Prefer DNS domain for PrincipalContext; NETBIOS alone can make ValidateCredentials return false.
+    param([string]$Account)
+    if ($Account -match '@') { return $Account.Split('@')[-1] }
+    $netbios = if ($Account -match '\\') { $Account.Split('\')[0] } else { $env:USERDOMAIN }
+    if (Get-Module -ListAvailable -Name ActiveDirectory) {
+        try {
+            Import-Module ActiveDirectory -ErrorAction Stop
+            $d = Get-ADDomain -Identity $netbios -ErrorAction Stop
+            if ($d.DNSRoot) { return [string]$d.DNSRoot }
+        } catch {
+            $null = $_
+        }
+    }
+    return $netbios
+}
+
 function Test-AdCredentialHere {
-    # ValidateCredentials requires a plain string; SecureString is used at the call sites.
+    # Asks this host's DC: does domain\user + password authenticate?
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'PlainPassword')]
     param([string]$Domain, [string]$SamAccountName, [string]$PlainPassword)
     Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
-    $ctx = [DirectoryServices.AccountManagement.PrincipalContext]::new(
-        [DirectoryServices.AccountManagement.ContextType]::Domain,
-        $Domain
-    )
-    try { return [bool]$ctx.ValidateCredentials($SamAccountName, $PlainPassword) }
-    finally { $ctx.Dispose() }
+
+    $opts = [DirectoryServices.AccountManagement.ContextOptions]::Negotiate -bor
+        [DirectoryServices.AccountManagement.ContextOptions]::Signing -bor
+        [DirectoryServices.AccountManagement.ContextOptions]::Sealing
+
+    $users = [System.Collections.Generic.List[string]]::new()
+    [void]$users.Add($SamAccountName)
+    if ($SamAccountName -notmatch '\\|@') {
+        [void]$users.Add(('{0}\{1}' -f $Domain, $SamAccountName))
+    }
+
+    foreach ($user in $users) {
+        $ctx = [DirectoryServices.AccountManagement.PrincipalContext]::new(
+            [DirectoryServices.AccountManagement.ContextType]::Domain,
+            $Domain
+        )
+        try {
+            if ($ctx.ValidateCredentials($user, $PlainPassword, $opts)) { return $true }
+            if ($ctx.ValidateCredentials($user, $PlainPassword)) { return $true }
+        } catch {
+            $null = $_
+        } finally {
+            $ctx.Dispose()
+        }
+    }
+    return $false
 }
 
 function Wait-AdCredentialReady {
@@ -292,13 +329,8 @@ function Wait-AdCredentialReady {
     )
 
     $sam = $Account.Split('\')[-1]
-    $domain = if ($Account -match '\\') {
-        $Account.Split('\')[0]
-    } elseif ($Account -match '@') {
-        $Account.Split('@')[1]
-    } else {
-        $env:USERDOMAIN
-    }
+    if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    $domain = Resolve-AdAuthDomain -Account $Account
     $plain = [Net.NetworkCredential]::new('', $SecurePassword).Password
     $started = Get-Date
     $deadline = $started.AddSeconds($TimeoutSeconds)
@@ -349,13 +381,8 @@ function Test-AdCredentialOnComputer {
     )
 
     $sam = $Account.Split('\')[-1]
-    $domain = if ($Account -match '\\') {
-        $Account.Split('\')[0]
-    } elseif ($Account -match '@') {
-        $Account.Split('@')[1]
-    } else {
-        $env:USERDOMAIN
-    }
+    if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    $domain = Resolve-AdAuthDomain -Account $Account
     $localNames = @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
     if ($Computer -in $localNames) {
         return Test-AdCredentialHere -Domain $domain -SamAccountName $sam -PlainPassword $PlainPassword
@@ -364,12 +391,26 @@ function Test-AdCredentialOnComputer {
     $sb = {
         param($Domain, $Sam, $SecretText)
         Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
-        $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
-            [System.DirectoryServices.AccountManagement.ContextType]::Domain,
-            $Domain
-        )
-        try { return [bool]$ctx.ValidateCredentials($Sam, $SecretText) }
-        finally { $ctx.Dispose() }
+        $opts = [System.DirectoryServices.AccountManagement.ContextOptions]::Negotiate -bor
+            [System.DirectoryServices.AccountManagement.ContextOptions]::Signing -bor
+            [System.DirectoryServices.AccountManagement.ContextOptions]::Sealing
+        $users = @($Sam)
+        if ($Sam -notmatch '\\|@') { $users += ('{0}\{1}' -f $Domain, $Sam) }
+        foreach ($user in $users) {
+            $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
+                [System.DirectoryServices.AccountManagement.ContextType]::Domain,
+                $Domain
+            )
+            try {
+                if ($ctx.ValidateCredentials($user, $SecretText, $opts)) { return $true }
+                if ($ctx.ValidateCredentials($user, $SecretText)) { return $true }
+            } catch {
+                $null = $_
+            } finally {
+                $ctx.Dispose()
+            }
+        }
+        return $false
     }
 
     $ic = @{
