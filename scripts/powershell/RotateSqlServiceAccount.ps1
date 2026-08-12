@@ -892,7 +892,7 @@ function Wait-AgReady {
         }
         if (-not $pending) {
             if ($ForPlannedFailover) {
-                Write-Host "  $label: databases Synchronized/failover-ready on $SecondarySqlInstance" -ForegroundColor Green
+                Write-Host "  ${label}: databases Synchronized/failover-ready on $SecondarySqlInstance" -ForegroundColor Green
             }
             return
         }
