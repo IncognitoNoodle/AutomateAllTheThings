@@ -58,7 +58,7 @@ param(
 
 # === CONFIG (edit here) ===
 # Shared UNC for vault + history + transcripts. Change once for the environment.
-$script:OutputFolder = ''
+$script:OutputFolder = '\\SERVERNAME\C$\Temp\'
 $script:ServiceTypes = @('Engine', 'Agent', 'SSRS', 'SSIS')
 
 $ErrorActionPreference = 'Stop'
@@ -651,11 +651,44 @@ function Update-NodeServicePassword {
     Update-DbaServiceAccount @p
 }
 
+function Test-RestartAuthFailure {
+    param([object[]]$Results)
+    $text = @(
+        $Results | ForEach-Object {
+            @($_.Status, $_.State, $_.Message, $_.ServiceName) -join ' '
+        }
+    ) -join ' | '
+    return [bool]($text -match 'authentication|logon failure|correct authentication|password|credentials|dependent service')
+}
+
+function Wait-AdAfterAuthFailure {
+    param(
+        [string[]]$Account,
+        [hashtable]$AccountPassword,
+        [string]$Computer,
+        [PSCredential]$Credential,
+        [int]$TimeoutSeconds
+    )
+    Write-Warning '  Auth/logon failure suspected - unlock, re-check AD on node, retry'
+    foreach ($acct in @($Account)) {
+        if (-not $acct) { continue }
+        Unlock-AdServiceAccount -Account $acct
+        if ($AccountPassword -and $AccountPassword.ContainsKey($acct)) {
+            Wait-AdCredentialReadyOnNode -Account $acct -SecurePassword $AccountPassword[$acct] `
+                -ComputerName $Computer -Credential $Credential -TimeoutSeconds $TimeoutSeconds
+        }
+    }
+}
+
 function Restart-SqlTargetService {
     param(
         [string]$Computer,
         [string[]]$Type = $script:ServiceTypes,
-        [PSCredential]$Credential
+        [PSCredential]$Credential,
+        [string[]]$Account,
+        [hashtable]$AccountPassword,
+        [int]$RetryCount = 5,
+        [int]$RetryDelaySeconds = 20
     )
     $Type = @($Type | Where-Object { $_ } | Sort-Object -Unique)
     if (-not $Type) { $Type = $script:ServiceTypes }
@@ -667,10 +700,83 @@ function Restart-SqlTargetService {
         EnableException = $true
     }
     if ($Credential) { $p.Credential = $Credential }
-    Write-Host "  Restart $($Type -join '/') on $Computer" -ForegroundColor Cyan
-    $result = @(Restart-DbaService @p)
-    $bad = @($result | Where-Object { $_.Status -eq 'Failed' -or $_.State -ne 'Running' })
-    if ($bad) { throw "Restart failed on ${Computer}: $(($bad.ServiceName) -join ', ')" }
+    $retryWait = [Math]::Max(60, $RetryDelaySeconds * 3)
+
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        Write-Host "  Restart $($Type -join '/') on $Computer (attempt $attempt/$RetryCount)" -ForegroundColor Cyan
+        try {
+            $result = @(Restart-DbaService @p)
+        } catch {
+            $err = [string]$_
+            Write-Warning "  Restart-DbaService threw on ${Computer}: $err"
+            $authFail = $err -match 'authentication|logon|password|credential|dependent service'
+            if (-not $authFail -or $attempt -ge $RetryCount) { throw }
+            Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
+                -Computer $Computer -Credential $Credential -TimeoutSeconds $retryWait
+            Start-Sleep -Seconds $RetryDelaySeconds
+            continue
+        }
+
+        $bad = @($result | Where-Object {
+                $_.Status -eq 'Failed' -or [string]$_.State -ne 'Running'
+            })
+        if (-not $bad) { return }
+
+        $names = ($bad.ServiceName) -join ', '
+        Write-Warning "  Restart failed on ${Computer}: $names"
+        if (-not (Test-RestartAuthFailure -Results $bad) -or $attempt -ge $RetryCount) {
+            throw "Restart failed on ${Computer}: $names"
+        }
+
+        Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
+            -Computer $Computer -Credential $Credential -TimeoutSeconds $retryWait
+        Start-Sleep -Seconds $RetryDelaySeconds
+    }
+}
+
+function Wait-SqlTargetServiceRunning {
+    param(
+        [string]$Computer,
+        [string[]]$Type = $script:ServiceTypes,
+        [PSCredential]$Credential,
+        [int]$TimeoutSeconds = 180
+    )
+    if ([string]::IsNullOrWhiteSpace($Computer)) { return }
+    $Type = @($Type | Where-Object { $_ } | Sort-Object -Unique)
+    if (-not $Type) { return }
+
+    $label = $Type -join '/'
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $attempt = 0
+    Write-Host "  Waiting for $label Running on $Computer (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
+    do {
+        $attempt++
+        try {
+            $gp = @{
+                ComputerName    = $Computer
+                Type            = $Type
+                EnableException = $true
+                ErrorAction     = 'Stop'
+            }
+            if ($Credential) { $gp.Credential = $Credential }
+            $svcs = @(Get-DbaService @gp)
+            if (-not $svcs) {
+                Write-Host "  No $label services on $Computer (nothing to wait for)" -ForegroundColor DarkYellow
+                return
+            }
+            $notRunning = @($svcs | Where-Object { [string]$_.State -ne 'Running' })
+            if (-not $notRunning) {
+                Write-Host ("  {0} Running on {1} ({2})" -f $label, $Computer, (($svcs.ServiceName) -join ', ')) -ForegroundColor Green
+                return
+            }
+            $states = ($notRunning | ForEach-Object { "$($_.ServiceName)=$($_.State)" }) -join '; '
+            Write-Host "  Not ready on $Computer (attempt $attempt): $states" -ForegroundColor DarkYellow
+        } catch {
+            Write-Host ("  Service check failed on {0} (attempt {1}): {2}" -f $Computer, $attempt, $_) -ForegroundColor DarkYellow
+        }
+        Start-Sleep -Seconds 5
+    } while ((Get-Date) -lt $deadline)
+    throw "$label not Running on $Computer within ${TimeoutSeconds}s."
 }
 
 function Test-ReplicaMatch {
@@ -730,7 +836,9 @@ function Invoke-GracefulAgApply {
         [PSCredential]$Credential,
         [PSCredential]$SqlCredential,
         [int]$SyncTimeoutSeconds,
-        [switch]$SkipFailback
+        [switch]$SkipFailback,
+        [string[]]$Account,
+        [hashtable]$AccountPassword
     )
 
     if (-not $ServiceType) { $ServiceType = $script:ServiceTypes }
@@ -744,9 +852,12 @@ function Invoke-GracefulAgApply {
             (Test-ReplicaMatch -ReplicaName $OriginalPrimary -SqlInstance $_.SqlInstance) -or
             ($_.ComputerName -eq $OriginalPrimary.Split('\')[0])
         } | Select-Object -First 1
+        if (-not $mapped) { throw "Could not map primary '$OriginalPrimary' to discovered nodes." }
         $primarySql = $mapped.SqlInstance
     }
-    if (-not $primarySql) { throw "Could not map primary '$OriginalPrimary' to discovered nodes." }
+    if (-not $primarySql -or -not $bySql.ContainsKey($primarySql)) {
+        throw "Could not map primary '$OriginalPrimary' to discovered nodes."
+    }
 
     $secondary = $Nodes | Where-Object { $_.SqlInstance -ne $primarySql } | Select-Object -First 1
     if (-not $secondary) { throw 'AG mode requires at least two replicas.' }
@@ -757,7 +868,13 @@ function Invoke-GracefulAgApply {
     Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
-    Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType -Credential $Credential
+    $svcCredSecondary = $null
+    $remoteSecondary = $secondary.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+    if ($Credential -and $remoteSecondary) { $svcCredSecondary = $Credential }
+    Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType -Credential $svcCredSecondary `
+        -Account $Account -AccountPassword $AccountPassword
+    Wait-SqlTargetServiceRunning -Computer $secondary.ComputerName -Type $ServiceType -Credential $svcCredSecondary `
+        -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
@@ -772,7 +889,13 @@ function Invoke-GracefulAgApply {
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType -Credential $Credential
+    $svcCredPrimary = $null
+    $remotePrimary = $primary.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+    if ($Credential -and $remotePrimary) { $svcCredPrimary = $Credential }
+    Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType -Credential $svcCredPrimary `
+        -Account $Account -AccountPassword $AccountPassword
+    Wait-SqlTargetServiceRunning -Computer $primary.ComputerName -Type $ServiceType -Credential $svcCredPrimary `
+        -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
@@ -836,9 +959,21 @@ function Write-VaultHistoryCsv {
 Set-DbatoolsConfig sql.connection.encrypt $true
 Set-DbatoolsConfig sql.connection.trustcert $true
 
+if ($script:OutputFolder -match 'SERVERNAME' -or [string]::IsNullOrWhiteSpace($script:OutputFolder)) {
+    throw @"
+OutputFolder is not configured.
+Edit CONFIG in this script and set a real shared path, for example:
+  `$script:OutputFolder = '\\YourFileServer\Share\SqlServiceAccountRotation\'
+Current value: $($script:OutputFolder)
+"@
+}
 if (-not (Test-Path $script:OutputFolder)) {
-    New-Item $script:OutputFolder -ItemType Directory -Force | Out-Null
-    Set-RestrictedAcl -Path $script:OutputFolder -Container
+    try {
+        New-Item $script:OutputFolder -ItemType Directory -Force | Out-Null
+        Set-RestrictedAcl -Path $script:OutputFolder -Container
+    } catch {
+        throw "Cannot create/access OutputFolder '$($script:OutputFolder)'. Check the UNC path and share permissions. $_"
+    }
 }
 
 $transcript = $PSCmdlet.ParameterSetName -eq 'Rotate'
@@ -977,12 +1112,31 @@ try {
             try {
                 Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
                 if (Test-IsDomainAccount -Account $account -Computer $seedComputer) {
+                    $entry = @{
+                        EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
+                        LastComputerName  = $seedComputer
+                        LastTopology      = $topo.Mode
+                        LastNodes         = ($computers -join ', ')
+                        LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
+                        LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
+                        LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
+                    }
+                    $vaultDoc = Save-VaultAccountEntry -Path $vaultPath -Account $account -Entry $entry
+                    Write-Host '  Saved to vault (AD changed; waiting for replication before service update).' -ForegroundColor Green
+
                     Wait-AdCredentialReady -Account $account -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
                     Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $securePwd `
                         -ComputerName $accountNodes -Credential $Credential -TimeoutSeconds $SyncTimeoutSeconds
                 }
             } catch {
                 Write-Host "  FAILED (AD): $_" -ForegroundColor Red
+                if ($vaultDoc.Accounts.ContainsKey($account) -and $vaultDoc.Accounts[$account].EncryptedPassword) {
+                    Write-Warning @"
+AD password for '$account' may already be changed, and is saved in the vault.
+Do NOT rotate again blindly. Use -RevealAccount '$account' to recover it, fix lockout/replication,
+then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update services + restart).
+"@
+                }
                 $ok = $false; $anyFailures = $true
             }
         }
@@ -995,9 +1149,13 @@ try {
             if ($Credential -and $remote) { $svcCred = $Credential }
             try {
                 Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer" -ForegroundColor DarkCyan
-                $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
-                if ($result.Status -contains 'Failed') {
-                    Write-Host "  FAILED @ ${computer}: $((($result | Where-Object Status -eq Failed).Message) -join '; ')" -ForegroundColor Red
+                $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred)
+                $failed = @($result | Where-Object { $_.Status -eq 'Failed' })
+                if ($failed.Count -gt 0) {
+                    Write-Host "  FAILED @ ${computer}: $((($failed).Message) -join '; ')" -ForegroundColor Red
+                    $ok = $false; $anyFailures = $true
+                } elseif ($result.Count -eq 0) {
+                    Write-Host "  FAILED @ ${computer}: Update-DbaServiceAccount returned no result" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
                 }
             } catch {
@@ -1007,17 +1165,24 @@ try {
         }
 
         if ($ok) {
-            $entry = @{
-                EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
-                LastComputerName  = $seedComputer
-                LastTopology      = $topo.Mode
-                LastNodes         = ($computers -join ', ')
-                LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
-                LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
-                LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
+            $alreadyVaulted = (-not $SkipAdPasswordReset) -and (
+                Test-IsDomainAccount -Account $account -Computer $seedComputer
+            ) -and $vaultDoc.Accounts.ContainsKey($account)
+            if ($alreadyVaulted) {
+                Write-Host '  Services updated (not restarted yet).' -ForegroundColor Green
+            } else {
+                $entry = @{
+                    EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
+                    LastComputerName  = $seedComputer
+                    LastTopology      = $topo.Mode
+                    LastNodes         = ($computers -join ', ')
+                    LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
+                    LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
+                    LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
+                }
+                $vaultDoc = Save-VaultAccountEntry -Path $vaultPath -Account $account -Entry $entry
+                Write-Host '  Saved to password-protected vault (not restarted yet).' -ForegroundColor Green
             }
-            $vaultDoc = Save-VaultAccountEntry -Path $vaultPath -Account $account -Entry $entry
-            Write-Host '  Saved to password-protected vault (not restarted yet).' -ForegroundColor Green
             $rotatedAccounts.Add($account)
         }
 
@@ -1025,47 +1190,57 @@ try {
     }
 
     if (-not $SkipRestart -and -not $anyFailures) {
-        # Final node-AD check before restart (site DC lag can still exist after service update).
-        $sqlNodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
-        foreach ($account in $rotatedAccounts) {
-            if (-not (Test-IsDomainAccount -Account $account -Computer $seedComputer)) { continue }
-            if (-not $vaultDoc.Accounts.ContainsKey($account)) { continue }
-            $sec = Unprotect-Secret -CipherText $vaultDoc.Accounts[$account].EncryptedPassword -Key $vaultKey
-            try {
+        $restartAccounts = @($rotatedAccounts)
+        $restartPasswords = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+        try {
+            $sqlNodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
+            foreach ($account in $restartAccounts) {
+                if (-not (Test-IsDomainAccount -Account $account -Computer $seedComputer)) { continue }
+                if (-not $vaultDoc.Accounts.ContainsKey($account)) { continue }
+                $sec = Unprotect-Secret -CipherText $vaultDoc.Accounts[$account].EncryptedPassword -Key $vaultKey
+                $restartPasswords[$account] = $sec
                 Write-Host "`nPre-restart AD check on SQL nodes: $account" -ForegroundColor Cyan
                 Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $sec `
                     -ComputerName $sqlNodes -Credential $Credential `
                     -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
-            } finally {
-                if ($sec) { $sec.Dispose() }
             }
-        }
 
-        $typesToRestart = @(
-            $groups |
-                Where-Object { $_.Name -in $rotatedAccounts } |
-                ForEach-Object { $_.Group } |
-                ForEach-Object { [string]$_.ServiceType } |
-                Sort-Object -Unique
-        )
-        if (-not $typesToRestart) { $typesToRestart = $script:ServiceTypes }
+            $typesToRestart = @(
+                $groups |
+                    Where-Object { $_.Name -in $rotatedAccounts } |
+                    ForEach-Object { $_.Group } |
+                    ForEach-Object { [string]$_.ServiceType } |
+                    Sort-Object -Unique
+            )
+            if (-not $typesToRestart) { $typesToRestart = $script:ServiceTypes }
 
-        if ($topo.Mode -eq 'AvailabilityGroup') {
-            Invoke-GracefulAgApply `
-                -Nodes $topo.Nodes `
-                -AgNames $topo.AgNames `
-                -OriginalPrimary $topo.OriginalPrimary `
-                -ServiceType $typesToRestart `
-                -Credential $Credential `
-                -SqlCredential $SqlCredential `
-                -SyncTimeoutSeconds $SyncTimeoutSeconds `
-                -SkipFailback:$SkipFailback
-        } else {
-            $node = $topo.Nodes[0]
-            $svcCred = $null
-            $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-            if ($Credential -and $remote) { $svcCred = $Credential }
-            Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred
+            if ($topo.Mode -eq 'AvailabilityGroup') {
+                Invoke-GracefulAgApply `
+                    -Nodes $topo.Nodes `
+                    -AgNames $topo.AgNames `
+                    -OriginalPrimary $topo.OriginalPrimary `
+                    -ServiceType $typesToRestart `
+                    -Credential $Credential `
+                    -SqlCredential $SqlCredential `
+                    -SyncTimeoutSeconds $SyncTimeoutSeconds `
+                    -SkipFailback:$SkipFailback `
+                    -Account $restartAccounts `
+                    -AccountPassword $restartPasswords
+            } else {
+                $node = $topo.Nodes[0]
+                $svcCred = $null
+                $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+                if ($Credential -and $remote) { $svcCred = $Credential }
+                Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred `
+                    -Account $restartAccounts -AccountPassword $restartPasswords
+                Wait-SqlTargetServiceRunning -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred `
+                    -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+            }
+        } finally {
+            foreach ($k in @($restartPasswords.Keys)) {
+                if ($restartPasswords[$k]) { $restartPasswords[$k].Dispose() }
+            }
+            $restartPasswords.Clear()
         }
     } elseif ($SkipRestart) {
         Write-Warning 'SkipRestart: password updated; restart/failover later to apply.'
