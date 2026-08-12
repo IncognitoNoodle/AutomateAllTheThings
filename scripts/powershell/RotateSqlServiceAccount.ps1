@@ -1,19 +1,6 @@
 <#
 .SYNOPSIS
     Rotate SQL Engine/Agent/SSRS/SSIS service account passwords (standalone or Always On).
-
-.NOTES
-    Order: Set-ADAccountPassword first, vault immediately, wait until the password validates
-    on the management host AND each SQL node (WinRM), then Update-DbaServiceAccount -NoRestart,
-    then restart. Jump-box ValidateCredentials alone can race site DC replication.
-
-    Vault mutex (Global\SqlServiceAccountVault) is held only during vault file open/read/write,
-    not during AD waits, service updates, or restarts — so other operators can use the vault
-    while a long rotate is waiting on replication.
-
-    Domain Kerberos WinRM encrypts the remoting session used for per-node checks.
-    Prefer Kerberos; avoid Basic auth / CredSSP. HTTPS WinRM is optional environment
-    hardening and is not required by this script.
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
@@ -80,9 +67,6 @@ $vaultPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault.xml'
 $mutexName = 'Global\SqlServiceAccountVault'
 $vaultCanary = 'SqlServiceAccountVault.v2'
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 function Set-RestrictedAcl {
     param([string]$Path, [switch]$Container)
     try {
@@ -159,11 +143,6 @@ function Unprotect-Secret {
 }
 
 function Open-PasswordVault {
-    <#
-      Returns @{ Doc = hashtable; Key = byte[]; Password = SecureString }
-      Doc shape:
-        Version, Salt, Check, Accounts = @{ account = @{ EncryptedPassword; ... } }
-    #>
     param(
         [string]$Path,
         [SecureString]$VaultPassword,
@@ -196,7 +175,6 @@ Delete vault.key (and preferably recreate the vault) - this script now uses a pa
     }
 
     $raw = Import-Clixml -Path $Path
-    # Normalize
     if ($raw -isnot [hashtable]) { $raw = @{} + $raw }
 
     if (-not $raw.Version -or -not $raw.Salt -or -not $raw.Check) {
@@ -236,11 +214,6 @@ function Write-VaultAtomic {
 }
 
 function Invoke-WithVaultLock {
-    <#
-      Hold Global\SqlServiceAccountVault only for vault file I/O (open/read/write).
-      Do NOT hold across AD waits, service updates, or restarts.
-      Returns whatever the scriptblock outputs.
-    #>
     param(
         [scriptblock]$ScriptBlock,
         [int]$TimeoutSeconds = 60
@@ -269,7 +242,6 @@ Wait a moment and retry (lock is only held during vault I/O, not during AD wait/
 }
 
 function Save-VaultAccountEntry {
-    # Lock → reload from disk → upsert account → write. Avoids clobbering concurrent vault updates.
     param(
         [string]$Path,
         [string]$Account,
@@ -368,8 +340,6 @@ function Get-TargetTopology {
     if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
     if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
 
-    # Standalone instances throw from Get-DbaAvailabilityGroup ("HADR is not configured").
-    # Treat that as Mode=Standalone. Real connection failures still bubble up.
     $ags = @()
     try {
         $ags = @(Get-DbaAvailabilityGroup @agParams)
@@ -434,7 +404,6 @@ Install RSAT ActiveDirectory, or reset AD yourself and re-run with -SkipAdPasswo
     }
     Import-Module ActiveDirectory -ErrorAction Stop
     $sam = $Account.Split('\')[-1]
-    # No -Server: use normal AD discovery (same as the previously working runs).
     Write-Host "  AD: Set-ADAccountPassword $sam" -ForegroundColor DarkCyan
     Set-ADAccountPassword -Identity $sam -NewPassword $SecurePassword -Reset -ErrorAction Stop
 }
@@ -457,7 +426,6 @@ function Unlock-AdServiceAccount {
 }
 
 function Resolve-AdAuthDomain {
-    # Prefer DNS domain for PrincipalContext; NETBIOS alone can make ValidateCredentials return false.
     param([string]$Account)
     if ($Account -match '@') { return $Account.Split('@')[-1] }
     $netbios = if ($Account -match '\\') { $Account.Split('\')[0] } else { $env:USERDOMAIN }
@@ -474,8 +442,6 @@ function Resolve-AdAuthDomain {
 }
 
 function Test-AdCredentialHere {
-    # Asks this host's DC: does domain\user + password authenticate?
-    # ValidateCredentials requires a plain string; SecureString is used at the call sites.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'PlainPassword')]
     param([string]$Domain, [string]$SamAccountName, [string]$PlainPassword)
     Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
@@ -508,10 +474,6 @@ function Test-AdCredentialHere {
 }
 
 function Wait-AdCredentialReady {
-    <#
-      Phase 1: wait until THIS management host's DC accepts the password.
-      Not enough alone - SQL nodes may still use a lagging site DC.
-    #>
     param(
         [string]$Account,
         [securestring]$SecurePassword,
@@ -541,7 +503,6 @@ function Wait-AdCredentialReady {
                 if ($successes -ge $RequiredSuccesses) { return }
             } else {
                 $successes = 0
-                # ValidateCredentials returned false (wrong/old password on this host's DC) - not an exception, so warn explicitly.
                 Write-Host "  AD (mgmt host): not ready for $Account (attempt $attempt, ${elapsed}s elapsed, ${left}s left)" -ForegroundColor DarkYellow
             }
         } catch {
@@ -559,10 +520,6 @@ Check: account lockout, wrong domain NETBIOS vs DNS, password policy reject, jum
 }
 
 function Test-AdCredentialOnComputer {
-    <#
-      Validate from the SQL node itself so we use THAT machine's DC affinity.
-      PlainPassword is required for remoting ArgumentList + ValidateCredentials.
-    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'PlainPassword')]
     param(
         [string]$Computer,
@@ -613,17 +570,12 @@ function Test-AdCredentialOnComputer {
     if ($Credential) {
         $ic.Credential = $Credential
     } else {
-        # Prefer Kerberos (encrypted session). Avoid falling back to weaker auth by default.
         $ic.Authentication = 'Kerberos'
     }
     return [bool](Invoke-Command @ic)
 }
 
 function Wait-AdCredentialReadyOnNode {
-    <#
-      Phase 2: wait until each SQL node accepts the password via its own DC path.
-      Closes the race where mgmt host DC is updated but SQL site DC is not.
-    #>
     param(
         [string]$Account,
         [securestring]$SecurePassword,
@@ -731,7 +683,6 @@ function Restart-SqlTargetService {
         Confirm         = $false
         EnableException = $true
     }
-    # Omit InstanceName so host-level SSRS/SSIS are included.
     if ($Credential) { $p.Credential = $Credential }
     $retryWait = [Math]::Max(60, $RetryDelaySeconds * 3)
 
@@ -781,11 +732,6 @@ function Test-ReplicaMatch {
 }
 
 function Get-NodeSqlConnectName {
-    <#
-      Prefer FQDN\INSTANCE for Kerberos (SPN). Discovery often keeps short SqlInstance
-      (HOST\SQL01) while ComputerName is already FQDN — short name can SSPI-fail after
-      service-account restart.
-    #>
     param([object]$Node)
     if (-not $Node) { return $null }
     $parts = ([string]$Node.SqlInstance).Split('\')
@@ -801,8 +747,6 @@ function Test-SqlConnectRetryable {
 }
 
 function Wait-SqlInstanceReady {
-    # After Engine restart (esp. service-account password change), wait until SQL accepts connections.
-    # Connect-DbaInstance has no -EnableException on many dbatools versions — use -ErrorAction Stop.
     param(
         [string]$SqlInstance,
         [PSCredential]$SqlCredential,
@@ -821,7 +765,6 @@ function Wait-SqlInstanceReady {
             return
         } catch {
             $msg = [string]$_
-            # Script bugs / bad params must not burn the whole timeout.
             if ($msg -match 'parameter cannot be found|NamedParameterNotFound|Cannot find a parameter') { throw }
             Write-Host ("  SQL connect: not ready {0} (attempt {1}): {2}" -f $SqlInstance, $attempt, $msg) -ForegroundColor DarkYellow
             if (-not (Test-SqlConnectRetryable -ErrorText $msg) -and $attempt -gt 3) { throw }
@@ -855,7 +798,6 @@ function Wait-AgReady {
             throw
         }
 
-        # Empty AG list is NOT "ready" (can happen while SQL is still coming up).
         if ($ags.Count -eq 0) {
             Write-Host "  Wait sync: no AG data from $SqlInstance yet" -ForegroundColor DarkYellow
             Start-Sleep -Seconds 5
@@ -924,7 +866,6 @@ function Invoke-GracefulAgApply {
     Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
-    # Connect with FQDN when available (Kerberos SPN); keep short names for replica matching.
     $primaryConnect = Get-NodeSqlConnectName -Node $primary
     $secondaryConnect = Get-NodeSqlConnectName -Node $secondary
     Write-Host "Connect:   $primaryConnect / $secondaryConnect" -ForegroundColor DarkCyan
@@ -1032,9 +973,6 @@ function Write-VaultHistoryCsv {
     } | Sort-Object Account | Export-Csv -Path $Path -NoTypeInformation -Force
 }
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 if ($script:OutputFolder -match 'SERVERNAME' -or [string]::IsNullOrWhiteSpace($script:OutputFolder)) {
     throw @"
 OutputFolder is not configured.
@@ -1060,7 +998,6 @@ if ($transcript) {
 try {
     $unattend = $PSBoundParameters.ContainsKey('Unattended') -and $Unattended
 
-    # Vault lock is only held for file I/O (open / save / history), not the whole rotate.
     $opened = Invoke-WithVaultLock {
         $o = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
         if ($o.IsNew) {
@@ -1072,7 +1009,6 @@ try {
     $vaultDoc = $opened.Doc
     $vaultKey = $opened.Key
 
-    # ---- Vault-only modes ----
     if ($ListVault) {
         Show-VaultAccount -Doc $vaultDoc
         return
@@ -1090,7 +1026,6 @@ try {
         return
     }
 
-    # ---- Rotate mode ----
         if (-not (Get-Module -ListAvailable -Name dbatools)) {
             if (-not $InstallModule) { throw 'dbatools missing. Install it or pass -InstallModule.' }
             Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
@@ -1121,7 +1056,6 @@ try {
             Get-DbaService @gp
         }
         $allServices = @($allServices)
-        # Engine/Agent honor -InstanceName; keep host-level SSRS/SSIS.
         if ($InstanceName) {
             $allServices = @(
                 $allServices | Where-Object {
@@ -1189,9 +1123,6 @@ try {
             $ok = $true
             $accountNodes = @($g.Group.ComputerName | Sort-Object -Unique)
 
-            # 1) AD first (previous working order), vault immediately, wait until auth is ready.
-            #    Then update service logon caches. Running services keep the old password in
-            #    memory until restart, so AD can change safely before SCM is updated.
             if (-not $SkipAdPasswordReset) {
                 try {
                     Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
@@ -1224,7 +1155,6 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
                 }
             }
 
-            # 2) Update Windows service logon cache on every node (NoRestart).
             if ($ok) {
                 foreach ($computer in $accountNodes) {
                     if (-not $ok) { break }
@@ -1273,8 +1203,6 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
         }
 
         if (-not $SkipRestart -and -not $anyFailures) {
-            # Pre-restart: re-check from each SQL node (site DC lag / lockout after vault write).
-            # Keep decrypted passwords for restart auth-retry path.
             $restartAccounts = @($rotatedAccounts)
             $restartPasswords = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
             try {
@@ -1290,7 +1218,6 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
                     }
                 }
 
-                # Restart only service types that were rotated.
                 $typesToRestart = @(
                     $groupList |
                         ForEach-Object { $_.Group } |
@@ -1331,7 +1258,6 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
 
         $reportPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault_History.csv'
         Invoke-WithVaultLock {
-            # Prefer on-disk vault so history includes any concurrent saves.
             $histDoc = if (Test-Path $vaultPath) { Import-Clixml -Path $vaultPath } else { $vaultDoc }
             Write-VaultHistoryCsv -Doc $histDoc -Path $reportPath
         }

@@ -4,33 +4,19 @@
 
 .DESCRIPTION
     Discovers domain AD service accounts for Engine/Agent/SSRS/SSIS (not local users).
-    Applies one or more SecOps passwords in a single pass, then restarts once
-    (standalone) or AG secondary-restart / failover / former-primary-restart / failback.
-    Does not update AD and does not store passwords in a vault.
-
-    Before restart, waits until the supplied password validates on the management host
-    AND on each SQL node (WinRM). SecOps may have reset AD on a DC that SQL nodes
-    have not replicated from yet.
-
-.NOTES
-    Per-node checks use WinRM Invoke-Command. Domain Kerberos WinRM encrypts the
-    session (including the brief password used for ValidateCredentials). Prefer
-    Kerberos; avoid Basic auth / CredSSP. HTTPS WinRM is optional environment
-    hardening and is not required by this script.
+    Applies SecOps passwords, waits for AD readiness on SQL nodes, then restarts
+    (standalone or AG failover/failback). No AD change. No vault.
 
 .EXAMPLE
-    # List domain AD service accounts on a SQL instance
     .\ApplySqlServiceAccountPassword.ps1 -SqlInstance 'HOST\SQL01' -ListAccounts
 
 .EXAMPLE
-    # Standalone: update one or more service account passwords, then restart once
     $p1 = ConvertTo-SecureString 'PwForSql' -AsPlainText -Force
     $p2 = ConvertTo-SecureString 'PwForSsrs' -AsPlainText -Force
     .\ApplySqlServiceAccountPassword.ps1 -SqlInstance 'HOST\SQL01' `
         -Account 'DOMAIN\svcSql','DOMAIN\svcSsrs' -SecurePassword $p1,$p2
 
 .EXAMPLE
-    # Availability Group: same params; script discovers replicas and does failover/failback
     $p1 = ConvertTo-SecureString 'PwForSql' -AsPlainText -Force
     .\ApplySqlServiceAccountPassword.ps1 -SqlInstance 'HOST\SQL01' `
         -AvailabilityGroup 'AgName' -Account 'DOMAIN\svcSql' -SecurePassword $p1
@@ -72,11 +58,7 @@ $script:ServiceTypes = @('Engine', 'Agent', 'SSRS', 'SSIS')
 $ErrorActionPreference = 'Stop'
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 function Test-IsDomainServiceAccount {
-    # Domain AD service accounts only. Rejects built-ins, gMSA, local MACHINE\user, .\user, bare names.
     param([string]$StartName, [string]$ForComputer)
 
     if ([string]::IsNullOrWhiteSpace($StartName)) { return @{ Ok = $false; Reason = 'empty' } }
@@ -121,7 +103,6 @@ function Get-TargetTopology {
     if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
     if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
 
-    # Standalone throws "HADR is not configured" - treat as Mode=Standalone.
     $ags = @()
     try {
         $ags = @(Get-DbaAvailabilityGroup @agParams)
@@ -184,7 +165,6 @@ function Get-SqlTargetService {
     $all = @($all)
     if (-not $InstanceName) { return $all }
 
-    # Engine/Agent honor -InstanceName; keep host-level SSRS/SSIS.
     $all | Where-Object {
         $type = [string]$_.ServiceType
         ($type -in @('SSRS', 'SSIS')) -or ($_.InstanceName -in $InstanceName)
@@ -267,7 +247,6 @@ function Unlock-AdServiceAccount {
 }
 
 function Resolve-AdAuthDomain {
-    # Prefer DNS domain for PrincipalContext; NETBIOS alone can make ValidateCredentials return false.
     param([string]$Account)
     if ($Account -match '@') { return $Account.Split('@')[-1] }
     $netbios = if ($Account -match '\\') { $Account.Split('\')[0] } else { $env:USERDOMAIN }
@@ -284,7 +263,6 @@ function Resolve-AdAuthDomain {
 }
 
 function Test-AdCredentialHere {
-    # Asks this host's DC: does domain\user + password authenticate?
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'PlainPassword')]
     param([string]$Domain, [string]$SamAccountName, [string]$PlainPassword)
     Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
@@ -317,10 +295,6 @@ function Test-AdCredentialHere {
 }
 
 function Wait-AdCredentialReady {
-    <#
-      Phase 1: wait until THIS management host's DC accepts the password.
-      Not enough alone - SQL nodes may still use a lagging site DC.
-    #>
     param(
         [string]$Account,
         [securestring]$SecurePassword,
@@ -350,7 +324,6 @@ function Wait-AdCredentialReady {
                 if ($successes -ge $RequiredSuccesses) { return }
             } else {
                 $successes = 0
-                # ValidateCredentials returned false (wrong/old password on this host's DC) - not an exception, so warn explicitly.
                 Write-Host "  AD (mgmt host): not ready for $Account (attempt $attempt, ${elapsed}s elapsed, ${left}s left)" -ForegroundColor DarkYellow
             }
         } catch {
@@ -368,10 +341,6 @@ Check: account lockout, wrong domain NETBIOS vs DNS, jump-box DC lag, or that th
 }
 
 function Test-AdCredentialOnComputer {
-    <#
-      Validate from the SQL node itself so we use THAT machine's DC affinity.
-      Domain Kerberos WinRM encrypts the remoting session (password not cleartext).
-    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'PlainPassword')]
     param(
         [string]$Computer,
@@ -422,16 +391,12 @@ function Test-AdCredentialOnComputer {
     if ($Credential) {
         $ic.Credential = $Credential
     } else {
-        # Prefer Kerberos (encrypted session). Avoid falling back to weaker auth by default.
         $ic.Authentication = 'Kerberos'
     }
     return [bool](Invoke-Command @ic)
 }
 
 function Wait-AdCredentialReadyOnNode {
-    <#
-      Phase 2: wait until each SQL node accepts the SecOps password via its own DC path.
-    #>
     param(
         [string]$Account,
         [securestring]$SecurePassword,
@@ -588,7 +553,6 @@ function Test-SqlConnectRetryable {
 }
 
 function Wait-SqlInstanceReady {
-    # Connect-DbaInstance has no -EnableException on many dbatools versions — use -ErrorAction Stop.
     param(
         [string]$SqlInstance,
         [PSCredential]$SqlCredential,
@@ -775,9 +739,6 @@ function Invoke-GracefulAgApply {
     Write-Host "  Done. Primary restored on $($primary.SqlInstance)." -ForegroundColor Green
 }
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 if ($script:OutputFolder -match 'SERVERNAME' -or [string]::IsNullOrWhiteSpace($script:OutputFolder)) {
     throw @"
 OutputFolder is not configured.
@@ -904,7 +865,6 @@ try {
     }
 
     if (-not $anyFailures) {
-        # Pre-restart: re-check on all topology nodes (site DC lag after service update).
         $sqlNodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
         $restartAccounts = @($updatedAccounts)
         $restartPasswords = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
@@ -916,7 +876,6 @@ try {
                 -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
         }
 
-        # Restart only service types we actually updated (avoids touching unrelated SSRS/SSIS).
         $typesToRestart = @(
             $targets |
                 ForEach-Object { $_.Group } |
