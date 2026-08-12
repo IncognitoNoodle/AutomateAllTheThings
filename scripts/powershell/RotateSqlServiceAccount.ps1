@@ -357,8 +357,20 @@ function Get-TargetTopology {
     }
 }
 
+function Get-AdPasswordDomainController {
+    # Prefer PDC emulator so password set + validate hit the same authoritative DC.
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return $null }
+    Import-Module ActiveDirectory -ErrorAction Stop
+    try { return (Get-ADDomain).PDCEmulator } catch { return $null }
+}
+
 function Reset-DomainAccountPassword {
-    param([string]$Account, [securestring]$SecurePassword, [string]$LocalComputer)
+    param(
+        [string]$Account,
+        [securestring]$SecurePassword,
+        [string]$LocalComputer,
+        [string]$DomainController
+    )
     if (-not (Test-IsDomainAccount -Account $Account -Computer $LocalComputer)) { return }
 
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
@@ -369,19 +381,28 @@ Install RSAT ActiveDirectory, or reset AD yourself and re-run with -SkipAdPasswo
     }
     Import-Module ActiveDirectory -ErrorAction Stop
     $sam = $Account.Split('\')[-1]
-    Write-Host "  AD: Set-ADAccountPassword $sam" -ForegroundColor DarkCyan
-    Set-ADAccountPassword -Identity $sam -NewPassword $SecurePassword -Reset -ErrorAction Stop
+    $p = @{
+        Identity    = $sam
+        NewPassword = $SecurePassword
+        Reset       = $true
+        ErrorAction = 'Stop'
+    }
+    if ($DomainController) { $p.Server = $DomainController }
+    Write-Host ("  AD: Set-ADAccountPassword {0}{1}" -f $sam, $(if ($DomainController) { " @ $DomainController" } else { '' })) -ForegroundColor DarkCyan
+    Set-ADAccountPassword @p
 }
 
 function Wait-AdCredentialReady {
     <#
       After Set-ADAccountPassword, wait until domain auth accepts the new password.
-      Prevents service restart lockouts when DC replication is slow.
+      Validates against the same DC used for the reset when provided.
     #>
     param(
         [string]$Account,
         [securestring]$SecurePassword,
-        [int]$TimeoutSeconds = 180
+        [string]$DomainController,
+        [int]$TimeoutSeconds = 180,
+        [int]$RequiredSuccesses = 2
     )
 
     $sam = $Account.Split('\')[-1]
@@ -394,33 +415,52 @@ function Wait-AdCredentialReady {
 
     $plain = [Net.NetworkCredential]::new('', $SecurePassword).Password
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    Write-Host "  AD: waiting until password is accepted for $Account (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
+    $successes = 0
+    $target = if ($DomainController) { $DomainController } else { $domain }
+    Write-Host "  AD: waiting until password is accepted for $Account via $target (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
 
     do {
         try {
             $adUser = $null
-            try { $adUser = Get-ADUser -Identity $sam -Properties LockedOut -ErrorAction Stop }
+            $getUser = @{ Identity = $sam; Properties = 'LockedOut'; ErrorAction = 'Stop' }
+            if ($DomainController) { $getUser.Server = $DomainController }
+            try { $adUser = Get-ADUser @getUser }
             catch { $adUser = $null }
 
             if ($adUser -and $adUser.LockedOut) {
                 Write-Warning "  AD account $sam is locked out - unlocking before retry"
-                Unlock-ADAccount -Identity $sam -ErrorAction Stop
+                $unlock = @{ Identity = $sam; ErrorAction = 'Stop' }
+                if ($DomainController) { $unlock.Server = $DomainController }
+                Unlock-ADAccount @unlock
+                $successes = 0
                 Start-Sleep -Seconds 2
             }
 
-            $ctx = [DirectoryServices.AccountManagement.PrincipalContext]::new(
-                [DirectoryServices.AccountManagement.ContextType]::Domain,
-                $domain
-            )
+            # Bind validation to a specific DC when we have one (avoids "OK on jumpbox DC, fail on SQL site DC").
+            $ctx = if ($DomainController) {
+                [DirectoryServices.AccountManagement.PrincipalContext]::new(
+                    [DirectoryServices.AccountManagement.ContextType]::Domain,
+                    $DomainController
+                )
+            } else {
+                [DirectoryServices.AccountManagement.PrincipalContext]::new(
+                    [DirectoryServices.AccountManagement.ContextType]::Domain,
+                    $domain
+                )
+            }
             try {
                 if ($ctx.ValidateCredentials($sam, $plain)) {
-                    Write-Host "  AD: credential OK for $Account" -ForegroundColor Green
-                    return
+                    $successes++
+                    Write-Host "  AD: credential OK for $Account ($successes/$RequiredSuccesses)" -ForegroundColor Green
+                    if ($successes -ge $RequiredSuccesses) { return }
+                } else {
+                    $successes = 0
                 }
             } finally {
                 $ctx.Dispose()
             }
         } catch {
+            $successes = 0
             Write-Host ("  AD wait: {0}" -f $_) -ForegroundColor DarkYellow
         }
         Start-Sleep -Seconds 5
@@ -772,6 +812,13 @@ try {
 
         $anyFailures = $false
         $seedComputer = $topo.Nodes[0].ComputerName
+        $rotatedAccounts = [System.Collections.Generic.List[string]]::new()
+        $adDc = $null
+        if (-not $SkipAdPasswordReset) {
+            $adDc = Get-AdPasswordDomainController
+            if ($adDc) { Write-Host "AD password DC: $adDc" -ForegroundColor Cyan }
+            else { Write-Warning 'Could not resolve PDC emulator; AD reset/validate will use default DC discovery.' }
+        }
 
         foreach ($g in $groupList) {
             $account = $g.Name
@@ -789,9 +836,13 @@ try {
                 if ($Credential -and $remote) { $svcCred = $Credential }
                 try {
                     Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer" -ForegroundColor DarkCyan
-                    $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
-                    if ($result.Status -contains 'Failed') {
-                        Write-Host "  FAILED @ ${computer}: $((($result | Where-Object Status -eq Failed).Message) -join '; ')" -ForegroundColor Red
+                    $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred)
+                    $failed = @($result | Where-Object { $_.Status -eq 'Failed' })
+                    if ($failed.Count -gt 0) {
+                        Write-Host "  FAILED @ ${computer}: $((($failed).Message) -join '; ')" -ForegroundColor Red
+                        $ok = $false; $anyFailures = $true
+                    } elseif ($result.Count -eq 0) {
+                        Write-Host "  FAILED @ ${computer}: Update-DbaServiceAccount returned no result" -ForegroundColor Red
                         $ok = $false; $anyFailures = $true
                     }
                 } catch {
@@ -800,11 +851,13 @@ try {
                 }
             }
 
-            # 2) Change AD password, then wait until domain auth accepts it (replication).
+            # 2) Change AD password on PDC, then wait until that DC accepts it.
             if ($ok -and -not $SkipAdPasswordReset) {
                 try {
-                    Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
-                    Wait-AdCredentialReady -Account $account -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
+                    Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd `
+                        -LocalComputer $seedComputer -DomainController $adDc
+                    Wait-AdCredentialReady -Account $account -SecurePassword $securePwd `
+                        -DomainController $adDc -TimeoutSeconds $SyncTimeoutSeconds
                 } catch {
                     Write-Host "  FAILED (AD): $_" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
@@ -822,6 +875,7 @@ try {
                     LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
                 }
                 Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+                $rotatedAccounts.Add($account)
                 Write-Host '  Saved to password-protected vault (not restarted yet).' -ForegroundColor Green
             }
 
@@ -829,6 +883,21 @@ try {
         }
 
         if (-not $SkipRestart -and -not $anyFailures) {
+            # Final AD check right before restart (catches lockouts / lag after vault write).
+            if (-not $SkipAdPasswordReset) {
+                foreach ($account in $rotatedAccounts) {
+                    $sec = Unprotect-Secret -CipherText $vaultDoc.Accounts[$account].EncryptedPassword -Key $vaultKey
+                    try {
+                        Write-Host "`nPre-restart AD check: $account" -ForegroundColor Cyan
+                        Wait-AdCredentialReady -Account $account -SecurePassword $sec `
+                            -DomainController $adDc -TimeoutSeconds ([Math]::Min(120, $SyncTimeoutSeconds)) `
+                            -RequiredSuccesses 1
+                    } finally {
+                        if ($sec) { $sec.Dispose() }
+                    }
+                }
+            }
+
             # Restart only service types that were rotated.
             $typesToRestart = @(
                 $groupList |
