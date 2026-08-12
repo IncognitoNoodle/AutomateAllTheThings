@@ -797,13 +797,34 @@ function Wait-AgReady {
         [string[]]$AgNames,
         [string]$SecondarySqlInstance,
         [PSCredential]$SqlCredential,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+        [switch]$ForPlannedFailover
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $label = if ($ForPlannedFailover) { 'Wait failover-ready' } else { 'Wait sync' }
     do {
-        $p = @{ SqlInstance = $SqlInstance; AvailabilityGroup = $AgNames; EnableException = $true }
-        if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
-        $ags = @(Get-DbaAvailabilityGroup @p)
+        try {
+            $p = @{
+                SqlInstance       = $SqlInstance
+                AvailabilityGroup = $AgNames
+                EnableException   = $true
+                WarningAction     = 'SilentlyContinue'
+                ErrorAction       = 'Stop'
+            }
+            if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
+            $ags = @(Get-DbaAvailabilityGroup @p)
+        } catch {
+            Write-Host ("  {0}: {1} - {2}" -f $label, $SqlInstance, ([string]$_).Split("`n")[0]) -ForegroundColor DarkYellow
+            Start-Sleep -Seconds 5
+            continue
+        }
+
+        if ($ags.Count -eq 0) {
+            Write-Host "  ${label}: no AG data from $SqlInstance yet" -ForegroundColor DarkYellow
+            Start-Sleep -Seconds 5
+            continue
+        }
+
         $pending = foreach ($ag in $ags) {
             $target = $ag.AvailabilityReplicas | Where-Object { Test-ReplicaMatch $_.Name $SecondarySqlInstance } | Select-Object -First 1
             if (-not $target) {
@@ -813,19 +834,72 @@ function Wait-AgReady {
             $sync = [string]$target.RollupSynchronizationState
             $conn = [string]$target.ConnectionState
             $mode = [string]$target.AvailabilityMode
-            $ok = ($conn -eq 'Connected') -and (
-                $sync -eq 'Synchronized' -or
-                ($mode -match 'Asynchronous' -and $sync -eq 'Synchronizing')
-            )
-            if (-not $ok) {
+            # Planned failover/failback requires Synchronized (not async Synchronizing).
+            $replicaOk = if ($ForPlannedFailover) {
+                ($conn -eq 'Connected') -and ($sync -eq 'Synchronized')
+            } else {
+                ($conn -eq 'Connected') -and (
+                    $sync -eq 'Synchronized' -or
+                    ($mode -match 'Asynchronous' -and $sync -eq 'Synchronizing')
+                )
+            }
+            if (-not $replicaOk) {
                 [pscustomobject]@{ Ag = $ag.Name; Why = "$($target.Name) $conn/$sync" }
+                continue
+            }
+
+            if (-not $ForPlannedFailover) { continue }
+
+            try {
+                $dbParams = @{
+                    SqlInstance       = $SqlInstance
+                    AvailabilityGroup = $ag.Name
+                    EnableException   = $true
+                    WarningAction     = 'SilentlyContinue'
+                    ErrorAction       = 'Stop'
+                }
+                if ($SqlCredential) { $dbParams.SqlCredential = $SqlCredential }
+                $dbs = @(Get-DbaAgDatabase @dbParams | Where-Object {
+                        Test-ReplicaMatch -ReplicaName $_.Replica -SqlInstance $SecondarySqlInstance
+                    })
+            } catch {
+                [pscustomobject]@{ Ag = $ag.Name; Why = "database check failed: $(([string]$_).Split("`n")[0])" }
+                continue
+            }
+
+            if (-not $dbs) {
+                [pscustomobject]@{ Ag = $ag.Name; Why = "no databases on $SecondarySqlInstance" }
+                continue
+            }
+
+            foreach ($db in $dbs) {
+                $dbSync = [string]$db.SynchronizationState
+                $joined = $true
+                if ($null -ne $db.IsJoined) { $joined = [bool]$db.IsJoined }
+                $ready = $false
+                if ($null -ne $db.IsFailoverReady) {
+                    $ready = [bool]$db.IsFailoverReady
+                } else {
+                    $ready = ($dbSync -eq 'Synchronized')
+                }
+                if (-not $joined -or -not $ready) {
+                    [pscustomobject]@{
+                        Ag  = $ag.Name
+                        Why = "$($db.Name) joined=$joined sync=$dbSync failoverReady=$ready"
+                    }
+                }
             }
         }
-        if (-not $pending) { return }
-        Write-Host ("  Wait sync: " + (($pending | ForEach-Object { "$($_.Ag)=$($_.Why)" }) -join '; ')) -ForegroundColor DarkYellow
+        if (-not $pending) {
+            if ($ForPlannedFailover) {
+                Write-Host "  $label: databases Synchronized/failover-ready on $SecondarySqlInstance" -ForegroundColor Green
+            }
+            return
+        }
+        Write-Host ("  ${label}: " + (($pending | ForEach-Object { "$($_.Ag)=$($_.Why)" }) -join '; ')) -ForegroundColor DarkYellow
         Start-Sleep -Seconds 5
     } while ((Get-Date) -lt $deadline)
-    throw "AG sync timeout (${TimeoutSeconds}s) waiting on $SecondarySqlInstance"
+    throw "AG $label timeout (${TimeoutSeconds}s) waiting on $SecondarySqlInstance"
 }
 
 function Invoke-GracefulAgApply {
@@ -878,6 +952,8 @@ function Invoke-GracefulAgApply {
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
+    Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
+        -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds -ForPlannedFailover
 
     Write-Host "  Failover -> $($secondary.SqlInstance)" -ForegroundColor Cyan
     $fo = @{
@@ -904,6 +980,9 @@ function Invoke-GracefulAgApply {
         Write-Warning "SkipFailback: primary left on $($secondary.SqlInstance)"
         return
     }
+
+    Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
+        -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds -ForPlannedFailover
 
     Write-Host "  Failback -> $($primary.SqlInstance)" -ForegroundColor Cyan
     $fb = @{
