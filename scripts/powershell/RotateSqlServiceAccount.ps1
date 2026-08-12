@@ -534,7 +534,8 @@ function Wait-AdCredentialReadyOnNodes {
     throw @"
 AD password for '$Account' not accepted on SQL node(s): $($pending -join ', ') within ${TimeoutSeconds}s.
 Management host may already see the new password while SQL site DCs are still catching up.
-Unlock the account if locked, wait for AD replication, then re-run. Do not restart SQL until node checks pass.
+Requires WinRM to the SQL nodes for per-node ValidateCredentials. Unlock if locked, wait for replication, re-run.
+Do not restart SQL until node checks pass.
 "@
 }
 
