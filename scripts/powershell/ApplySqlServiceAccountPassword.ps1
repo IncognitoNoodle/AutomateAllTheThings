@@ -636,7 +636,6 @@ function Invoke-GracefulAgApply {
         [PSCredential]$Credential,
         [PSCredential]$SqlCredential,
         [int]$SyncTimeoutSeconds,
-        [switch]$SkipFailback,
         [string[]]$Account,
         [hashtable]$AccountPassword
     )
@@ -652,9 +651,12 @@ function Invoke-GracefulAgApply {
             (Test-ReplicaMatch -ReplicaName $OriginalPrimary -SqlInstance $_.SqlInstance) -or
             ($_.ComputerName -eq $OriginalPrimary.Split('\')[0])
         } | Select-Object -First 1
+        if (-not $mapped) { throw "Could not map primary '$OriginalPrimary' to discovered nodes." }
         $primarySql = $mapped.SqlInstance
     }
-    if (-not $primarySql) { throw "Could not map primary '$OriginalPrimary' to discovered nodes." }
+    if (-not $primarySql -or -not $bySql.ContainsKey($primarySql)) {
+        throw "Could not map primary '$OriginalPrimary' to discovered nodes."
+    }
 
     $secondary = $Nodes | Where-Object { $_.SqlInstance -ne $primarySql } | Select-Object -First 1
     if (-not $secondary) { throw 'AG mode requires at least two replicas.' }
@@ -692,11 +694,6 @@ function Invoke-GracefulAgApply {
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    if ($SkipFailback) {
-        Write-Warning "SkipFailback: primary left on $($secondary.SqlInstance)"
-        return
-    }
-
     Write-Host "  Failback -> $($primary.SqlInstance)" -ForegroundColor Cyan
     $fb = @{
         SqlInstance = $primary.SqlInstance; AvailabilityGroup = $AgNames
@@ -708,8 +705,6 @@ function Invoke-GracefulAgApply {
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
     Write-Host "  Done. Primary restored on $($primary.SqlInstance)." -ForegroundColor Green
 }
-
-
 
 if ($script:OutputFolder -match 'SERVERNAME' -or [string]::IsNullOrWhiteSpace($script:OutputFolder)) {
     throw @"

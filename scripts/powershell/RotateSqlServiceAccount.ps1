@@ -247,14 +247,18 @@ function Save-VaultAccountEntry {
         [string]$Account,
         [hashtable]$Entry
     )
+    # Locals so the nested lock scriptblock (and PSScriptAnalyzer) clearly see the params used.
+    $savePath = $Path
+    $saveAccount = $Account
+    $saveEntry = $Entry
     Invoke-WithVaultLock {
-        if (-not (Test-Path $Path)) {
-            throw "Vault file missing at '$Path' (expected to exist before saving an account)."
+        if (-not (Test-Path $savePath)) {
+            throw "Vault file missing at '$savePath' (expected to exist before saving an account)."
         }
-        $doc = Import-Clixml -Path $Path
+        $doc = Import-Clixml -Path $savePath
         if (-not $doc.Accounts) { $doc.Accounts = @{} }
-        $doc.Accounts[$Account] = $Entry
-        Write-VaultAtomic -Doc $doc -Path $Path
+        $doc.Accounts[$saveAccount] = $saveEntry
+        Write-VaultAtomic -Doc $doc -Path $savePath
         $doc
     }
 }
@@ -846,9 +850,12 @@ function Invoke-GracefulAgApply {
             (Test-ReplicaMatch -ReplicaName $OriginalPrimary -SqlInstance $_.SqlInstance) -or
             ($_.ComputerName -eq $OriginalPrimary.Split('\')[0])
         } | Select-Object -First 1
+        if (-not $mapped) { throw "Could not map primary '$OriginalPrimary' to discovered nodes." }
         $primarySql = $mapped.SqlInstance
     }
-    if (-not $primarySql) { throw "Could not map primary '$OriginalPrimary' to discovered nodes." }
+    if (-not $primarySql -or -not $bySql.ContainsKey($primarySql)) {
+        throw "Could not map primary '$OriginalPrimary' to discovered nodes."
+    }
 
     $secondary = $Nodes | Where-Object { $_.SqlInstance -ne $primarySql } | Select-Object -First 1
     if (-not $secondary) { throw 'AG mode requires at least two replicas.' }
