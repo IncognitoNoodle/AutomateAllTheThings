@@ -3,9 +3,9 @@
     Rotate SQL Engine/Agent/SSRS/SSIS service account passwords (standalone or Always On).
 
 .NOTES
-    After Set-ADAccountPassword, waits until the password validates on the management host
-    AND on each SQL node (via WinRM Invoke-Command). Jump-box ValidateCredentials alone
-    can race site DC replication and cause restart logon/lockout failures.
+    Order: Set-ADAccountPassword first, vault immediately, wait until the password validates
+    on the management host AND each SQL node (WinRM), then Update-DbaServiceAccount -NoRestart,
+    then restart. Jump-box ValidateCredentials alone can race site DC replication.
 
     Domain Kerberos WinRM encrypts the remoting session used for per-node checks.
     Prefer Kerberos; avoid Basic auth / CredSSP. HTTPS WinRM is optional environment
@@ -1035,38 +1035,13 @@ try {
             Write-Host "`nRotating: $account" -ForegroundColor Green
             $securePwd = Get-StrongPassword -Length $PasswordLength
             $ok = $true
+            $accountNodes = @($g.Group.ComputerName | Sort-Object -Unique)
 
-            # 1) Push new password to Windows service logon cache on every node first
-            #    (running services keep old credentials in memory until restart).
-            foreach ($computer in @($g.Group.ComputerName | Select-Object -Unique)) {
-                if (-not $ok) { break }
-                $nodeServices = @($g.Group | Where-Object ComputerName -eq $computer)
-                $svcCred = $null
-                $remote = $computer -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                if ($Credential -and $remote) { $svcCred = $Credential }
+            # 1) AD first (previous working order), vault immediately, wait until auth is ready.
+            #    Then update service logon caches. Running services keep the old password in
+            #    memory until restart, so AD can change safely before SCM is updated.
+            if (-not $SkipAdPasswordReset) {
                 try {
-                    Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer" -ForegroundColor DarkCyan
-                    $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred)
-                    $failed = @($result | Where-Object { $_.Status -eq 'Failed' })
-                    if ($failed.Count -gt 0) {
-                        Write-Host "  FAILED @ ${computer}: $((($failed).Message) -join '; ')" -ForegroundColor Red
-                        $ok = $false; $anyFailures = $true
-                    } elseif ($result.Count -eq 0) {
-                        Write-Host "  FAILED @ ${computer}: Update-DbaServiceAccount returned no result" -ForegroundColor Red
-                        $ok = $false; $anyFailures = $true
-                    }
-                } catch {
-                    Write-Host "  FAILED @ ${computer}: $_" -ForegroundColor Red
-                    $ok = $false; $anyFailures = $true
-                }
-            }
-
-            # 2) Change AD password, vault immediately, then wait for mgmt host + each SQL node.
-            #    Vault BEFORE wait: if wait times out, AD/services already have the new password -
-            #    without an early vault write that password was disposed and lost (re-runs break).
-            if ($ok -and -not $SkipAdPasswordReset) {
-                try {
-                    $accountNodes = @($g.Group.ComputerName | Sort-Object -Unique)
                     Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
 
                     $vaultDoc.Accounts[$account] = @{
@@ -1079,36 +1054,67 @@ try {
                         LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
                     }
                     Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
-                    Write-Host '  Saved to vault (AD changed; waiting for replication before restart).' -ForegroundColor Green
+                    Write-Host '  Saved to vault (AD changed; waiting for replication before service update).' -ForegroundColor Green
 
                     Wait-AdCredentialReady -Account $account -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
                     Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $securePwd `
                         -ComputerName $accountNodes -Credential $Credential -TimeoutSeconds $SyncTimeoutSeconds
-                    $rotatedAccounts.Add($account)
                 } catch {
                     Write-Host "  FAILED (AD): $_" -ForegroundColor Red
                     if ($vaultDoc.Accounts.ContainsKey($account) -and $vaultDoc.Accounts[$account].EncryptedPassword) {
                         Write-Warning @"
-AD/service password for '$account' may already be changed, and is saved in the vault.
-Do NOT rotate again blindly. Use -RevealAccount '$account' to recover it, fix AD/lockout/replication,
-then re-run with -SkipAdPasswordReset (or wait and re-run restart path) once ValidateCredentials works.
+AD password for '$account' may already be changed, and is saved in the vault.
+Do NOT rotate again blindly. Use -RevealAccount '$account' to recover it, fix lockout/replication,
+then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update services + restart).
 "@
                     }
                     $ok = $false; $anyFailures = $true
                 }
-            } elseif ($ok -and $SkipAdPasswordReset) {
-                $vaultDoc.Accounts[$account] = @{
-                    EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
-                    LastComputerName  = $seedComputer
-                    LastTopology      = $topo.Mode
-                    LastNodes         = ($computers -join ', ')
-                    LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
-                    LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
-                    LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
+            }
+
+            # 2) Update Windows service logon cache on every node (NoRestart).
+            if ($ok) {
+                foreach ($computer in $accountNodes) {
+                    if (-not $ok) { break }
+                    $nodeServices = @($g.Group | Where-Object ComputerName -eq $computer)
+                    $svcCred = $null
+                    $remote = $computer -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+                    if ($Credential -and $remote) { $svcCred = $Credential }
+                    try {
+                        Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer" -ForegroundColor DarkCyan
+                        $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred)
+                        $failed = @($result | Where-Object { $_.Status -eq 'Failed' })
+                        if ($failed.Count -gt 0) {
+                            Write-Host "  FAILED @ ${computer}: $((($failed).Message) -join '; ')" -ForegroundColor Red
+                            $ok = $false; $anyFailures = $true
+                        } elseif ($result.Count -eq 0) {
+                            Write-Host "  FAILED @ ${computer}: Update-DbaServiceAccount returned no result" -ForegroundColor Red
+                            $ok = $false; $anyFailures = $true
+                        }
+                    } catch {
+                        Write-Host "  FAILED @ ${computer}: $_" -ForegroundColor Red
+                        $ok = $false; $anyFailures = $true
+                    }
                 }
-                Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+            }
+
+            if ($ok) {
+                if ($SkipAdPasswordReset) {
+                    $vaultDoc.Accounts[$account] = @{
+                        EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
+                        LastComputerName  = $seedComputer
+                        LastTopology      = $topo.Mode
+                        LastNodes         = ($computers -join ', ')
+                        LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
+                        LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
+                        LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
+                    }
+                    Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+                    Write-Host '  Saved to vault (SkipAdPasswordReset; services updated, not restarted yet).' -ForegroundColor Green
+                } else {
+                    Write-Host '  Services updated (not restarted yet).' -ForegroundColor Green
+                }
                 $rotatedAccounts.Add($account)
-                Write-Host '  Saved to password-protected vault (SkipAdPasswordReset; not restarted yet).' -ForegroundColor Green
             }
 
             if ($securePwd) { $securePwd.Dispose(); Remove-Variable securePwd -EA SilentlyContinue }
