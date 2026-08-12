@@ -572,6 +572,48 @@ function Test-ReplicaMatch {
     $true
 }
 
+function Get-NodeSqlConnectName {
+    param([object]$Node)
+    if (-not $Node) { return $null }
+    $parts = ([string]$Node.SqlInstance).Split('\')
+    $instanceName = if ($parts.Count -gt 1) { $parts[1] } else { $null }
+    $hostName = if ($Node.ComputerName) { [string]$Node.ComputerName } else { $parts[0] }
+    if ($instanceName) { return "$hostName\$instanceName" }
+    return $hostName
+}
+
+function Test-SqlConnectRetryable {
+    param([string]$ErrorText)
+    return [bool]($ErrorText -match 'SSPI|principal name|Cannot generate SSPI|Login timeout|network-related|error: 40|error: 0|connection.*fail|timeout|not allowed to connect|pipeline')
+}
+
+function Wait-SqlInstanceReady {
+    param(
+        [string]$SqlInstance,
+        [PSCredential]$SqlCredential,
+        [int]$TimeoutSeconds = 180
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $attempt = 0
+    Write-Host "  SQL connect: waiting for $SqlInstance (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
+    do {
+        $attempt++
+        try {
+            $p = @{ SqlInstance = $SqlInstance; EnableException = $true }
+            if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
+            $null = Connect-DbaInstance @p
+            Write-Host "  SQL connect: OK $SqlInstance (attempt $attempt)" -ForegroundColor Green
+            return
+        } catch {
+            $msg = [string]$_
+            Write-Host ("  SQL connect: not ready {0} (attempt {1}): {2}" -f $SqlInstance, $attempt, $msg) -ForegroundColor DarkYellow
+            if (-not (Test-SqlConnectRetryable -ErrorText $msg) -and $attempt -gt 3) { throw }
+        }
+        Start-Sleep -Seconds 5
+    } while ((Get-Date) -lt $deadline)
+    throw "SQL instance '$SqlInstance' not accepting connections within ${TimeoutSeconds}s (often SSPI/Kerberos right after service account restart)."
+}
+
 function Wait-AgReady {
     param(
         [string]$SqlInstance,
@@ -582,9 +624,26 @@ function Wait-AgReady {
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        $p = @{ SqlInstance = $SqlInstance; AvailabilityGroup = $AgNames; EnableException = $true }
-        if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
-        $ags = @(Get-DbaAvailabilityGroup @p)
+        try {
+            $p = @{ SqlInstance = $SqlInstance; AvailabilityGroup = $AgNames; EnableException = $true }
+            if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
+            $ags = @(Get-DbaAvailabilityGroup @p)
+        } catch {
+            $msg = [string]$_
+            if (Test-SqlConnectRetryable -ErrorText $msg) {
+                Write-Host ("  Wait sync: connect error on {0}: {1}" -f $SqlInstance, $msg) -ForegroundColor DarkYellow
+                Start-Sleep -Seconds 5
+                continue
+            }
+            throw
+        }
+
+        if ($ags.Count -eq 0) {
+            Write-Host "  Wait sync: no AG data from $SqlInstance yet" -ForegroundColor DarkYellow
+            Start-Sleep -Seconds 5
+            continue
+        }
+
         $pending = foreach ($ag in $ags) {
             $target = $ag.AvailabilityReplicas | Where-Object { Test-ReplicaMatch $_.Name $SecondarySqlInstance } | Select-Object -First 1
             if (-not $target) {
@@ -606,7 +665,7 @@ function Wait-AgReady {
         Write-Host ("  Wait sync: " + (($pending | ForEach-Object { "$($_.Ag)=$($_.Why)" }) -join '; ')) -ForegroundColor DarkYellow
         Start-Sleep -Seconds 5
     } while ((Get-Date) -lt $deadline)
-    throw "AG sync timeout (${TimeoutSeconds}s) waiting on $SecondarySqlInstance"
+    throw "AG sync timeout (${TimeoutSeconds}s) waiting on $SecondarySqlInstance (connected via $SqlInstance)"
 }
 
 function Invoke-GracefulAgApply {
@@ -647,37 +706,69 @@ function Invoke-GracefulAgApply {
     Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
+    $primaryConnect = Get-NodeSqlConnectName -Node $primary
+    $secondaryConnect = Get-NodeSqlConnectName -Node $secondary
+    Write-Host "Connect:   $primaryConnect / $secondaryConnect" -ForegroundColor DarkCyan
+
     Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) `
         -Account $Account -AccountPassword $AccountPassword
-    Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
+    Wait-SqlInstanceReady -SqlInstance $secondaryConnect -SqlCredential $SqlCredential `
+        -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+    Wait-AgReady -SqlInstance $primaryConnect -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    Write-Host "  Failover -> $($secondary.SqlInstance)" -ForegroundColor Cyan
+    Write-Host "  Failover -> $($secondary.SqlInstance) (via $secondaryConnect)" -ForegroundColor Cyan
     $fo = @{
-        SqlInstance = $secondary.SqlInstance; AvailabilityGroup = $AgNames
+        SqlInstance = $secondaryConnect; AvailabilityGroup = $AgNames
         Confirm = $false; EnableException = $true
     }
     if ($SqlCredential) { $fo.SqlCredential = $SqlCredential }
-    Invoke-DbaAgFailover @fo | Out-Null
+    $foAttempt = 0
+    do {
+        $foAttempt++
+        try {
+            Invoke-DbaAgFailover @fo | Out-Null
+            break
+        } catch {
+            $msg = [string]$_
+            if ($foAttempt -ge 5 -or -not (Test-SqlConnectRetryable -ErrorText $msg)) { throw }
+            Write-Warning "  Failover connect/SSPI retry $foAttempt/5 on ${secondaryConnect}: $msg"
+            Start-Sleep -Seconds 8
+        }
+    } while ($true)
     Start-Sleep -Seconds 3
-    Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
+    Wait-AgReady -SqlInstance $secondaryConnect -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
     Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $primary.ComputerName $Credential) `
         -Account $Account -AccountPassword $AccountPassword
-    Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
+    Wait-SqlInstanceReady -SqlInstance $primaryConnect -SqlCredential $SqlCredential `
+        -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+    Wait-AgReady -SqlInstance $secondaryConnect -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    Write-Host "  Failback -> $($primary.SqlInstance)" -ForegroundColor Cyan
+    Write-Host "  Failback -> $($primary.SqlInstance) (via $primaryConnect)" -ForegroundColor Cyan
     $fb = @{
-        SqlInstance = $primary.SqlInstance; AvailabilityGroup = $AgNames
+        SqlInstance = $primaryConnect; AvailabilityGroup = $AgNames
         Confirm = $false; EnableException = $true
     }
     if ($SqlCredential) { $fb.SqlCredential = $SqlCredential }
-    Invoke-DbaAgFailover @fb | Out-Null
-    Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
+    $fbAttempt = 0
+    do {
+        $fbAttempt++
+        try {
+            Invoke-DbaAgFailover @fb | Out-Null
+            break
+        } catch {
+            $msg = [string]$_
+            if ($fbAttempt -ge 5 -or -not (Test-SqlConnectRetryable -ErrorText $msg)) { throw }
+            Write-Warning "  Failback connect/SSPI retry $fbAttempt/5 on ${primaryConnect}: $msg"
+            Start-Sleep -Seconds 8
+        }
+    } while ($true)
+    Wait-AgReady -SqlInstance $primaryConnect -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
     Write-Host "  Done. Primary restored on $($primary.SqlInstance)." -ForegroundColor Green
 }
