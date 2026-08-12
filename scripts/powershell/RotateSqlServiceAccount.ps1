@@ -221,6 +221,56 @@ function Write-VaultAtomic {
     Set-RestrictedAcl -Path $Path
 }
 
+function Invoke-WithVaultLock {
+    param(
+        [scriptblock]$ScriptBlock,
+        [int]$TimeoutSeconds = 60
+    )
+    $mutex = [Threading.Mutex]::new($false, $mutexName)
+    $gotLock = $false
+    try {
+        try {
+            $gotLock = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+        } catch [Threading.AbandonedMutexException] {
+            Write-Warning 'Recovered abandoned vault lock.'
+            $gotLock = $true
+        }
+        if (-not $gotLock) {
+            throw @"
+Vault lock timeout (${TimeoutSeconds}s).
+Another process on this machine is reading/writing the vault file right now.
+Wait a moment and retry (lock is only held during vault I/O, not during AD wait/restart).
+"@
+        }
+        & $ScriptBlock
+    } finally {
+        if ($gotLock) { [void]$mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function Save-VaultAccountEntry {
+    param(
+        [string]$Path,
+        [string]$Account,
+        [hashtable]$Entry
+    )
+    # Locals so the nested lock scriptblock (and PSScriptAnalyzer) clearly see the params used.
+    $savePath = $Path
+    $saveAccount = $Account
+    $saveEntry = $Entry
+    Invoke-WithVaultLock {
+        if (-not (Test-Path $savePath)) {
+            throw "Vault file missing at '$savePath' (expected to exist before saving an account)."
+        }
+        $doc = Import-Clixml -Path $savePath
+        if (-not $doc.Accounts) { $doc.Accounts = @{} }
+        $doc.Accounts[$saveAccount] = $saveEntry
+        Write-VaultAtomic -Doc $doc -Path $savePath
+        $doc
+    }
+}
+
 function Get-StrongPassword {
     param([int]$Length = 24)
     $sets = @(
@@ -789,229 +839,221 @@ if ($transcript) {
 }
 
 try {
-    $mutex = [Threading.Mutex]::new($false, $mutexName)
-    $gotLock = $false
-    try {
-        try { $gotLock = $mutex.WaitOne([TimeSpan]::FromSeconds(60)) }
-        catch [Threading.AbandonedMutexException] {
-            Write-Warning 'Recovered abandoned vault lock.'
-            $gotLock = $true
-        }
-        if (-not $gotLock) { throw 'Vault lock timeout (60s).' }
+    $unattend = $PSBoundParameters.ContainsKey('Unattended') -and $Unattended
 
-        $unattend = $PSBoundParameters.ContainsKey('Unattended') -and $Unattended
-        $opened = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
-        $vaultDoc = $opened.Doc
-        $vaultKey = $opened.Key
-
-        if ($opened.IsNew) {
-            Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+    $opened = Invoke-WithVaultLock {
+        $o = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
+        if ($o.IsNew) {
+            Write-VaultAtomic -Doc $o.Doc -Path $vaultPath
             Write-Host "Vault created: $vaultPath" -ForegroundColor Cyan
         }
+        $o
+    }
+    $vaultDoc = $opened.Doc
+    $vaultKey = $opened.Key
 
-        # ---- Vault-only modes ----
-        if ($ListVault) {
-            Show-VaultAccount -Doc $vaultDoc
-            return
+    # ---- Vault-only modes ----
+    if ($ListVault) {
+        Show-VaultAccount -Doc $vaultDoc
+        return
+    }
+
+    if ($RevealAccount) {
+        if (-not $vaultDoc.Accounts.ContainsKey($RevealAccount)) {
+            throw "Account '$RevealAccount' not found in vault. Use -ListVault."
         }
+        $secure = Unprotect-Secret -CipherText $vaultDoc.Accounts[$RevealAccount].EncryptedPassword -Key $vaultKey
+        $plain = [Net.NetworkCredential]::new('', $secure).Password
+        Write-Host "Account: $RevealAccount" -ForegroundColor Cyan
+        Write-Output $plain
+        $secure.Dispose()
+        return
+    }
 
-        if ($RevealAccount) {
-            if (-not $vaultDoc.Accounts.ContainsKey($RevealAccount)) {
-                throw "Account '$RevealAccount' not found in vault. Use -ListVault."
+    # ---- Rotate mode ----
+    if (-not (Get-Module -ListAvailable -Name dbatools)) {
+        if (-not $InstallModule) { throw 'dbatools missing. Install it or pass -InstallModule.' }
+        Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
+    }
+    Import-Module dbatools -ErrorAction Stop
+
+    $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
+        -SqlCredential $SqlCredential -Credential $Credential
+
+    Write-Host "`nMode: $($topo.Mode)" -ForegroundColor Cyan
+    $topo.Nodes | Format-Table ComputerName, SqlInstance -AutoSize
+    if ($topo.AgNames) { Write-Host "AGs: $($topo.AgNames -join ', ')" -ForegroundColor Cyan }
+
+    $computers = @($topo.Nodes.ComputerName | Select-Object -Unique)
+
+    $allServices = foreach ($node in $topo.Nodes) {
+        $svcCred = $null
+        $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+        if ($Credential -and $remote) { $svcCred = $Credential }
+        $gp = @{
+            ComputerName = $node.ComputerName; Type = 'Engine', 'Agent'; EnableException = $true
+        }
+        if ($InstanceName) { $gp.InstanceName = $InstanceName }
+        if ($svcCred) { $gp.Credential = $svcCred }
+        Get-DbaService @gp
+    }
+    $allServices = @($allServices)
+    if (-not $allServices) { throw "No Engine/Agent services on: $($computers -join ', ')" }
+
+    Write-Host "`nServices:" -ForegroundColor Cyan
+    $allServices | Select-Object ComputerName, ServiceName, State, StartName | Format-Table -AutoSize
+
+    $groups = $allServices | Group-Object StartName | Where-Object {
+        $c = Test-AccountEligible -StartName $_.Name -ForComputer @($_.Group.ComputerName)[0] -IncludeDomain $IncludeDomain
+        if (-not $c.Ok) { Write-Host "Skip $($_.Name): $($c.Reason)" -ForegroundColor Yellow; return $false }
+        $true
+    }
+    if (-not $groups) { Write-Warning 'No eligible accounts.'; return }
+
+    $allowed = [Collections.Generic.HashSet[string]]::new([string[]]$computers, [StringComparer]::OrdinalIgnoreCase)
+    $conflicts = foreach ($g in $groups) {
+        if (-not $vaultDoc.Accounts.ContainsKey($g.Name)) { continue }
+        $prev = $vaultDoc.Accounts[$g.Name].LastComputerName
+        if ($prev -and -not $allowed.Contains($prev)) {
+            [pscustomobject]@{
+                Account         = $g.Name
+                PreviousServer  = $prev
+                PreviousRotated = $vaultDoc.Accounts[$g.Name].LastRotatedUtc
             }
-            $secure = Unprotect-Secret -CipherText $vaultDoc.Accounts[$RevealAccount].EncryptedPassword -Key $vaultKey
-            $plain = [Net.NetworkCredential]::new('', $secure).Password
-            Write-Host "Account: $RevealAccount" -ForegroundColor Cyan
-            Write-Output $plain
-            $secure.Dispose()
-            return
+        }
+    }
+
+    $skippedConflicts = @()
+    if ($conflicts) {
+        Write-Host "`n*** SHARED ACCOUNT (outside this topology) ***" -ForegroundColor Red
+        $conflicts | Format-Table -AutoSize
+        if ($Unattended) {
+            $names = @($conflicts.Account)
+            $skippedConflicts = @($groups | Where-Object Name -in $names)
+            $groups = @($groups | Where-Object Name -notin $names)
+            Write-Warning "Unattended: skipped $($names -join ', ')"
+        } else {
+            Write-Warning 'Proceeding with shared account rotation (maintenance).'
+        }
+    }
+    if (-not $groups) {
+        if ($skippedConflicts) { exit 2 }
+        Write-Warning 'Nothing to rotate.'; return
+    }
+
+    Write-Host "`nPlan: $($groups.Count) account(s) on $($computers -join ', ')" -ForegroundColor Cyan
+
+    $anyFailures = $false
+    $seedComputer = $topo.Nodes[0].ComputerName
+    $rotatedAccounts = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($g in $groups) {
+        $account = $g.Name
+        Write-Host "`nRotating: $account" -ForegroundColor Green
+        $securePwd = Get-StrongPassword -Length $PasswordLength
+        $ok = $true
+        $accountNodes = @($g.Group.ComputerName | Sort-Object -Unique)
+
+        if (-not $SkipAdPasswordReset) {
+            try {
+                Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
+                if (Test-IsDomainAccount -Account $account -Computer $seedComputer) {
+                    Wait-AdCredentialReady -Account $account -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
+                    Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $securePwd `
+                        -ComputerName $accountNodes -Credential $Credential -TimeoutSeconds $SyncTimeoutSeconds
+                }
+            } catch {
+                Write-Host "  FAILED (AD): $_" -ForegroundColor Red
+                $ok = $false; $anyFailures = $true
+            }
         }
 
-        # ---- Rotate mode ----
-        if (-not (Get-Module -ListAvailable -Name dbatools)) {
-            if (-not $InstallModule) { throw 'dbatools missing. Install it or pass -InstallModule.' }
-            Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
+        foreach ($computer in $accountNodes) {
+            if (-not $ok) { break }
+            $nodeServices = @($g.Group | Where-Object ComputerName -eq $computer)
+            $svcCred = $null
+            $remote = $computer -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+            if ($Credential -and $remote) { $svcCred = $Credential }
+            try {
+                Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer" -ForegroundColor DarkCyan
+                $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
+                if ($result.Status -contains 'Failed') {
+                    Write-Host "  FAILED @ ${computer}: $((($result | Where-Object Status -eq Failed).Message) -join '; ')" -ForegroundColor Red
+                    $ok = $false; $anyFailures = $true
+                }
+            } catch {
+                Write-Host "  FAILED @ ${computer}: $_" -ForegroundColor Red
+                $ok = $false; $anyFailures = $true
+            }
         }
-        Import-Module dbatools -ErrorAction Stop
 
-        $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
-            -SqlCredential $SqlCredential -Credential $Credential
+        if ($ok) {
+            $entry = @{
+                EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
+                LastComputerName  = $seedComputer
+                LastTopology      = $topo.Mode
+                LastNodes         = ($computers -join ', ')
+                LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
+                LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
+                LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
+            }
+            $vaultDoc = Save-VaultAccountEntry -Path $vaultPath -Account $account -Entry $entry
+            Write-Host '  Saved to password-protected vault (not restarted yet).' -ForegroundColor Green
+            $rotatedAccounts.Add($account)
+        }
 
-        Write-Host "`nMode: $($topo.Mode)" -ForegroundColor Cyan
-        $topo.Nodes | Format-Table ComputerName, SqlInstance -AutoSize
-        if ($topo.AgNames) { Write-Host "AGs: $($topo.AgNames -join ', ')" -ForegroundColor Cyan }
+        if ($securePwd) { $securePwd.Dispose(); Remove-Variable securePwd -EA SilentlyContinue }
+    }
 
-        $computers = @($topo.Nodes.ComputerName | Select-Object -Unique)
+    if (-not $SkipRestart -and -not $anyFailures) {
+        # Final node-AD check before restart (site DC lag can still exist after service update).
+        $sqlNodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
+        foreach ($account in $rotatedAccounts) {
+            if (-not (Test-IsDomainAccount -Account $account -Computer $seedComputer)) { continue }
+            if (-not $vaultDoc.Accounts.ContainsKey($account)) { continue }
+            $sec = Unprotect-Secret -CipherText $vaultDoc.Accounts[$account].EncryptedPassword -Key $vaultKey
+            try {
+                Write-Host "`nPre-restart AD check on SQL nodes: $account" -ForegroundColor Cyan
+                Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $sec `
+                    -ComputerName $sqlNodes -Credential $Credential `
+                    -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+            } finally {
+                if ($sec) { $sec.Dispose() }
+            }
+        }
 
-        $allServices = foreach ($node in $topo.Nodes) {
+        if ($topo.Mode -eq 'AvailabilityGroup') {
+            Invoke-GracefulAgApply `
+                -Nodes $topo.Nodes `
+                -AgNames $topo.AgNames `
+                -OriginalPrimary $topo.OriginalPrimary `
+                -InstanceName $InstanceName `
+                -Credential $Credential `
+                -SqlCredential $SqlCredential `
+                -SyncTimeoutSeconds $SyncTimeoutSeconds `
+                -SkipFailback:$SkipFailback
+        } else {
+            $node = $topo.Nodes[0]
             $svcCred = $null
             $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
             if ($Credential -and $remote) { $svcCred = $Credential }
-            $gp = @{
-                ComputerName = $node.ComputerName; Type = 'Engine', 'Agent'; EnableException = $true
-            }
-            if ($InstanceName) { $gp.InstanceName = $InstanceName }
-            if ($svcCred) { $gp.Credential = $svcCred }
-            Get-DbaService @gp
+            Restart-SqlEngineAgent -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
         }
-        $allServices = @($allServices)
-        if (-not $allServices) { throw "No Engine/Agent services on: $($computers -join ', ')" }
-
-        Write-Host "`nServices:" -ForegroundColor Cyan
-        $allServices | Select-Object ComputerName, ServiceName, State, StartName | Format-Table -AutoSize
-
-        $groups = $allServices | Group-Object StartName | Where-Object {
-            $c = Test-AccountEligible -StartName $_.Name -ForComputer @($_.Group.ComputerName)[0] -IncludeDomain $IncludeDomain
-            if (-not $c.Ok) { Write-Host "Skip $($_.Name): $($c.Reason)" -ForegroundColor Yellow; return $false }
-            $true
-        }
-        if (-not $groups) { Write-Warning 'No eligible accounts.'; return }
-
-        $allowed = [Collections.Generic.HashSet[string]]::new([string[]]$computers, [StringComparer]::OrdinalIgnoreCase)
-        $conflicts = foreach ($g in $groups) {
-            if (-not $vaultDoc.Accounts.ContainsKey($g.Name)) { continue }
-            $prev = $vaultDoc.Accounts[$g.Name].LastComputerName
-            if ($prev -and -not $allowed.Contains($prev)) {
-                [pscustomobject]@{
-                    Account         = $g.Name
-                    PreviousServer  = $prev
-                    PreviousRotated = $vaultDoc.Accounts[$g.Name].LastRotatedUtc
-                }
-            }
-        }
-
-        $skippedConflicts = @()
-        if ($conflicts) {
-            Write-Host "`n*** SHARED ACCOUNT (outside this topology) ***" -ForegroundColor Red
-            $conflicts | Format-Table -AutoSize
-            if ($Unattended) {
-                $names = @($conflicts.Account)
-                $skippedConflicts = @($groups | Where-Object Name -in $names)
-                $groups = @($groups | Where-Object Name -notin $names)
-                Write-Warning "Unattended: skipped $($names -join ', ')"
-            } else {
-                Write-Warning 'Proceeding with shared account rotation (maintenance).'
-            }
-        }
-        if (-not $groups) {
-            if ($skippedConflicts) { exit 2 }
-            Write-Warning 'Nothing to rotate.'; return
-        }
-
-        Write-Host "`nPlan: $($groups.Count) account(s) on $($computers -join ', ')" -ForegroundColor Cyan
-
-        $anyFailures = $false
-        $seedComputer = $topo.Nodes[0].ComputerName
-        $rotatedAccounts = [System.Collections.Generic.List[string]]::new()
-
-        foreach ($g in $groups) {
-            $account = $g.Name
-            Write-Host "`nRotating: $account" -ForegroundColor Green
-            $securePwd = Get-StrongPassword -Length $PasswordLength
-            $ok = $true
-            $accountNodes = @($g.Group.ComputerName | Sort-Object -Unique)
-
-            if (-not $SkipAdPasswordReset) {
-                try {
-                    Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
-                    if (Test-IsDomainAccount -Account $account -Computer $seedComputer) {
-                        Wait-AdCredentialReady -Account $account -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
-                        Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $securePwd `
-                            -ComputerName $accountNodes -Credential $Credential -TimeoutSeconds $SyncTimeoutSeconds
-                    }
-                } catch {
-                    Write-Host "  FAILED (AD): $_" -ForegroundColor Red
-                    $ok = $false; $anyFailures = $true
-                }
-            }
-
-            foreach ($computer in $accountNodes) {
-                if (-not $ok) { break }
-                $nodeServices = @($g.Group | Where-Object ComputerName -eq $computer)
-                $svcCred = $null
-                $remote = $computer -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                if ($Credential -and $remote) { $svcCred = $Credential }
-                try {
-                    Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer" -ForegroundColor DarkCyan
-                    $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
-                    if ($result.Status -contains 'Failed') {
-                        Write-Host "  FAILED @ ${computer}: $((($result | Where-Object Status -eq Failed).Message) -join '; ')" -ForegroundColor Red
-                        $ok = $false; $anyFailures = $true
-                    }
-                } catch {
-                    Write-Host "  FAILED @ ${computer}: $_" -ForegroundColor Red
-                    $ok = $false; $anyFailures = $true
-                }
-            }
-
-            if ($ok) {
-                $vaultDoc.Accounts[$account] = @{
-                    EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
-                    LastComputerName  = $seedComputer
-                    LastTopology      = $topo.Mode
-                    LastNodes         = ($computers -join ', ')
-                    LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
-                    LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
-                    LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
-                }
-                Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
-                Write-Host '  Saved to password-protected vault (not restarted yet).' -ForegroundColor Green
-                $rotatedAccounts.Add($account)
-            }
-
-            if ($securePwd) { $securePwd.Dispose(); Remove-Variable securePwd -EA SilentlyContinue }
-        }
-
-        if (-not $SkipRestart -and -not $anyFailures) {
-            # Final node-AD check before restart (site DC lag can still exist after service update).
-            $sqlNodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
-            foreach ($account in $rotatedAccounts) {
-                if (-not (Test-IsDomainAccount -Account $account -Computer $seedComputer)) { continue }
-                if (-not $vaultDoc.Accounts.ContainsKey($account)) { continue }
-                $sec = Unprotect-Secret -CipherText $vaultDoc.Accounts[$account].EncryptedPassword -Key $vaultKey
-                try {
-                    Write-Host "`nPre-restart AD check on SQL nodes: $account" -ForegroundColor Cyan
-                    Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $sec `
-                        -ComputerName $sqlNodes -Credential $Credential `
-                        -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
-                } finally {
-                    if ($sec) { $sec.Dispose() }
-                }
-            }
-
-            if ($topo.Mode -eq 'AvailabilityGroup') {
-                Invoke-GracefulAgApply `
-                    -Nodes $topo.Nodes `
-                    -AgNames $topo.AgNames `
-                    -OriginalPrimary $topo.OriginalPrimary `
-                    -InstanceName $InstanceName `
-                    -Credential $Credential `
-                    -SqlCredential $SqlCredential `
-                    -SyncTimeoutSeconds $SyncTimeoutSeconds `
-                    -SkipFailback:$SkipFailback
-            } else {
-                $node = $topo.Nodes[0]
-                $svcCred = $null
-                $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                if ($Credential -and $remote) { $svcCred = $Credential }
-                Restart-SqlEngineAgent -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
-            }
-        } elseif ($SkipRestart) {
-            Write-Warning 'SkipRestart: password updated; restart/failover later to apply.'
-        }
-
-        $reportPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault_History.csv'
-        Write-VaultHistoryCsv -Doc $vaultDoc -Path $reportPath
-
-        Write-Host "`nVault:   $vaultPath (password-protected)" -ForegroundColor Cyan
-        Write-Host "History: $reportPath (no secrets)" -ForegroundColor Cyan
-
-        if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
-        if ($skippedConflicts) { Write-Warning "$($skippedConflicts.Count) shared account(s) skipped."; exit 2 }
-    } finally {
-        if ($gotLock) { [void]$mutex.ReleaseMutex() }
-        $mutex.Dispose()
+    } elseif ($SkipRestart) {
+        Write-Warning 'SkipRestart: password updated; restart/failover later to apply.'
     }
+
+    $reportPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault_History.csv'
+    Invoke-WithVaultLock {
+        $histDoc = if (Test-Path $vaultPath) { Import-Clixml -Path $vaultPath } else { $vaultDoc }
+        Write-VaultHistoryCsv -Doc $histDoc -Path $reportPath
+    }
+
+    Write-Host "`nVault:   $vaultPath (password-protected)" -ForegroundColor Cyan
+    Write-Host "History: $reportPath (no secrets)" -ForegroundColor Cyan
+
+    if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
+    if ($skippedConflicts) { Write-Warning "$($skippedConflicts.Count) shared account(s) skipped."; exit 2 }
 } finally {
     if ($transcript) { Stop-Transcript | Out-Null }
 }
