@@ -397,6 +397,8 @@ function Unlock-AdServiceAccount {
 }
 
 function Test-AdCredentialHere {
+    # ValidateCredentials requires a plain string; SecureString is used at the call sites.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'PlainPassword')]
     param([string]$Domain, [string]$SamAccountName, [string]$PlainPassword)
     Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
     $ctx = [DirectoryServices.AccountManagement.PrincipalContext]::new(
@@ -449,7 +451,9 @@ function Wait-AdCredentialReady {
 function Test-AdCredentialOnComputer {
     <#
       Validate from the SQL node itself so we use THAT machine's DC affinity.
+      PlainPassword is required for remoting ArgumentList + ValidateCredentials.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'PlainPassword')]
     param(
         [string]$Computer,
         [string]$Account,
@@ -460,20 +464,18 @@ function Test-AdCredentialOnComputer {
     $sam = $Account.Split('\')[-1]
     $domain = if ($Account -match '\\') { $Account.Split('\')[0] } else { $env:USERDOMAIN }
     $localNames = @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-    $isLocal = $Computer -in $localNames
-
-    if ($isLocal) {
+    if ($Computer -in $localNames) {
         return Test-AdCredentialHere -Domain $domain -SamAccountName $sam -PlainPassword $PlainPassword
     }
 
     $sb = {
-        param($Domain, $Sam, $Password)
+        param($Domain, $Sam, $SecretText)
         Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
         $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
             [System.DirectoryServices.AccountManagement.ContextType]::Domain,
             $Domain
         )
-        try { return [bool]$ctx.ValidateCredentials($Sam, $Password) }
+        try { return [bool]$ctx.ValidateCredentials($Sam, $SecretText) }
         finally { $ctx.Dispose() }
     }
 
@@ -487,10 +489,10 @@ function Test-AdCredentialOnComputer {
     return [bool](Invoke-Command @ic)
 }
 
-function Wait-AdCredentialReadyOnNodes {
+function Wait-AdCredentialReadyOnNode {
     <#
-      Phase 2: wait until EACH SQL node accepts the password via its own DC path.
-      This closes the race where mgmt host DC is updated but SQL site DC is not.
+      Phase 2: wait until each SQL node accepts the password via its own DC path.
+      Closes the race where mgmt host DC is updated but SQL site DC is not.
     #>
     param(
         [string]$Account,
@@ -562,6 +564,25 @@ function Test-RestartAuthFailure {
     return [bool]($text -match 'authentication|logon failure|correct authentication|password|credentials|dependent service')
 }
 
+function Wait-AdAfterAuthFailure {
+    param(
+        [string[]]$Account,
+        [hashtable]$AccountPassword,
+        [string]$Computer,
+        [PSCredential]$Credential,
+        [int]$TimeoutSeconds
+    )
+    Write-Warning "  Auth/logon failure suspected - unlock, re-check AD on node, retry"
+    foreach ($acct in @($Account)) {
+        if (-not $acct) { continue }
+        Unlock-AdServiceAccount -Account $acct
+        if ($AccountPassword -and $AccountPassword.ContainsKey($acct)) {
+            Wait-AdCredentialReadyOnNode -Account $acct -SecurePassword $AccountPassword[$acct] `
+                -ComputerName $Computer -Credential $Credential -TimeoutSeconds $TimeoutSeconds
+        }
+    }
+}
+
 function Restart-SqlTargetService {
     param(
         [string]$Computer,
@@ -582,27 +603,19 @@ function Restart-SqlTargetService {
     }
     # Omit InstanceName so host-level SSRS/SSIS are included.
     if ($Credential) { $p.Credential = $Credential }
+    $retryWait = [Math]::Max(60, $RetryDelaySeconds * 3)
 
     for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
-        # Re-validate from this SQL node before each restart attempt.
-        foreach ($acct in @($Account)) {
-            if (-not $acct -or -not $AccountPassword -or -not $AccountPassword.ContainsKey($acct)) { continue }
-            $sec = $AccountPassword[$acct]
-            Wait-AdCredentialReadyOnNodes -Account $acct -SecurePassword $sec `
-                -ComputerName $Computer -Credential $Credential -TimeoutSeconds ([Math]::Max(60, $RetryDelaySeconds * 3))
-        }
-
         Write-Host "  Restart $($Type -join '/') on $Computer (attempt $attempt/$RetryCount)" -ForegroundColor Cyan
         try {
             $result = @(Restart-DbaService @p)
         } catch {
-            $result = @()
             $err = [string]$_
             Write-Warning "  Restart-DbaService threw on ${Computer}: $err"
-            if ($attempt -ge $RetryCount -or ($err -notmatch 'authentication|logon|password|credential|dependent service')) {
-                throw
-            }
-            foreach ($acct in @($Account)) { if ($acct) { Unlock-AdServiceAccount -Account $acct } }
+            $authFail = $err -match 'authentication|logon|password|credential|dependent service'
+            if (-not $authFail -or $attempt -ge $RetryCount) { throw }
+            Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
+                -Computer $Computer -Credential $Credential -TimeoutSeconds $retryWait
             Start-Sleep -Seconds $RetryDelaySeconds
             continue
         }
@@ -615,14 +628,13 @@ function Restart-SqlTargetService {
         if (-not $bad) { return }
 
         $names = ($bad.ServiceName) -join ', '
-        $authFail = Test-RestartAuthFailure -Results $bad
         Write-Warning "  Restart failed on ${Computer}: $names"
-        if (-not $authFail -or $attempt -ge $RetryCount) {
+        if (-not (Test-RestartAuthFailure -Results $bad) -or $attempt -ge $RetryCount) {
             throw "Restart failed on ${Computer}: $names"
         }
 
-        Write-Warning "  Auth/logon failure suspected - waiting for AD on node, then retry"
-        foreach ($acct in @($Account)) { if ($acct) { Unlock-AdServiceAccount -Account $acct } }
+        Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
+            -Computer $Computer -Credential $Credential -TimeoutSeconds $retryWait
         Start-Sleep -Seconds $RetryDelaySeconds
     }
 }
@@ -982,7 +994,7 @@ try {
                     $accountNodes = @($g.Group.ComputerName | Sort-Object -Unique)
                     Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
                     Wait-AdCredentialReady -Account $account -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
-                    Wait-AdCredentialReadyOnNodes -Account $account -SecurePassword $securePwd `
+                    Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $securePwd `
                         -ComputerName $accountNodes -Credential $Credential -TimeoutSeconds $SyncTimeoutSeconds
                 } catch {
                     Write-Host "  FAILED (AD): $_" -ForegroundColor Red
@@ -1015,13 +1027,13 @@ try {
             $restartPasswords = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
             try {
                 if (-not $SkipAdPasswordReset) {
-                    $allNodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
+                    $sqlNodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
                     foreach ($account in $restartAccounts) {
                         $sec = Unprotect-Secret -CipherText $vaultDoc.Accounts[$account].EncryptedPassword -Key $vaultKey
                         $restartPasswords[$account] = $sec
                         Write-Host "`nPre-restart AD check on SQL nodes: $account" -ForegroundColor Cyan
-                        Wait-AdCredentialReadyOnNodes -Account $account -SecurePassword $sec `
-                            -ComputerName $allNodes -Credential $Credential `
+                        Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $sec `
+                            -ComputerName $sqlNodes -Credential $Credential `
                             -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
                     }
                 }
