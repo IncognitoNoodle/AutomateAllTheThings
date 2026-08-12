@@ -547,6 +547,27 @@ function Get-NodeSqlConnectName {
     return $hostName
 }
 
+function Get-NodeSqlConnectNameList {
+    param([object]$Node)
+    $list = [System.Collections.Generic.List[string]]::new()
+    foreach ($n in @((Get-NodeSqlConnectName -Node $Node), [string]$Node.SqlInstance)) {
+        if ([string]::IsNullOrWhiteSpace($n)) { continue }
+        if (-not ($list | Where-Object { $_ -eq $n })) { [void]$list.Add($n) }
+    }
+    return , @($list)
+}
+
+function Get-SqlErrorSummary {
+    param([string]$ErrorText)
+    $line = @(
+        $ErrorText -split '[\r\n]+' |
+            Where-Object { $_ -and ($_ -notmatch '^\s*at\s') } |
+            Select-Object -First 1
+    )
+    if (-not $line) { return 'connection failed' }
+    return (($line[0] -replace '\s+', ' ').Trim())
+}
+
 function Test-SqlConnectRetryable {
     param([string]$ErrorText)
     return [bool]($ErrorText -match 'SSPI|principal name|Cannot generate SSPI|Login timeout|network-related|error: 40|error: 0|connection.*fail|timeout|not allowed to connect|pipeline')
@@ -554,30 +575,47 @@ function Test-SqlConnectRetryable {
 
 function Wait-SqlInstanceReady {
     param(
-        [string]$SqlInstance,
+        [string[]]$SqlInstance,
         [PSCredential]$SqlCredential,
         [int]$TimeoutSeconds = 180
     )
+    $targets = @($SqlInstance | Where-Object { $_ } | Select-Object -Unique)
+    if ($targets.Count -eq 0) { throw 'Wait-SqlInstanceReady: no SqlInstance provided.' }
+
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $attempt = 0
-    Write-Host "  SQL connect: waiting for $SqlInstance (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
+    $sspiHits = 0
+    Write-Host ("  SQL connect: waiting for {0} (up to {1}s)" -f ($targets -join ' | '), $TimeoutSeconds) -ForegroundColor DarkCyan
     do {
         $attempt++
-        try {
-            $p = @{ SqlInstance = $SqlInstance; ErrorAction = 'Stop' }
-            if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
-            $null = Connect-DbaInstance @p
-            Write-Host "  SQL connect: OK $SqlInstance (attempt $attempt)" -ForegroundColor Green
-            return
-        } catch {
-            $msg = [string]$_
-            if ($msg -match 'parameter cannot be found|NamedParameterNotFound|Cannot find a parameter') { throw }
-            Write-Host ("  SQL connect: not ready {0} (attempt {1}): {2}" -f $SqlInstance, $attempt, $msg) -ForegroundColor DarkYellow
-            if (-not (Test-SqlConnectRetryable -ErrorText $msg) -and $attempt -gt 3) { throw }
+        foreach ($target in $targets) {
+            try {
+                $p = @{ SqlInstance = $target; ErrorAction = 'Stop' }
+                if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
+                $null = Connect-DbaInstance @p
+                Write-Host "  SQL connect: OK $target (attempt $attempt)" -ForegroundColor Green
+                return $target
+            } catch {
+                $msg = [string]$_
+                if ($msg -match 'parameter cannot be found|NamedParameterNotFound|Cannot find a parameter') { throw }
+                $summary = Get-SqlErrorSummary -ErrorText $msg
+                Write-Host ("  SQL connect: not ready {0} (attempt {1}): {2}" -f $target, $attempt, $summary) -ForegroundColor DarkYellow
+                if ($summary -match 'SSPI|principal name') { $sspiHits++ }
+                if (-not (Test-SqlConnectRetryable -ErrorText $msg) -and $attempt -gt 3) { throw }
+            }
         }
         Start-Sleep -Seconds 5
     } while ((Get-Date) -lt $deadline)
-    throw "SQL instance '$SqlInstance' not accepting connections within ${TimeoutSeconds}s (often SSPI/Kerberos right after service account restart)."
+
+    $hint = if ($sspiHits -gt 0 -and -not $SqlCredential) {
+        @"
+
+Persistent SSPI/Kerberos on: $($targets -join ', ').
+Check SPNs for the SQL service account (setspn -Q MSSQLSvc/hostname...), DNS, and clock skew.
+Or re-run AG steps with -SqlCredential (SQL auth) to bypass Kerberos during rotate.
+"@
+    } else { '' }
+    throw "SQL instance not accepting connections within ${TimeoutSeconds}s ($($targets -join ' | ')).$hint"
 }
 
 function Wait-AgReady {
@@ -597,7 +635,7 @@ function Wait-AgReady {
         } catch {
             $msg = [string]$_
             if (Test-SqlConnectRetryable -ErrorText $msg) {
-                Write-Host ("  Wait sync: connect error on {0}: {1}" -f $SqlInstance, $msg) -ForegroundColor DarkYellow
+                Write-Host ("  Wait sync: connect error on {0}: {1}" -f $SqlInstance, (Get-SqlErrorSummary -ErrorText $msg)) -ForegroundColor DarkYellow
                 Start-Sleep -Seconds 5
                 continue
             }
@@ -672,15 +710,17 @@ function Invoke-GracefulAgApply {
     Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
-    $primaryConnect = Get-NodeSqlConnectName -Node $primary
-    $secondaryConnect = Get-NodeSqlConnectName -Node $secondary
-    Write-Host "Connect:   $primaryConnect / $secondaryConnect" -ForegroundColor DarkCyan
+    $primaryCandidates = Get-NodeSqlConnectNameList -Node $primary
+    $secondaryCandidates = Get-NodeSqlConnectNameList -Node $secondary
+    Write-Host ("Connect candidates: {0} / {1}" -f ($primaryCandidates -join ', '), ($secondaryCandidates -join ', ')) -ForegroundColor DarkCyan
 
     Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) `
         -Account $Account -AccountPassword $AccountPassword
-    Wait-SqlInstanceReady -SqlInstance $secondaryConnect -SqlCredential $SqlCredential `
+    $secondaryConnect = Wait-SqlInstanceReady -SqlInstance $secondaryCandidates -SqlCredential $SqlCredential `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+    $primaryConnect = Wait-SqlInstanceReady -SqlInstance $primaryCandidates -SqlCredential $SqlCredential `
+        -TimeoutSeconds ([Math]::Min(120, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $primaryConnect -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
@@ -699,7 +739,7 @@ function Invoke-GracefulAgApply {
         } catch {
             $msg = [string]$_
             if ($foAttempt -ge 5 -or -not (Test-SqlConnectRetryable -ErrorText $msg)) { throw }
-            Write-Warning "  Failover connect/SSPI retry $foAttempt/5 on ${secondaryConnect}: $msg"
+            Write-Warning ("  Failover connect/SSPI retry {0}/5 on {1}: {2}" -f $foAttempt, $secondaryConnect, (Get-SqlErrorSummary $msg))
             Start-Sleep -Seconds 8
         }
     } while ($true)
@@ -710,7 +750,7 @@ function Invoke-GracefulAgApply {
     Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $primary.ComputerName $Credential) `
         -Account $Account -AccountPassword $AccountPassword
-    Wait-SqlInstanceReady -SqlInstance $primaryConnect -SqlCredential $SqlCredential `
+    $primaryConnect = Wait-SqlInstanceReady -SqlInstance $primaryCandidates -SqlCredential $SqlCredential `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $secondaryConnect -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -730,7 +770,7 @@ function Invoke-GracefulAgApply {
         } catch {
             $msg = [string]$_
             if ($fbAttempt -ge 5 -or -not (Test-SqlConnectRetryable -ErrorText $msg)) { throw }
-            Write-Warning "  Failback connect/SSPI retry $fbAttempt/5 on ${primaryConnect}: $msg"
+            Write-Warning ("  Failback connect/SSPI retry {0}/5 on {1}: {2}" -f $fbAttempt, $primaryConnect, (Get-SqlErrorSummary $msg))
             Start-Sleep -Seconds 8
         }
     } while ($true)
