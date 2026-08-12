@@ -411,7 +411,7 @@ function Wait-AdCredentialReady {
                     Start-Sleep -Seconds 2
                 }
             } catch {
-                # ignore ADWS/lookup issues during wait
+                $null = $_
             }
 
             $ctx = [DirectoryServices.AccountManagement.PrincipalContext]::new(
