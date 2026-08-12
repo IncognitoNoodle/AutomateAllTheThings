@@ -428,28 +428,39 @@ function Wait-AdCredentialReady {
     $sam = $Account.Split('\')[-1]
     $domain = if ($Account -match '\\') { $Account.Split('\')[0] } else { $env:USERDOMAIN }
     $plain = [Net.NetworkCredential]::new('', $SecurePassword).Password
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $started = Get-Date
+    $deadline = $started.AddSeconds($TimeoutSeconds)
     $successes = 0
-    Write-Host "  AD (mgmt host): waiting for $Account (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
+    $attempt = 0
+    Write-Host "  AD (mgmt host): waiting for $Account via ValidateCredentials($domain\$sam) (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
 
     do {
+        $attempt++
+        $elapsed = [int]((Get-Date) - $started).TotalSeconds
+        $left = [Math]::Max(0, $TimeoutSeconds - $elapsed)
         try {
             Unlock-AdServiceAccount -Account $Account
             if (Test-AdCredentialHere -Domain $domain -SamAccountName $sam -PlainPassword $plain) {
                 $successes++
-                Write-Host "  AD (mgmt host): OK for $Account ($successes/$RequiredSuccesses)" -ForegroundColor Green
+                Write-Host "  AD (mgmt host): OK for $Account ($successes/$RequiredSuccesses) after ${elapsed}s" -ForegroundColor Green
                 if ($successes -ge $RequiredSuccesses) { return }
             } else {
                 $successes = 0
+                # ValidateCredentials returned false (wrong/old password on this host's DC) - not an exception, so warn explicitly.
+                Write-Host "  AD (mgmt host): not ready for $Account (attempt $attempt, ${elapsed}s elapsed, ${left}s left)" -ForegroundColor DarkYellow
             }
         } catch {
             $successes = 0
-            Write-Host ("  AD (mgmt host) wait: {0}" -f $_) -ForegroundColor DarkYellow
+            Write-Host ("  AD (mgmt host) wait error for {0} (attempt {1}, {2}s): {3}" -f $Account, $attempt, $elapsed, $_) -ForegroundColor DarkYellow
         }
         Start-Sleep -Seconds 5
     } while ((Get-Date) -lt $deadline)
 
-    throw "AD password for '$Account' not accepted on management host within ${TimeoutSeconds}s."
+    throw @"
+AD password for '$Account' not accepted on management host within ${TimeoutSeconds}s ($attempt attempts).
+Set-ADAccountPassword may have succeeded, but ValidateCredentials still fails from this host.
+Check: account lockout, wrong domain NETBIOS vs DNS, password policy reject, jump-box DC lag, or RSAT/AD connectivity.
+"@
 }
 
 function Test-AdCredentialOnComputer {
