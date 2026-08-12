@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Rotate SQL Engine/Agent service account passwords (standalone or Always On).
+    Rotate SQL Engine/Agent/SSRS/SSIS service account passwords (standalone or Always On).
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
@@ -59,6 +59,7 @@ param(
 # === CONFIG (edit here) ===
 # Shared UNC for vault + history + transcripts. Change once for the environment.
 $script:OutputFolder = ''
+$script:ServiceTypes = @('Engine', 'Agent', 'SSRS', 'SSIS')
 
 $ErrorActionPreference = 'Stop'
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -650,19 +651,24 @@ function Update-NodeServicePassword {
     Update-DbaServiceAccount @p
 }
 
-function Restart-SqlEngineAgent {
-    param([string]$Computer, [string[]]$InstanceName, [PSCredential]$Credential)
+function Restart-SqlTargetService {
+    param(
+        [string]$Computer,
+        [string[]]$Type = $script:ServiceTypes,
+        [PSCredential]$Credential
+    )
+    $Type = @($Type | Where-Object { $_ } | Sort-Object -Unique)
+    if (-not $Type) { $Type = $script:ServiceTypes }
     $p = @{
         ComputerName    = $Computer
-        Type            = 'Engine', 'Agent'
+        Type            = $Type
         Force           = $true
         Confirm         = $false
         EnableException = $true
     }
-    if ($InstanceName) { $p.InstanceName = $InstanceName }
     if ($Credential) { $p.Credential = $Credential }
-    Write-Host "  Restart Engine/Agent on $Computer" -ForegroundColor Cyan
-    $result = Restart-DbaService @p
+    Write-Host "  Restart $($Type -join '/') on $Computer" -ForegroundColor Cyan
+    $result = @(Restart-DbaService @p)
     $bad = @($result | Where-Object { $_.Status -eq 'Failed' -or $_.State -ne 'Running' })
     if ($bad) { throw "Restart failed on ${Computer}: $(($bad.ServiceName) -join ', ')" }
 }
@@ -720,12 +726,14 @@ function Invoke-GracefulAgApply {
         [object[]]$Nodes,
         [string[]]$AgNames,
         [string]$OriginalPrimary,
-        [string[]]$InstanceName,
+        [string[]]$ServiceType,
         [PSCredential]$Credential,
         [PSCredential]$SqlCredential,
         [int]$SyncTimeoutSeconds,
         [switch]$SkipFailback
     )
+
+    if (-not $ServiceType) { $ServiceType = $script:ServiceTypes }
 
     $bySql = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($n in $Nodes) { $bySql[$n.SqlInstance] = $n }
@@ -749,7 +757,7 @@ function Invoke-GracefulAgApply {
     Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
-    Restart-SqlEngineAgent -Computer $secondary.ComputerName -InstanceName $InstanceName -Credential $Credential
+    Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType -Credential $Credential
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
@@ -764,7 +772,7 @@ function Invoke-GracefulAgApply {
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    Restart-SqlEngineAgent -Computer $primary.ComputerName -InstanceName $InstanceName -Credential $Credential
+    Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType -Credential $Credential
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
@@ -891,23 +899,34 @@ try {
         $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
         if ($Credential -and $remote) { $svcCred = $Credential }
         $gp = @{
-            ComputerName = $node.ComputerName; Type = 'Engine', 'Agent'; EnableException = $true
+            ComputerName    = $node.ComputerName
+            Type            = $script:ServiceTypes
+            EnableException = $true
         }
-        if ($InstanceName) { $gp.InstanceName = $InstanceName }
         if ($svcCred) { $gp.Credential = $svcCred }
         Get-DbaService @gp
     }
     $allServices = @($allServices)
-    if (-not $allServices) { throw "No Engine/Agent services on: $($computers -join ', ')" }
+    if ($InstanceName) {
+        $allServices = @(
+            $allServices | Where-Object {
+                $type = [string]$_.ServiceType
+                ($type -in @('SSRS', 'SSIS')) -or ($_.InstanceName -in $InstanceName)
+            }
+        )
+    }
+    if (-not $allServices) {
+        throw "No $($script:ServiceTypes -join '/') services on: $($computers -join ', ')"
+    }
 
     Write-Host "`nServices:" -ForegroundColor Cyan
-    $allServices | Select-Object ComputerName, ServiceName, State, StartName | Format-Table -AutoSize
+    $allServices | Select-Object ComputerName, ServiceName, ServiceType, State, StartName | Format-Table -AutoSize
 
-    $groups = $allServices | Group-Object StartName | Where-Object {
-        $c = Test-AccountEligible -StartName $_.Name -ForComputer @($_.Group.ComputerName)[0] -IncludeDomain $IncludeDomain
-        if (-not $c.Ok) { Write-Host "Skip $($_.Name): $($c.Reason)" -ForegroundColor Yellow; return $false }
-        $true
-    }
+    $groups = @($allServices | Group-Object StartName | Where-Object {
+            $c = Test-AccountEligible -StartName $_.Name -ForComputer @($_.Group.ComputerName)[0] -IncludeDomain $IncludeDomain
+            if (-not $c.Ok) { Write-Host "Skip $($_.Name): $($c.Reason)" -ForegroundColor Yellow; return $false }
+            $true
+        })
     if (-not $groups) { Write-Warning 'No eligible accounts.'; return }
 
     $allowed = [Collections.Generic.HashSet[string]]::new([string[]]$computers, [StringComparer]::OrdinalIgnoreCase)
@@ -1022,12 +1041,21 @@ try {
             }
         }
 
+        $typesToRestart = @(
+            $groups |
+                Where-Object { $_.Name -in $rotatedAccounts } |
+                ForEach-Object { $_.Group } |
+                ForEach-Object { [string]$_.ServiceType } |
+                Sort-Object -Unique
+        )
+        if (-not $typesToRestart) { $typesToRestart = $script:ServiceTypes }
+
         if ($topo.Mode -eq 'AvailabilityGroup') {
             Invoke-GracefulAgApply `
                 -Nodes $topo.Nodes `
                 -AgNames $topo.AgNames `
                 -OriginalPrimary $topo.OriginalPrimary `
-                -InstanceName $InstanceName `
+                -ServiceType $typesToRestart `
                 -Credential $Credential `
                 -SqlCredential $SqlCredential `
                 -SyncTimeoutSeconds $SyncTimeoutSeconds `
@@ -1037,7 +1065,7 @@ try {
             $svcCred = $null
             $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
             if ($Credential -and $remote) { $svcCred = $Credential }
-            Restart-SqlEngineAgent -Computer $node.ComputerName -InstanceName $InstanceName -Credential $svcCred
+            Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred
         }
     } elseif ($SkipRestart) {
         Write-Warning 'SkipRestart: password updated; restart/failover later to apply.'
