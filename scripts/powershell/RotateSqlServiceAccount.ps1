@@ -7,6 +7,10 @@
     on the management host AND each SQL node (WinRM), then Update-DbaServiceAccount -NoRestart,
     then restart. Jump-box ValidateCredentials alone can race site DC replication.
 
+    Vault mutex (Global\SqlServiceAccountVault) is held only during vault file open/read/write,
+    not during AD waits, service updates, or restarts — so other operators can use the vault
+    while a long rotate is waiting on replication.
+
     Domain Kerberos WinRM encrypts the remoting session used for per-node checks.
     Prefer Kerberos; avoid Basic auth / CredSSP. HTTPS WinRM is optional environment
     hardening and is not required by this script.
@@ -229,6 +233,58 @@ function Write-VaultAtomic {
     if (Test-Path $Path) { Copy-Item $Path "$Path.bak" -Force }
     Move-Item $temp $Path -Force
     Set-RestrictedAcl -Path $Path
+}
+
+function Invoke-WithVaultLock {
+    <#
+      Hold Global\SqlServiceAccountVault only for vault file I/O (open/read/write).
+      Do NOT hold across AD waits, service updates, or restarts.
+      Returns whatever the scriptblock outputs.
+    #>
+    param(
+        [scriptblock]$ScriptBlock,
+        [int]$TimeoutSeconds = 60
+    )
+    $mutex = [Threading.Mutex]::new($false, $mutexName)
+    $gotLock = $false
+    try {
+        try {
+            $gotLock = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+        } catch [Threading.AbandonedMutexException] {
+            Write-Warning 'Recovered abandoned vault lock.'
+            $gotLock = $true
+        }
+        if (-not $gotLock) {
+            throw @"
+Vault lock timeout (${TimeoutSeconds}s).
+Another process on this machine is reading/writing the vault file right now.
+Wait a moment and retry (lock is only held during vault I/O, not during AD wait/restart).
+"@
+        }
+        & $ScriptBlock
+    } finally {
+        if ($gotLock) { [void]$mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function Save-VaultAccountEntry {
+    # Lock → reload from disk → upsert account → write. Avoids clobbering concurrent vault updates.
+    param(
+        [string]$Path,
+        [string]$Account,
+        [hashtable]$Entry
+    )
+    Invoke-WithVaultLock {
+        if (-not (Test-Path $Path)) {
+            throw "Vault file missing at '$Path' (expected to exist before saving an account)."
+        }
+        $doc = Import-Clixml -Path $Path
+        if (-not $doc.Accounts) { $doc.Accounts = @{} }
+        $doc.Accounts[$Account] = $Entry
+        Write-VaultAtomic -Doc $doc -Path $Path
+        $doc
+    }
 }
 
 function Get-StrongPassword {
@@ -900,45 +956,39 @@ if ($transcript) {
 }
 
 try {
-    $mutex = [Threading.Mutex]::new($false, $mutexName)
-    $gotLock = $false
-    try {
-        try { $gotLock = $mutex.WaitOne([TimeSpan]::FromSeconds(60)) }
-        catch [Threading.AbandonedMutexException] {
-            Write-Warning 'Recovered abandoned vault lock.'
-            $gotLock = $true
-        }
-        if (-not $gotLock) { throw 'Vault lock timeout (60s).' }
+    $unattend = $PSBoundParameters.ContainsKey('Unattended') -and $Unattended
 
-        $unattend = $PSBoundParameters.ContainsKey('Unattended') -and $Unattended
-        $opened = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
-        $vaultDoc = $opened.Doc
-        $vaultKey = $opened.Key
-
-        if ($opened.IsNew) {
-            Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+    # Vault lock is only held for file I/O (open / save / history), not the whole rotate.
+    $opened = Invoke-WithVaultLock {
+        $o = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
+        if ($o.IsNew) {
+            Write-VaultAtomic -Doc $o.Doc -Path $vaultPath
             Write-Host "Vault created: $vaultPath" -ForegroundColor Cyan
         }
+        $o
+    }
+    $vaultDoc = $opened.Doc
+    $vaultKey = $opened.Key
 
-        # ---- Vault-only modes ----
-        if ($ListVault) {
-            Show-VaultAccount -Doc $vaultDoc
-            return
+    # ---- Vault-only modes ----
+    if ($ListVault) {
+        Show-VaultAccount -Doc $vaultDoc
+        return
+    }
+
+    if ($RevealAccount) {
+        if (-not $vaultDoc.Accounts.ContainsKey($RevealAccount)) {
+            throw "Account '$RevealAccount' not found in vault. Use -ListVault."
         }
+        $secure = Unprotect-Secret -CipherText $vaultDoc.Accounts[$RevealAccount].EncryptedPassword -Key $vaultKey
+        $plain = [Net.NetworkCredential]::new('', $secure).Password
+        Write-Host "Account: $RevealAccount" -ForegroundColor Cyan
+        Write-Output $plain
+        $secure.Dispose()
+        return
+    }
 
-        if ($RevealAccount) {
-            if (-not $vaultDoc.Accounts.ContainsKey($RevealAccount)) {
-                throw "Account '$RevealAccount' not found in vault. Use -ListVault."
-            }
-            $secure = Unprotect-Secret -CipherText $vaultDoc.Accounts[$RevealAccount].EncryptedPassword -Key $vaultKey
-            $plain = [Net.NetworkCredential]::new('', $secure).Password
-            Write-Host "Account: $RevealAccount" -ForegroundColor Cyan
-            Write-Output $plain
-            $secure.Dispose()
-            return
-        }
-
-        # ---- Rotate mode ----
+    # ---- Rotate mode ----
         if (-not (Get-Module -ListAvailable -Name dbatools)) {
             if (-not $InstallModule) { throw 'dbatools missing. Install it or pass -InstallModule.' }
             Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
@@ -1044,7 +1094,7 @@ try {
                 try {
                     Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
 
-                    $vaultDoc.Accounts[$account] = @{
+                    $entry = @{
                         EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
                         LastComputerName  = $seedComputer
                         LastTopology      = $topo.Mode
@@ -1053,7 +1103,7 @@ try {
                         LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
                         LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
                     }
-                    Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+                    $vaultDoc = Save-VaultAccountEntry -Path $vaultPath -Account $account -Entry $entry
                     Write-Host '  Saved to vault (AD changed; waiting for replication before service update).' -ForegroundColor Green
 
                     Wait-AdCredentialReady -Account $account -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
@@ -1100,7 +1150,7 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
 
             if ($ok) {
                 if ($SkipAdPasswordReset) {
-                    $vaultDoc.Accounts[$account] = @{
+                    $entry = @{
                         EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
                         LastComputerName  = $seedComputer
                         LastTopology      = $topo.Mode
@@ -1109,7 +1159,7 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
                         LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
                         LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
                     }
-                    Write-VaultAtomic -Doc $vaultDoc -Path $vaultPath
+                    $vaultDoc = Save-VaultAccountEntry -Path $vaultPath -Account $account -Entry $entry
                     Write-Host '  Saved to vault (SkipAdPasswordReset; services updated, not restarted yet).' -ForegroundColor Green
                 } else {
                     Write-Host '  Services updated (not restarted yet).' -ForegroundColor Green
@@ -1178,17 +1228,17 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
         }
 
         $reportPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault_History.csv'
-        Write-VaultHistoryCsv -Doc $vaultDoc -Path $reportPath
+        Invoke-WithVaultLock {
+            # Prefer on-disk vault so history includes any concurrent saves.
+            $histDoc = if (Test-Path $vaultPath) { Import-Clixml -Path $vaultPath } else { $vaultDoc }
+            Write-VaultHistoryCsv -Doc $histDoc -Path $reportPath
+        }
 
         Write-Host "`nVault:   $vaultPath (password-protected)" -ForegroundColor Cyan
         Write-Host "History: $reportPath (no secrets)" -ForegroundColor Cyan
 
         if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
         if ($skippedConflicts) { Write-Warning "$($skippedConflicts.Count) shared account(s) skipped."; exit 2 }
-    } finally {
-        if ($gotLock) { [void]$mutex.ReleaseMutex() }
-        $mutex.Dispose()
-    }
 } finally {
     if ($transcript) { Stop-Transcript | Out-Null }
 }
