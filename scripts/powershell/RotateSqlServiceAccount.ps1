@@ -363,9 +363,24 @@ Example:
     $cred
 }
 
+function Test-SqlSspiOrLoginFailureMessage {
+    param([string]$Message)
+    $Message -match 'SSPI|Kerberos|login failed|Login failed|principal name|Cannot generate SSPI'
+}
+
 function Test-SqlAuthFailureMessage {
     param([string]$Message)
-    $Message -match 'SSPI|Kerberos|login failed|Login failed|principal name|Cannot generate SSPI|A network-related|timeout|timed out|connection|Connection'
+    (Test-SqlSspiOrLoginFailureMessage $Message) -or (
+        $Message -match 'A network-related|timeout|timed out|connection|Connection'
+    )
+}
+
+function Get-RemoteCredential {
+    param([string]$Computer, [PSCredential]$Credential)
+    if ($Credential -and $Computer -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')) {
+        return $Credential
+    }
+    $null
 }
 
 function Get-TargetTopology {
@@ -927,9 +942,11 @@ function Invoke-GracefulAgApply {
     Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
-    Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType -Credential $Credential `
+    Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType `
+        -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) `
         -Account $Account -AccountPassword $AccountPassword
-    Wait-SqlTargetServiceRunning -Computer $secondary.ComputerName -Type $ServiceType -Credential $Credential `
+    Wait-SqlTargetServiceRunning -Computer $secondary.ComputerName -Type $ServiceType `
+        -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -945,9 +962,11 @@ function Invoke-GracefulAgApply {
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
-    Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType -Credential $Credential `
+    Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType `
+        -Credential (Get-RemoteCredential $primary.ComputerName $Credential) `
         -Account $Account -AccountPassword $AccountPassword
-    Wait-SqlTargetServiceRunning -Computer $primary.ComputerName -Type $ServiceType -Credential $Credential `
+    Wait-SqlTargetServiceRunning -Computer $primary.ComputerName -Type $ServiceType `
+        -Credential (Get-RemoteCredential $primary.ComputerName $Credential) `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -1077,7 +1096,7 @@ try {
                 -SqlCredential $SqlCredential -Credential $Credential
         } catch {
             $msg = [string]$_
-            if ($SqlCredential -or -not (Test-SqlAuthFailureMessage $msg)) { throw }
+            if ($SqlCredential -or -not (Test-SqlSspiOrLoginFailureMessage $msg)) { throw }
             Write-Warning 'Windows/Kerberos SQL login failed during topology discovery; prompting for SQL auth.'
             $SqlCredential = Resolve-AgSqlCredential -Unattended:$unattend
             $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
@@ -1171,11 +1190,18 @@ try {
         foreach ($g in $groupList) {
             $account = $g.Name
             Write-Host "`nRotating: $account" -ForegroundColor Green
-            $securePwd = Get-StrongPassword -Length $PasswordLength
             $ok = $true
             $accountNodes = @($g.Group.ComputerName | Sort-Object -Unique)
+            $securePwd = $null
 
-            if (-not $SkipAdPasswordReset) {
+            if ($SkipAdPasswordReset) {
+                if (-not $vaultDoc.Accounts.ContainsKey($account) -or -not $vaultDoc.Accounts[$account].EncryptedPassword) {
+                    throw "SkipAdPasswordReset requires a vault entry for '$account'. Use -RevealAccount or rotate without -SkipAdPasswordReset first."
+                }
+                $securePwd = Unprotect-Secret -CipherText $vaultDoc.Accounts[$account].EncryptedPassword -Key $vaultKey
+                Write-Host '  Using vault password (SkipAdPasswordReset; AD not changed).' -ForegroundColor Cyan
+            } else {
+                $securePwd = Get-StrongPassword -Length $PasswordLength
                 try {
                     Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
 
@@ -1211,9 +1237,7 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
                 foreach ($computer in $accountNodes) {
                     if (-not $ok) { break }
                     $nodeServices = @($g.Group | Where-Object ComputerName -eq $computer)
-                    $svcCred = $null
-                    $remote = $computer -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                    if ($Credential -and $remote) { $svcCred = $Credential }
+                    $svcCred = Get-RemoteCredential -Computer $computer -Credential $Credential
                     try {
                         Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer" -ForegroundColor DarkCyan
                         $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred)
@@ -1234,8 +1258,9 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
 
             if ($ok) {
                 if ($SkipAdPasswordReset) {
+                    $existing = $vaultDoc.Accounts[$account]
                     $entry = @{
-                        EncryptedPassword = Protect-Secret -Secret $securePwd -Key $vaultKey
+                        EncryptedPassword = $existing.EncryptedPassword
                         LastComputerName  = $seedComputer
                         LastTopology      = $topo.Mode
                         LastNodes         = ($computers -join ', ')
@@ -1244,7 +1269,7 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
                         LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
                     }
                     $vaultDoc = Save-VaultAccountEntry -Path $vaultPath -Account $account -Entry $entry
-                    Write-Host '  Saved to vault (SkipAdPasswordReset; services updated, not restarted yet).' -ForegroundColor Green
+                    Write-Host '  Services updated (SkipAdPasswordReset; vault password unchanged).' -ForegroundColor Green
                 } else {
                     Write-Host '  Services updated (not restarted yet).' -ForegroundColor Green
                 }
@@ -1258,16 +1283,14 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
             $restartAccounts = @($rotatedAccounts)
             $restartPasswords = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
             try {
-                if (-not $SkipAdPasswordReset) {
-                    $sqlNodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
-                    foreach ($account in $restartAccounts) {
-                        $sec = Unprotect-Secret -CipherText $vaultDoc.Accounts[$account].EncryptedPassword -Key $vaultKey
-                        $restartPasswords[$account] = $sec
-                        Write-Host "`nPre-restart AD check on SQL nodes: $account" -ForegroundColor Cyan
-                        Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $sec `
-                            -ComputerName $sqlNodes -Credential $Credential `
-                            -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
-                    }
+                $sqlNodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
+                foreach ($account in $restartAccounts) {
+                    $sec = Unprotect-Secret -CipherText $vaultDoc.Accounts[$account].EncryptedPassword -Key $vaultKey
+                    $restartPasswords[$account] = $sec
+                    Write-Host "`nPre-restart AD check on SQL nodes: $account" -ForegroundColor Cyan
+                    Wait-AdCredentialReadyOnNode -Account $account -SecurePassword $sec `
+                        -ComputerName $sqlNodes -Credential $Credential `
+                        -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
                 }
 
                 $typesToRestart = @(
@@ -1292,9 +1315,7 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
                         -AccountPassword $restartPasswords
                 } else {
                     $node = $topo.Nodes[0]
-                    $svcCred = $null
-                    $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                    if ($Credential -and $remote) { $svcCred = $Credential }
+                    $svcCred = Get-RemoteCredential -Computer $node.ComputerName -Credential $Credential
                     Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred `
                         -Account $restartAccounts -AccountPassword $restartPasswords
                     Wait-SqlTargetServiceRunning -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred `

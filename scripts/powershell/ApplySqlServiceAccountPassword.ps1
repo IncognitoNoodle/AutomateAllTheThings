@@ -96,9 +96,16 @@ function Get-NodeComputer {
     $resolved.FullComputerName
 }
 
+function Test-SqlSspiOrLoginFailureMessage {
+    param([string]$Message)
+    $Message -match 'SSPI|Kerberos|login failed|Login failed|principal name|Cannot generate SSPI'
+}
+
 function Test-SqlAuthFailureMessage {
     param([string]$Message)
-    $Message -match 'SSPI|Kerberos|login failed|Login failed|principal name|Cannot generate SSPI|A network-related|timeout|timed out|connection|Connection'
+    (Test-SqlSspiOrLoginFailureMessage $Message) -or (
+        $Message -match 'A network-related|timeout|timed out|connection|Connection'
+    )
 }
 
 function Resolve-AgSqlCredential {
@@ -785,7 +792,8 @@ try {
     Set-DbatoolsConfig -FullName sql.connection.trustcert -Value $true
 
     # AG cmdlets use SQL auth (-SqlCredential) to avoid Kerberos/SSPI.
-    if ($AvailabilityGroup) {
+    # ListAccounts is read-only listing of services; don't force a SQL login prompt.
+    if ($AvailabilityGroup -and -not $ListAccounts) {
         $SqlCredential = Resolve-AgSqlCredential -SqlCredential $SqlCredential
     }
 
@@ -794,14 +802,14 @@ try {
             -SqlCredential $SqlCredential -Credential $Credential
     } catch {
         $msg = [string]$_
-        if ($SqlCredential -or -not (Test-SqlAuthFailureMessage $msg)) { throw }
+        if ($ListAccounts -or $SqlCredential -or -not (Test-SqlSspiOrLoginFailureMessage $msg)) { throw }
         Write-Warning 'Windows/Kerberos SQL login failed during topology discovery; prompting for SQL auth.'
         $SqlCredential = Resolve-AgSqlCredential
         $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
             -SqlCredential $SqlCredential -Credential $Credential
     }
 
-    if ($topo.Mode -eq 'AvailabilityGroup') {
+    if ($topo.Mode -eq 'AvailabilityGroup' -and -not $ListAccounts) {
         $SqlCredential = Resolve-AgSqlCredential -SqlCredential $SqlCredential
         Write-Host "AG SQL login: $($SqlCredential.UserName)" -ForegroundColor DarkCyan
     }
@@ -870,9 +878,13 @@ try {
             $svcCred = Get-RemoteCredential -Computer $computer -Credential $Credential
             try {
                 Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer ($(($nodeServices.ServiceName) -join ', '))" -ForegroundColor DarkCyan
-                $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
-                if ($result.Status -contains 'Failed') {
-                    Write-Host "  FAILED @ ${computer}: $((($result | Where-Object Status -eq Failed).Message) -join '; ')" -ForegroundColor Red
+                $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred)
+                $failed = @($result | Where-Object { $_.Status -eq 'Failed' })
+                if ($failed.Count -gt 0) {
+                    Write-Host "  FAILED @ ${computer}: $((($failed).Message) -join '; ')" -ForegroundColor Red
+                    $ok = $false; $anyFailures = $true
+                } elseif ($result.Count -eq 0) {
+                    Write-Host "  FAILED @ ${computer}: Update-DbaServiceAccount returned no result" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
                 }
             } catch {
