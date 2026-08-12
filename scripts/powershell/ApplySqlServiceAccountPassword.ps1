@@ -588,6 +588,7 @@ function Test-SqlConnectRetryable {
 }
 
 function Wait-SqlInstanceReady {
+    # Connect-DbaInstance has no -EnableException on many dbatools versions — use -ErrorAction Stop.
     param(
         [string]$SqlInstance,
         [PSCredential]$SqlCredential,
@@ -599,13 +600,14 @@ function Wait-SqlInstanceReady {
     do {
         $attempt++
         try {
-            $p = @{ SqlInstance = $SqlInstance; EnableException = $true }
+            $p = @{ SqlInstance = $SqlInstance; ErrorAction = 'Stop' }
             if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
             $null = Connect-DbaInstance @p
             Write-Host "  SQL connect: OK $SqlInstance (attempt $attempt)" -ForegroundColor Green
             return
         } catch {
             $msg = [string]$_
+            if ($msg -match 'parameter cannot be found|NamedParameterNotFound|Cannot find a parameter') { throw }
             Write-Host ("  SQL connect: not ready {0} (attempt {1}): {2}" -f $SqlInstance, $attempt, $msg) -ForegroundColor DarkYellow
             if (-not (Test-SqlConnectRetryable -ErrorText $msg) -and $attempt -gt 3) { throw }
         }
