@@ -10,10 +10,15 @@ SecOps already reset the domain password. This script updates SQL Windows servic
 - `-ListAccounts` — show those service accounts
 - `-Account` + `-SecurePassword` — one or many pairs (same count/order)
 - Updates all supplied service logon caches (`Update-DbaServiceAccount -NoRestart`)
-- Restarts **once**:
+- Waits until the password validates on the **mgmt host** and **each SQL node** (WinRM) before restart — same AD readiness check as the rotator
+- Restarts **once** (with auth-failure unlock/retry):
   - Standalone → restart updated service types
   - AG → secondary restart → failover → former primary restart → failback
 - Transcript log only (no password vault / history CSV)
+
+## WinRM
+
+Per-node checks need WinRM from the jump box to each SQL node. Domain **Kerberos** WinRM encrypts the session. Prefer Kerberos; avoid Basic/CredSSP. HTTPS WinRM is optional environment hardening (not required by the script).
 
 ## Examples
 
