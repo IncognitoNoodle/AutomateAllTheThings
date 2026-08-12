@@ -503,7 +503,8 @@ function Restart-SqlTargetService {
         [string[]]$Account,
         [hashtable]$AccountPassword,
         [int]$RetryCount = 5,
-        [int]$RetryDelaySeconds = 20
+        [int]$RetryDelaySeconds = 20,
+        [int]$AdWaitSeconds = 0
     )
     $Type = @($Type | Sort-Object -Unique)
     $p = @{
@@ -514,7 +515,7 @@ function Restart-SqlTargetService {
         EnableException = $true
     }
     if ($Credential) { $p.Credential = $Credential }
-    $retryWait = [Math]::Max(60, $RetryDelaySeconds * 3)
+    $retryWait = if ($AdWaitSeconds -gt 0) { $AdWaitSeconds } else { [Math]::Max(60, $RetryDelaySeconds * 3) }
 
     for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
         Write-Host "  Restart $($Type -join '/') on $Computer (attempt $attempt/$RetryCount)" -ForegroundColor Cyan
@@ -713,7 +714,7 @@ function Invoke-GracefulAgApply {
 
     Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) `
-        -Account $Account -AccountPassword $AccountPassword
+        -Account $Account -AccountPassword $AccountPassword -AdWaitSeconds $SyncTimeoutSeconds
     Wait-SqlTargetServiceRunning -Computer $secondary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
@@ -733,7 +734,7 @@ function Invoke-GracefulAgApply {
 
     Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $primary.ComputerName $Credential) `
-        -Account $Account -AccountPassword $AccountPassword
+        -Account $Account -AccountPassword $AccountPassword -AdWaitSeconds $SyncTimeoutSeconds
     Wait-SqlTargetServiceRunning -Computer $primary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $primary.ComputerName $Credential) `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
@@ -785,7 +786,8 @@ try {
     Set-DbatoolsConfig -FullName sql.connection.trustcert -Value $true
 
     # AG cmdlets use SQL auth (-SqlCredential) to avoid Kerberos/SSPI.
-    if ($AvailabilityGroup) {
+    # ListAccounts is read-only; do not force a SQL login prompt.
+    if ($AvailabilityGroup -and -not $ListAccounts) {
         $SqlCredential = Resolve-AgSqlCredential -SqlCredential $SqlCredential
     }
 
@@ -794,14 +796,14 @@ try {
             -SqlCredential $SqlCredential -Credential $Credential
     } catch {
         $msg = [string]$_
-        if ($SqlCredential -or -not (Test-SqlAuthFailureMessage $msg)) { throw }
+        if ($ListAccounts -or $SqlCredential -or -not (Test-SqlAuthFailureMessage $msg)) { throw }
         Write-Warning 'Windows/Kerberos SQL login failed during topology discovery; prompting for SQL auth.'
         $SqlCredential = Resolve-AgSqlCredential
         $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
             -SqlCredential $SqlCredential -Credential $Credential
     }
 
-    if ($topo.Mode -eq 'AvailabilityGroup') {
+    if ($topo.Mode -eq 'AvailabilityGroup' -and -not $ListAccounts) {
         $SqlCredential = Resolve-AgSqlCredential -SqlCredential $SqlCredential
         Write-Host "AG SQL login: $($SqlCredential.UserName)" -ForegroundColor DarkCyan
     }
@@ -870,9 +872,13 @@ try {
             $svcCred = Get-RemoteCredential -Computer $computer -Credential $Credential
             try {
                 Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer ($(($nodeServices.ServiceName) -join ', '))" -ForegroundColor DarkCyan
-                $result = Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred
-                if ($result.Status -contains 'Failed') {
-                    Write-Host "  FAILED @ ${computer}: $((($result | Where-Object Status -eq Failed).Message) -join '; ')" -ForegroundColor Red
+                $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred)
+                $failed = @($result | Where-Object { $_.Status -eq 'Failed' })
+                if ($failed.Count -gt 0) {
+                    Write-Host "  FAILED @ ${computer}: $((($failed).Message) -join '; ')" -ForegroundColor Red
+                    $ok = $false; $anyFailures = $true
+                } elseif ($result.Count -eq 0) {
+                    Write-Host "  FAILED @ ${computer}: Update-DbaServiceAccount returned no result" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
                 }
             } catch {
@@ -916,7 +922,8 @@ try {
         )
         if (-not $typesToRestart) { $typesToRestart = $script:ServiceTypes }
 
-        if ($topo.Mode -eq 'AvailabilityGroup') {
+        $needsAgFailover = @($typesToRestart | Where-Object { $_ -in @('Engine', 'Agent') }).Count -gt 0
+        if ($topo.Mode -eq 'AvailabilityGroup' -and $needsAgFailover) {
             Invoke-GracefulAgApply `
                 -Nodes $topo.Nodes `
                 -AgNames $topo.AgNames `
@@ -928,13 +935,18 @@ try {
                 -Account $restartAccounts `
                 -AccountPassword $restartPasswords
         } else {
-            $node = $topo.Nodes[0]
-            Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart `
-                -Credential (Get-RemoteCredential $node.ComputerName $Credential) `
-                -Account $restartAccounts -AccountPassword $restartPasswords
-            Wait-SqlTargetServiceRunning -Computer $node.ComputerName -Type $typesToRestart `
-                -Credential (Get-RemoteCredential $node.ComputerName $Credential) `
-                -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+            if ($topo.Mode -eq 'AvailabilityGroup' -and -not $needsAgFailover) {
+                Write-Host 'SSRS/SSIS only: restarting on all nodes (no AG failover).' -ForegroundColor Cyan
+            }
+            foreach ($node in $topo.Nodes) {
+                Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart `
+                    -Credential (Get-RemoteCredential $node.ComputerName $Credential) `
+                    -Account $restartAccounts -AccountPassword $restartPasswords `
+                    -AdWaitSeconds $SyncTimeoutSeconds
+                Wait-SqlTargetServiceRunning -Computer $node.ComputerName -Type $typesToRestart `
+                    -Credential (Get-RemoteCredential $node.ComputerName $Credential) `
+                    -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+            }
         }
     }
 

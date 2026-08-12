@@ -688,7 +688,8 @@ function Restart-SqlTargetService {
         [string[]]$Account,
         [hashtable]$AccountPassword,
         [int]$RetryCount = 5,
-        [int]$RetryDelaySeconds = 20
+        [int]$RetryDelaySeconds = 20,
+        [int]$AdWaitSeconds = 0
     )
     $Type = @($Type | Where-Object { $_ } | Sort-Object -Unique)
     if (-not $Type) { $Type = $script:ServiceTypes }
@@ -700,7 +701,7 @@ function Restart-SqlTargetService {
         EnableException = $true
     }
     if ($Credential) { $p.Credential = $Credential }
-    $retryWait = [Math]::Max(60, $RetryDelaySeconds * 3)
+    $retryWait = if ($AdWaitSeconds -gt 0) { $AdWaitSeconds } else { [Math]::Max(60, $RetryDelaySeconds * 3) }
 
     for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
         Write-Host "  Restart $($Type -join '/') on $Computer (attempt $attempt/$RetryCount)" -ForegroundColor Cyan
@@ -872,7 +873,7 @@ function Invoke-GracefulAgApply {
     $remoteSecondary = $secondary.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
     if ($Credential -and $remoteSecondary) { $svcCredSecondary = $Credential }
     Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType -Credential $svcCredSecondary `
-        -Account $Account -AccountPassword $AccountPassword
+        -Account $Account -AccountPassword $AccountPassword -AdWaitSeconds $SyncTimeoutSeconds
     Wait-SqlTargetServiceRunning -Computer $secondary.ComputerName -Type $ServiceType -Credential $svcCredSecondary `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
@@ -893,7 +894,7 @@ function Invoke-GracefulAgApply {
     $remotePrimary = $primary.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
     if ($Credential -and $remotePrimary) { $svcCredPrimary = $Credential }
     Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType -Credential $svcCredPrimary `
-        -Account $Account -AccountPassword $AccountPassword
+        -Account $Account -AccountPassword $AccountPassword -AdWaitSeconds $SyncTimeoutSeconds
     Wait-SqlTargetServiceRunning -Computer $primary.ComputerName -Type $ServiceType -Credential $svcCredPrimary `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
@@ -984,8 +985,15 @@ if ($transcript) {
 try {
     $unattend = $PSBoundParameters.ContainsKey('Unattended') -and $Unattended
 
+    # Prompt for vault password outside the mutex (lock only covers vault file I/O).
+    if (Test-Path $vaultPath) {
+        $vaultPwdReady = Get-VaultPasswordInput -VaultPassword $VaultPassword -Unattended:$unattend
+    } else {
+        $vaultPwdReady = Get-VaultPasswordInput -VaultPassword $VaultPassword -ConfirmNew -Unattended:$unattend
+    }
+
     $opened = Invoke-WithVaultLock {
-        $o = Open-PasswordVault -Path $vaultPath -VaultPassword $VaultPassword -Unattended:$unattend
+        $o = Open-PasswordVault -Path $vaultPath -VaultPassword $vaultPwdReady -Unattended:$unattend
         if ($o.IsNew) {
             Write-VaultAtomic -Doc $o.Doc -Path $vaultPath
             Write-Host "Vault created: $vaultPath" -ForegroundColor Cyan
@@ -1104,11 +1112,19 @@ try {
     foreach ($g in $groups) {
         $account = $g.Name
         Write-Host "`nRotating: $account" -ForegroundColor Green
-        $securePwd = Get-StrongPassword -Length $PasswordLength
         $ok = $true
         $accountNodes = @($g.Group.ComputerName | Sort-Object -Unique)
+        $securePwd = $null
+        $vaultedAfterAd = $false
 
-        if (-not $SkipAdPasswordReset) {
+        if ($SkipAdPasswordReset) {
+            if (-not $vaultDoc.Accounts.ContainsKey($account) -or -not $vaultDoc.Accounts[$account].EncryptedPassword) {
+                throw "SkipAdPasswordReset requires a vault entry for '$account'. Use -RevealAccount or rotate without -SkipAdPasswordReset first."
+            }
+            $securePwd = Unprotect-Secret -CipherText $vaultDoc.Accounts[$account].EncryptedPassword -Key $vaultKey
+            Write-Host '  Using vault password (SkipAdPasswordReset; AD not changed).' -ForegroundColor Cyan
+        } else {
+            $securePwd = Get-StrongPassword -Length $PasswordLength
             try {
                 Reset-DomainAccountPassword -Account $account -SecurePassword $securePwd -LocalComputer $seedComputer
                 if (Test-IsDomainAccount -Account $account -Computer $seedComputer) {
@@ -1122,6 +1138,7 @@ try {
                         LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
                     }
                     $vaultDoc = Save-VaultAccountEntry -Path $vaultPath -Account $account -Entry $entry
+                    $vaultedAfterAd = $true
                     Write-Host '  Saved to vault (AD changed; waiting for replication before service update).' -ForegroundColor Green
 
                     Wait-AdCredentialReady -Account $account -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
@@ -1165,10 +1182,20 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
         }
 
         if ($ok) {
-            $alreadyVaulted = (-not $SkipAdPasswordReset) -and (
-                Test-IsDomainAccount -Account $account -Computer $seedComputer
-            ) -and $vaultDoc.Accounts.ContainsKey($account)
-            if ($alreadyVaulted) {
+            if ($SkipAdPasswordReset) {
+                $existing = $vaultDoc.Accounts[$account]
+                $entry = @{
+                    EncryptedPassword = $existing.EncryptedPassword
+                    LastComputerName  = $seedComputer
+                    LastTopology      = $topo.Mode
+                    LastNodes         = ($computers -join ', ')
+                    LastServices      = (($g.Group | ForEach-Object { "$($_.ComputerName)\$($_.ServiceName)" }) -join ', ')
+                    LastRotatedUtc    = (Get-Date).ToUniversalTime().ToString('u')
+                    LastRotatedBy     = "$env:USERDOMAIN\$env:USERNAME"
+                }
+                $vaultDoc = Save-VaultAccountEntry -Path $vaultPath -Account $account -Entry $entry
+                Write-Host '  Services updated (SkipAdPasswordReset; vault password unchanged).' -ForegroundColor Green
+            } elseif ($vaultedAfterAd) {
                 Write-Host '  Services updated (not restarted yet).' -ForegroundColor Green
             } else {
                 $entry = @{
@@ -1214,7 +1241,8 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
             )
             if (-not $typesToRestart) { $typesToRestart = $script:ServiceTypes }
 
-            if ($topo.Mode -eq 'AvailabilityGroup') {
+            $needsAgFailover = @($typesToRestart | Where-Object { $_ -in @('Engine', 'Agent') }).Count -gt 0
+            if ($topo.Mode -eq 'AvailabilityGroup' -and $needsAgFailover) {
                 Invoke-GracefulAgApply `
                     -Nodes $topo.Nodes `
                     -AgNames $topo.AgNames `
@@ -1227,14 +1255,19 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
                     -Account $restartAccounts `
                     -AccountPassword $restartPasswords
             } else {
-                $node = $topo.Nodes[0]
-                $svcCred = $null
-                $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                if ($Credential -and $remote) { $svcCred = $Credential }
-                Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred `
-                    -Account $restartAccounts -AccountPassword $restartPasswords
-                Wait-SqlTargetServiceRunning -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred `
-                    -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+                if ($topo.Mode -eq 'AvailabilityGroup' -and -not $needsAgFailover) {
+                    Write-Host 'SSRS/SSIS only: restarting on all nodes (no AG failover).' -ForegroundColor Cyan
+                }
+                foreach ($node in $topo.Nodes) {
+                    $svcCred = $null
+                    $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+                    if ($Credential -and $remote) { $svcCred = $Credential }
+                    Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred `
+                        -Account $restartAccounts -AccountPassword $restartPasswords `
+                        -AdWaitSeconds $SyncTimeoutSeconds
+                    Wait-SqlTargetServiceRunning -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred `
+                        -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+                }
             }
         } finally {
             foreach ($k in @($restartPasswords.Keys)) {
