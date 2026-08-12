@@ -6,6 +6,10 @@
     After Set-ADAccountPassword, waits until the password validates on the management host
     AND on each SQL node (via WinRM Invoke-Command). Jump-box ValidateCredentials alone
     can race site DC replication and cause restart logon/lockout failures.
+
+    Domain Kerberos WinRM encrypts the remoting session used for per-node checks.
+    Prefer Kerberos; avoid Basic auth / CredSSP. HTTPS WinRM is optional environment
+    hardening and is not required by this script.
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
@@ -485,7 +489,12 @@ function Test-AdCredentialOnComputer {
         ArgumentList = @($domain, $sam, $PlainPassword)
         ErrorAction  = 'Stop'
     }
-    if ($Credential) { $ic.Credential = $Credential }
+    if ($Credential) {
+        $ic.Credential = $Credential
+    } else {
+        # Prefer Kerberos (encrypted session). Avoid falling back to weaker auth by default.
+        $ic.Authentication = 'Kerberos'
+    }
     return [bool](Invoke-Command @ic)
 }
 
