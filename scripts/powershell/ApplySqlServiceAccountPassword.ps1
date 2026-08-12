@@ -508,9 +508,7 @@ function Restart-SqlTargetService {
         }
 
         $bad = @($result | Where-Object {
-                $_.Status -eq 'Failed' -or (
-                    [string]$_.ServiceType -in @('Engine', 'Agent') -and $_.State -ne 'Running'
-                )
+                $_.Status -eq 'Failed' -or [string]$_.State -ne 'Running'
             })
         if (-not $bad) { return }
 
@@ -537,44 +535,49 @@ function Test-ReplicaMatch {
     $true
 }
 
-function Wait-SqlEngineServiceRunning {
+function Wait-SqlTargetServiceRunning {
     param(
         [string]$Computer,
+        [string[]]$Type = $script:ServiceTypes,
         [PSCredential]$Credential,
         [int]$TimeoutSeconds = 180
     )
     if ([string]::IsNullOrWhiteSpace($Computer)) { return }
+    $Type = @($Type | Where-Object { $_ } | Sort-Object -Unique)
+    if (-not $Type) { return }
+
+    $label = $Type -join '/'
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $attempt = 0
-    Write-Host "  Waiting for Engine Running on $Computer (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
+    Write-Host "  Waiting for $label Running on $Computer (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
     do {
         $attempt++
         try {
             $gp = @{
                 ComputerName    = $Computer
-                Type            = 'Engine'
+                Type            = $Type
                 EnableException = $true
                 ErrorAction     = 'Stop'
             }
             if ($Credential) { $gp.Credential = $Credential }
-            $engines = @(Get-DbaService @gp)
-            $running = @($engines | Where-Object { [string]$_.State -eq 'Running' })
-            if ($running.Count -gt 0) {
-                Write-Host ("  Engine Running on {0} ({1})" -f $Computer, (($running.ServiceName) -join ', ')) -ForegroundColor Green
+            $svcs = @(Get-DbaService @gp)
+            if (-not $svcs) {
+                Write-Host "  No $label services on $Computer (nothing to wait for)" -ForegroundColor DarkYellow
                 return
             }
-            $states = if ($engines) {
-                ($engines | ForEach-Object { "$($_.ServiceName)=$($_.State)" }) -join '; '
-            } else {
-                'no Engine services returned'
+            $notRunning = @($svcs | Where-Object { [string]$_.State -ne 'Running' })
+            if (-not $notRunning) {
+                Write-Host ("  {0} Running on {1} ({2})" -f $label, $Computer, (($svcs.ServiceName) -join ', ')) -ForegroundColor Green
+                return
             }
-            Write-Host "  Engine not ready on $Computer (attempt $attempt): $states" -ForegroundColor DarkYellow
+            $states = ($notRunning | ForEach-Object { "$($_.ServiceName)=$($_.State)" }) -join '; '
+            Write-Host "  Not ready on $Computer (attempt $attempt): $states" -ForegroundColor DarkYellow
         } catch {
-            Write-Host ("  Engine check failed on {0} (attempt {1}): {2}" -f $Computer, $attempt, $_) -ForegroundColor DarkYellow
+            Write-Host ("  Service check failed on {0} (attempt {1}): {2}" -f $Computer, $attempt, $_) -ForegroundColor DarkYellow
         }
         Start-Sleep -Seconds 5
     } while ((Get-Date) -lt $deadline)
-    throw "SQL Engine not Running on $Computer within ${TimeoutSeconds}s."
+    throw "$label not Running on $Computer within ${TimeoutSeconds}s."
 }
 
 function Wait-AgReady {
@@ -670,7 +673,8 @@ function Invoke-GracefulAgApply {
     Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) `
         -Account $Account -AccountPassword $AccountPassword
-    Wait-SqlEngineServiceRunning -Computer $secondary.ComputerName -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) `
+    Wait-SqlTargetServiceRunning -Computer $secondary.ComputerName -Type $ServiceType `
+        -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -689,7 +693,8 @@ function Invoke-GracefulAgApply {
     Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType `
         -Credential (Get-RemoteCredential $primary.ComputerName $Credential) `
         -Account $Account -AccountPassword $AccountPassword
-    Wait-SqlEngineServiceRunning -Computer $primary.ComputerName -Credential (Get-RemoteCredential $primary.ComputerName $Credential) `
+    Wait-SqlTargetServiceRunning -Computer $primary.ComputerName -Type $ServiceType `
+        -Credential (Get-RemoteCredential $primary.ComputerName $Credential) `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -867,6 +872,9 @@ try {
             Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart `
                 -Credential (Get-RemoteCredential $node.ComputerName $Credential) `
                 -Account $restartAccounts -AccountPassword $restartPasswords
+            Wait-SqlTargetServiceRunning -Computer $node.ComputerName -Type $typesToRestart `
+                -Credential (Get-RemoteCredential $node.ComputerName $Credential) `
+                -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
         }
     }
 
