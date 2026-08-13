@@ -62,6 +62,8 @@ $script:OutputFolder = '\\SERVERNAME\C$\Temp\'
 $script:ServiceTypes = @('Engine', 'Agent', 'SSRS', 'SSIS')
 
 $ErrorActionPreference = 'Stop'
+$script:DomainDnsSuffixCache = $null
+$script:SqlHostDnsCache = @{}
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $vaultPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault.xml'
 $mutexName = 'Global\SqlServiceAccountVault'
@@ -332,13 +334,255 @@ function Test-IsDomainAccount {
     ($Account -match '\\') -and ($Account -notmatch "^$([regex]::Escape($Computer))\\|^\.\\")
 }
 
+function Test-IsLocalComputerName {
+    param([string]$ComputerName)
+    if ([string]::IsNullOrWhiteSpace($ComputerName)) { return $true }
+    $short = ($ComputerName -split '\.')[0]
+    $local = @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
+    return ($ComputerName -in $local) -or ($short -eq $env:COMPUTERNAME)
+}
+
+function Test-ComputerNameMatch {
+    param([string]$Left, [string]$Right)
+    if (-not $Left -or -not $Right) { return $false }
+    if ($Left -eq $Right) { return $true }
+    (($Left -split '\.')[0] -eq ($Right -split '\.')[0])
+}
+
+function Test-DnsNameResolve {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    try {
+        $null = [System.Net.Dns]::GetHostAddresses($Name)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-DomainDnsSuffixCandidate {
+    if ($null -ne $script:DomainDnsSuffixCache) { return @($script:DomainDnsSuffixCache) }
+
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $suffixes = [System.Collections.Generic.List[string]]::new()
+    $addSuffix = {
+        param($s)
+        if ([string]::IsNullOrWhiteSpace($s)) { return }
+        $t = $s.Trim().TrimStart('.').TrimEnd('.')
+        if ($t -and $seen.Add($t)) { [void]$suffixes.Add($t) }
+    }
+
+    try {
+        $ipProps = [System.Net.FAKESECRET_o2p3q4r5s6t7u8v9w0x1]::GetIPGlobalProperties()
+        & $addSuffix $ipProps.DomainName
+    } catch { $null = $_ }
+
+    try {
+        $dom = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+        & $addSuffix $dom.Name
+        foreach ($t in @($dom.GetAllTrustRelationships())) { & $addSuffix $t.TargetName }
+        $forest = $dom.Forest
+        & $addSuffix $forest.Name
+        foreach ($t in @($forest.GetAllTrustRelationships())) { & $addSuffix $t.TargetName }
+        foreach ($d in @($forest.Domains)) { & $addSuffix $d.Name }
+    } catch { $null = $_ }
+
+    try {
+        if (Get-Command Get-ADForest -ErrorAction SilentlyContinue) {
+            $f = Get-ADForest -ErrorAction Stop
+            & $addSuffix $f.Name
+            foreach ($d in @($f.Domains)) { & $addSuffix $d }
+            foreach ($u in @($f.UPNSuffixes)) { & $addSuffix $u }
+        }
+        if (Get-Command Get-ADTrust -ErrorAction SilentlyContinue) {
+            foreach ($t in @(Get-ADTrust -Filter * -ErrorAction SilentlyContinue)) {
+                & $addSuffix $t.Name
+                & $addSuffix $t.Target
+            }
+        }
+    } catch { $null = $_ }
+
+    $script:DomainDnsSuffixCache = @($suffixes)
+    return @($script:DomainDnsSuffixCache)
+}
+
+function Get-SqlHostFqdn {
+    param(
+        [string]$SqlInstance,
+        [PSCredential]$SqlCredential
+    )
+    if ([string]::IsNullOrWhiteSpace($SqlInstance)) { return $null }
+    if ($script:SqlHostDnsCache.ContainsKey($SqlInstance)) {
+        return $script:SqlHostDnsCache[$SqlInstance]
+    }
+    if (-not (Get-Command Invoke-DbaQuery -ErrorAction SilentlyContinue)) { return $null }
+
+    $fqdn = $null
+    try {
+        # Machine DNS domain (not service-account DEFAULT_DOMAIN()).
+        $q = @'
+DECLARE @domain nvarchar(256);
+EXEC master.dbo.xp_regread
+    N'HKEY_LOCAL_MACHINE',
+    N'SYSTEM\CurrentControlSet\Services\Tcpip\Parameters',
+    N'Domain',
+    @domain OUTPUT;
+SELECT
+    CAST(SERVERPROPERTY('MachineName') AS nvarchar(128)) AS MachineName,
+    @domain AS DnsDomain;
+'@
+        $p = @{
+            SqlInstance     = $SqlInstance
+            Query           = $q
+            EnableException = $true
+            ErrorAction     = 'Stop'
+        }
+        if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
+        $row = @(Invoke-DbaQuery @p) | Select-Object -First 1
+        if ($row -and $row.MachineName -and $row.DnsDomain) {
+            $fqdn = '{0}.{1}' -f ([string]$row.MachineName).Trim(), ([string]$row.DnsDomain).Trim().TrimStart('.')
+        }
+    } catch {
+        $null = $_
+    }
+
+    $script:SqlHostDnsCache[$SqlInstance] = $fqdn
+    return $fqdn
+}
+
+function Resolve-RemoteComputerTarget {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [string]$SqlInstance,
+        [PSCredential]$SqlCredential,
+        [PSCredential]$Credential
+    )
+
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $names = [System.Collections.Generic.List[string]]::new()
+    $add = {
+        param($n, $requireDns)
+        if ([string]::IsNullOrWhiteSpace($n)) { return }
+        $t = $n.Trim().TrimEnd('.')
+        if (-not $t) { return }
+        if ($requireDns -and ($t -match '\.') -and -not (Test-DnsNameResolve $t)) { return }
+        if ($seen.Add($t)) { [void]$names.Add($t) }
+    }
+
+    $raw = $ComputerName.Trim()
+    $short = ($raw -split '\.')[0]
+
+    # 1) SQL host TCP/IP DNS domain (best for cross-domain: machine domain != service account domain)
+    if ($SqlInstance) {
+        $sqlFqdn = Get-SqlHostFqdn -SqlInstance $SqlInstance -SqlCredential $SqlCredential
+        if ($sqlFqdn) { & $add $sqlFqdn $true }
+    }
+
+    # 2) dbatools name resolution (FQDN / DNSHostEntry / DNSDomain)
+    if (Get-Command Resolve-DbaNetworkName -ErrorAction SilentlyContinue) {
+        try {
+            $rp = @{ ComputerName = $raw; ErrorAction = 'Stop' }
+            if ($Credential) { $rp.Credential = $Credential }
+            $resolved = Resolve-DbaNetworkName @rp
+            foreach ($item in @($resolved)) {
+                foreach ($prop in @('FQDN', 'DNSHostEntry', 'FullComputerName')) {
+                    $v = [string]$item.$prop
+                    if ($v -match '\.') { & $add $v $true }
+                }
+                $dnsHost = [string]$item.DNSHostName
+                $dnsDom = [string]$item.DNSDomain
+                if (-not $dnsDom) { $dnsDom = [string]$item.Domain }
+                if ($dnsHost -and $dnsDom -and ($dnsDom -match '\.')) {
+                    & $add ('{0}.{1}' -f $dnsHost, $dnsDom.TrimStart('.')) $true
+                }
+            }
+        } catch { $null = $_ }
+    }
+
+    # 3) Forward + reverse DNS
+    try {
+        $entry = [System.Net.Dns]::GetHostEntry($raw)
+        if ($entry.HostName -match '\.') { & $add $entry.HostName $false }
+        foreach ($ip in @($entry.AddressList)) {
+            try {
+                $rev = [System.Net.Dns]::GetHostEntry($ip)
+                if ($rev.HostName -match '\.') { & $add $rev.HostName $false }
+            } catch { $null = $_ }
+        }
+    } catch { $null = $_ }
+
+    try {
+        foreach ($ip in @([System.Net.Dns]::GetHostAddresses($short))) {
+            try {
+                $rev = [System.Net.Dns]::GetHostEntry($ip)
+                if ($rev.HostName -match '\.') { & $add $rev.HostName $false }
+            } catch { $null = $_ }
+        }
+    } catch { $null = $_ }
+
+    # 4) Trusted / forest DNS suffixes (e.g. ucles.external while jump box is ucles.internal)
+    if ($short -notmatch '\.') {
+        foreach ($suffix in @(Get-DomainDnsSuffixCandidate)) {
+            & $add ('{0}.{1}' -f $short, $suffix) $true
+        }
+    }
+
+    & $add $raw $false
+    if ($short -and ($short -ne $raw)) { & $add $short $false }
+
+    # Prefer FQDNs first for Kerberos/WinRM.
+    $fqdns = @($names | Where-Object { $_ -match '\.' })
+    $rest = @($names | Where-Object { $_ -notmatch '\.' })
+    return @($fqdns + $rest)
+}
+
+function Test-WinRmComputerNameFailure {
+    param([string]$Message)
+    [bool]($Message -match 'WinRM|unknown to Kerberos|Cannot find the computer|is unknown to Kerberos|SPN with the format HTTP/')
+}
+
+function Initialize-DbaCmWinRm {
+    param(
+        [string]$ComputerName,
+        [PSCredential]$Credential,
+        [string]$SqlInstance,
+        [PSCredential]$SqlCredential
+    )
+    if (Test-IsLocalComputerName $ComputerName) { return }
+    if (-not (Get-Command New-DbaCmConnection -ErrorAction SilentlyContinue)) { return }
+    if (-not (Get-Command New-CimSessionOption -ErrorAction SilentlyContinue)) { return }
+
+    foreach ($t in @(Resolve-RemoteComputerTarget -ComputerName $ComputerName -SqlInstance $SqlInstance -SqlCredential $SqlCredential -Credential $Credential)) {
+        try {
+            $opt = New-CimSessionOption -Protocol WSMan -Authentication Negotiate
+            $p = @{
+                ComputerName    = $t
+                CimWinRMOptions = $opt
+                EnableException = $true
+                Confirm         = $false
+            }
+            if ($Credential) { $p.Credential = $Credential }
+            else { $p.UseWindowsCredentials = $true }
+            $null = New-DbaCmConnection @p
+        } catch {
+            $null = $_
+        }
+    }
+}
+
 function Get-NodeComputer {
-    param([string]$Instance, [PSCredential]$Credential)
-    $p = @{ ComputerName = $Instance }
-    if ($Credential) { $p.Credential = $Credential }
-    $resolved = Resolve-DbaNetworkName @p
-    if (-not $resolved.FullComputerName) { throw "Could not resolve computer name for $Instance" }
-    $resolved.FullComputerName
+    param(
+        [string]$Instance,
+        [PSCredential]$Credential,
+        [PSCredential]$SqlCredential
+    )
+
+    $targets = @(Resolve-RemoteComputerTarget -ComputerName (($Instance -split '\\')[0]) `
+            -SqlInstance $Instance -SqlCredential $SqlCredential -Credential $Credential)
+    $preferred = @($targets | Where-Object { $_ -match '\.' } | Select-Object -First 1)
+    if ($preferred) { return $preferred[0] }
+    if ($targets) { return $targets[0] }
+    throw "Could not resolve computer name for $Instance"
 }
 
 function Get-TargetTopology {
@@ -369,7 +613,7 @@ function Get-TargetTopology {
     }
 
     if (-not $ags) {
-        $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential
+        $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential -SqlCredential $SqlCredential
         return [pscustomobject]@{
             Mode            = 'Standalone'
             SeedSqlInstance = $SqlInstance
@@ -389,7 +633,7 @@ function Get-TargetTopology {
 
     $nodes = foreach ($rep in $replicaSql) {
         [pscustomobject]@{
-            ComputerName = (Get-NodeComputer -Instance $rep -Credential $Credential)
+            ComputerName = (Get-NodeComputer -Instance $rep -Credential $Credential -SqlCredential $SqlCredential)
             SqlInstance  = $rep
         }
     }
@@ -546,8 +790,7 @@ function Test-AdCredentialOnComputer {
     $sam = $Account.Split('\')[-1]
     if ($sam -match '@') { $sam = $sam.Split('@')[0] }
     $domain = Resolve-AdAuthDomain -Account $Account
-    $localNames = @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-    if ($Computer -in $localNames) {
+    if (Test-IsLocalComputerName $Computer) {
         return Test-AdCredentialHere -Domain $domain -SamAccountName $sam -PlainPassword $PlainPassword
     }
 
@@ -576,18 +819,8 @@ function Test-AdCredentialOnComputer {
         return $false
     }
 
-    # Prefer short name then FQDN; use Negotiate (not Kerberos-only) for WinRM.
-    $targets = [System.Collections.Generic.List[string]]::new()
-    [void]$targets.Add($Computer)
-    try {
-        $dns = [System.Net.Dns]::GetHostEntry($Computer)
-        if ($dns.HostName -and ($dns.HostName -ne $Computer)) {
-            [void]$targets.Add($dns.HostName)
-        }
-    } catch {
-        $null = $_
-    }
-
+    # FQDN first + Negotiate (not Kerberos-only) for cross-domain WinRM.
+    $targets = @(Resolve-RemoteComputerTarget -ComputerName $Computer)
     $lastErr = $null
     foreach ($target in $targets) {
         try {
@@ -602,6 +835,9 @@ function Test-AdCredentialOnComputer {
             return [bool](Invoke-Command @ic)
         } catch {
             $lastErr = $_
+            if (Test-WinRmComputerNameFailure ([string]$_)) {
+                Write-Host "  WinRM AD check via $target failed; trying next name..." -ForegroundColor DarkYellow
+            }
         }
     }
     if ($lastErr) { throw $lastErr }
@@ -632,8 +868,7 @@ function Wait-AdCredentialReadyOnNode {
         foreach ($node in @($pending)) {
             try {
                 $svcCred = $null
-                $remote = $node -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                if ($Credential -and $remote) { $svcCred = $Credential }
+                if ($Credential -and -not (Test-IsLocalComputerName $node)) { $svcCred = $Credential }
                 if (Test-AdCredentialOnComputer -Computer $node -Account $Account -PlainPassword $plain -Credential $svcCred) {
                     Write-Host "  AD (SQL node): OK for $Account @ $node" -ForegroundColor Green
                     [void]$pending.Remove($node)
@@ -701,8 +936,10 @@ function Wait-AdAfterAuthFailure {
 function Restart-SqlTargetService {
     param(
         [string]$Computer,
+        [string]$SqlInstance,
         [string[]]$Type = $script:ServiceTypes,
         [PSCredential]$Credential,
+        [PSCredential]$SqlCredential,
         [string[]]$Account,
         [hashtable]$AccountPassword,
         [int]$RetryCount = 5,
@@ -711,28 +948,52 @@ function Restart-SqlTargetService {
     )
     $Type = @($Type | Where-Object { $_ } | Sort-Object -Unique)
     if (-not $Type) { $Type = $script:ServiceTypes }
-    $p = @{
-        ComputerName    = $Computer
-        Type            = $Type
-        Force           = $true
-        Confirm         = $false
-        EnableException = $true
-    }
-    if ($Credential) { $p.Credential = $Credential }
+    $targets = @(Resolve-RemoteComputerTarget -ComputerName $Computer -SqlInstance $SqlInstance `
+            -SqlCredential $SqlCredential -Credential $Credential)
+    Initialize-DbaCmWinRm -ComputerName $Computer -Credential $Credential `
+        -SqlInstance $SqlInstance -SqlCredential $SqlCredential
     $retryWait = if ($AdWaitSeconds -gt 0) { $AdWaitSeconds } else { [Math]::Max(60, $RetryDelaySeconds * 3) }
 
     for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
-        Write-Host "  Restart $($Type -join '/') on $Computer (attempt $attempt/$RetryCount)" -ForegroundColor Cyan
-        try {
-            $result = @(Restart-DbaService @p)
-        } catch {
-            $err = [string]$_
-            Write-Warning "  Restart-DbaService threw on ${Computer}: $err"
-            $authFail = $err -match 'authentication|logon|password|credential|dependent service'
-            if (-not $authFail -or $attempt -ge $RetryCount) { throw }
-            Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
-                -Computer $Computer -Credential $Credential -TimeoutSeconds $retryWait
-            Start-Sleep -Seconds $RetryDelaySeconds
+        Write-Host ("  Restart {0} on {1} (attempt {2}/{3}; targets: {4})" -f ($Type -join '/'), $Computer, $attempt, $RetryCount, ($targets -join ', ')) -ForegroundColor Cyan
+        $result = $null
+        $lastErr = $null
+        $winRmOnlyFailures = $true
+        foreach ($t in $targets) {
+            try {
+                $p = @{
+                    ComputerName    = $t
+                    Type            = $Type
+                    Force           = $true
+                    Confirm         = $false
+                    EnableException = $true
+                }
+                if ($Credential) { $p.Credential = $Credential }
+                $result = @(Restart-DbaService @p)
+                $winRmOnlyFailures = $false
+                break
+            } catch {
+                $lastErr = $_
+                $err = [string]$_
+                if (Test-WinRmComputerNameFailure $err) {
+                    Write-Warning ("  Restart-DbaService WinRM failed on {0}: {1}" -f $t, $err.Split("`n")[0])
+                    continue
+                }
+                $winRmOnlyFailures = $false
+                Write-Warning "  Restart-DbaService threw on ${t}: $err"
+                $authFail = $err -match 'authentication|logon|password|credential|dependent service'
+                if (-not $authFail -or $attempt -ge $RetryCount) { throw }
+                Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
+                    -Computer $Computer -Credential $Credential -TimeoutSeconds $retryWait
+                Start-Sleep -Seconds $RetryDelaySeconds
+                $result = $null
+                break
+            }
+        }
+
+        if ($null -eq $result) {
+            if ($winRmOnlyFailures -and $lastErr) { throw $lastErr }
+            if ($lastErr -and $attempt -ge $RetryCount) { throw $lastErr }
             continue
         }
 
@@ -756,8 +1017,10 @@ function Restart-SqlTargetService {
 function Wait-SqlTargetServiceRunning {
     param(
         [string]$Computer,
+        [string]$SqlInstance,
         [string[]]$Type = $script:ServiceTypes,
         [PSCredential]$Credential,
+        [PSCredential]$SqlCredential,
         [int]$TimeoutSeconds = 180
     )
     if ([string]::IsNullOrWhiteSpace($Computer)) { return }
@@ -765,33 +1028,51 @@ function Wait-SqlTargetServiceRunning {
     if (-not $Type) { return }
 
     $label = $Type -join '/'
+    $targets = @(Resolve-RemoteComputerTarget -ComputerName $Computer -SqlInstance $SqlInstance `
+            -SqlCredential $SqlCredential -Credential $Credential)
+    Initialize-DbaCmWinRm -ComputerName $Computer -Credential $Credential `
+        -SqlInstance $SqlInstance -SqlCredential $SqlCredential
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $attempt = 0
     Write-Host "  Waiting for $label Running on $Computer (up to ${TimeoutSeconds}s)" -ForegroundColor DarkCyan
     do {
         $attempt++
-        try {
-            $gp = @{
-                ComputerName    = $Computer
-                Type            = $Type
-                EnableException = $true
-                ErrorAction     = 'Stop'
+        $probed = $false
+        foreach ($t in $targets) {
+            try {
+                $gp = @{
+                    ComputerName    = $t
+                    Type            = $Type
+                    EnableException = $true
+                    ErrorAction     = 'Stop'
+                }
+                if ($Credential) { $gp.Credential = $Credential }
+                $svcs = @(Get-DbaService @gp)
+                $probed = $true
+                if (-not $svcs) {
+                    Write-Host "  No $label services on $t (nothing to wait for)" -ForegroundColor DarkYellow
+                    return
+                }
+                $notRunning = @($svcs | Where-Object { [string]$_.State -ne 'Running' })
+                if (-not $notRunning) {
+                    Write-Host ("  {0} Running on {1} ({2})" -f $label, $t, (($svcs.ServiceName) -join ', ')) -ForegroundColor Green
+                    return
+                }
+                $states = ($notRunning | ForEach-Object { "$($_.ServiceName)=$($_.State)" }) -join '; '
+                Write-Host "  Not ready on $t (attempt $attempt): $states" -ForegroundColor DarkYellow
+                break
+            } catch {
+                if (Test-WinRmComputerNameFailure ([string]$_)) {
+                    Write-Host ("  Service check WinRM failed on {0}: {1}" -f $t, ([string]$_).Split("`n")[0]) -ForegroundColor DarkYellow
+                    continue
+                }
+                Write-Host ("  Service check failed on {0} (attempt {1}): {2}" -f $t, $attempt, $_) -ForegroundColor DarkYellow
+                $probed = $true
+                break
             }
-            if ($Credential) { $gp.Credential = $Credential }
-            $svcs = @(Get-DbaService @gp)
-            if (-not $svcs) {
-                Write-Host "  No $label services on $Computer (nothing to wait for)" -ForegroundColor DarkYellow
-                return
-            }
-            $notRunning = @($svcs | Where-Object { [string]$_.State -ne 'Running' })
-            if (-not $notRunning) {
-                Write-Host ("  {0} Running on {1} ({2})" -f $label, $Computer, (($svcs.ServiceName) -join ', ')) -ForegroundColor Green
-                return
-            }
-            $states = ($notRunning | ForEach-Object { "$($_.ServiceName)=$($_.State)" }) -join '; '
-            Write-Host "  Not ready on $Computer (attempt $attempt): $states" -ForegroundColor DarkYellow
-        } catch {
-            Write-Host ("  Service check failed on {0} (attempt {1}): {2}" -f $Computer, $attempt, $_) -ForegroundColor DarkYellow
+        }
+        if (-not $probed) {
+            Write-Host ("  Service check: no WinRM target worked for {0} (attempt {1})" -f $Computer, $attempt) -ForegroundColor DarkYellow
         }
         Start-Sleep -Seconds 5
     } while ((Get-Date) -lt $deadline)
@@ -888,7 +1169,7 @@ function Invoke-GracefulAgApply {
     if (-not $bySql.ContainsKey($primarySql)) {
         $mapped = $Nodes | Where-Object {
             (Test-ReplicaMatch -ReplicaName $OriginalPrimary -SqlInstance $_.SqlInstance) -or
-            ($_.ComputerName -eq $OriginalPrimary.Split('\')[0])
+            (Test-ComputerNameMatch -Left $_.ComputerName -Right ($OriginalPrimary.Split('\')[0]))
         } | Select-Object -First 1
         if (-not $mapped) { throw "Could not map primary '$OriginalPrimary' to discovered nodes." }
         $primarySql = $mapped.SqlInstance
@@ -907,11 +1188,12 @@ function Invoke-GracefulAgApply {
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
 
     $svcCredSecondary = $null
-    $remoteSecondary = $secondary.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-    if ($Credential -and $remoteSecondary) { $svcCredSecondary = $Credential }
-    Restart-SqlTargetService -Computer $secondary.ComputerName -Type $ServiceType -Credential $svcCredSecondary `
+    if ($Credential -and -not (Test-IsLocalComputerName $secondary.ComputerName)) { $svcCredSecondary = $Credential }
+    Restart-SqlTargetService -Computer $secondary.ComputerName -SqlInstance $secondary.SqlInstance -Type $ServiceType `
+        -Credential $svcCredSecondary -SqlCredential $SqlCredential `
         -Account $Account -AccountPassword $AccountPassword -AdWaitSeconds $SyncTimeoutSeconds
-    Wait-SqlTargetServiceRunning -Computer $secondary.ComputerName -Type $ServiceType -Credential $svcCredSecondary `
+    Wait-SqlTargetServiceRunning -Computer $secondary.ComputerName -SqlInstance $secondary.SqlInstance -Type $ServiceType `
+        -Credential $svcCredSecondary -SqlCredential $SqlCredential `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -928,11 +1210,12 @@ function Invoke-GracefulAgApply {
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
     $svcCredPrimary = $null
-    $remotePrimary = $primary.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-    if ($Credential -and $remotePrimary) { $svcCredPrimary = $Credential }
-    Restart-SqlTargetService -Computer $primary.ComputerName -Type $ServiceType -Credential $svcCredPrimary `
+    if ($Credential -and -not (Test-IsLocalComputerName $primary.ComputerName)) { $svcCredPrimary = $Credential }
+    Restart-SqlTargetService -Computer $primary.ComputerName -SqlInstance $primary.SqlInstance -Type $ServiceType `
+        -Credential $svcCredPrimary -SqlCredential $SqlCredential `
         -Account $Account -AccountPassword $AccountPassword -AdWaitSeconds $SyncTimeoutSeconds
-    Wait-SqlTargetServiceRunning -Computer $primary.ComputerName -Type $ServiceType -Credential $svcCredPrimary `
+    Wait-SqlTargetServiceRunning -Computer $primary.ComputerName -SqlInstance $primary.SqlInstance -Type $ServiceType `
+        -Credential $svcCredPrimary -SqlCredential $SqlCredential `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -1076,15 +1359,36 @@ try {
 
     $allServices = foreach ($node in $topo.Nodes) {
         $svcCred = $null
-        $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-        if ($Credential -and $remote) { $svcCred = $Credential }
-        $gp = @{
-            ComputerName    = $node.ComputerName
-            Type            = $script:ServiceTypes
-            EnableException = $true
+        if ($Credential -and -not (Test-IsLocalComputerName $node.ComputerName)) { $svcCred = $Credential }
+        Initialize-DbaCmWinRm -ComputerName $node.ComputerName -Credential $svcCred `
+            -SqlInstance $node.SqlInstance -SqlCredential $SqlCredential
+        $got = $null
+        $lastErr = $null
+        foreach ($t in @(Resolve-RemoteComputerTarget -ComputerName $node.ComputerName `
+                    -SqlInstance $node.SqlInstance -SqlCredential $SqlCredential -Credential $svcCred)) {
+            try {
+                $gp = @{
+                    ComputerName    = $t
+                    Type            = $script:ServiceTypes
+                    EnableException = $true
+                }
+                if ($svcCred) { $gp.Credential = $svcCred }
+                $got = @(Get-DbaService @gp)
+                break
+            } catch {
+                $lastErr = $_
+                if (Test-WinRmComputerNameFailure ([string]$_)) {
+                    Write-Host ("  Get-DbaService WinRM failed on {0}; trying next name..." -f $t) -ForegroundColor DarkYellow
+                    continue
+                }
+                throw
+            }
         }
-        if ($svcCred) { $gp.Credential = $svcCred }
-        Get-DbaService @gp
+        if ($null -eq $got) {
+            if ($lastErr) { throw $lastErr }
+            continue
+        }
+        $got
     }
     $allServices = @($allServices)
     if ($InstanceName) {
@@ -1199,8 +1503,7 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
             if (-not $ok) { break }
             $nodeServices = @($g.Group | Where-Object ComputerName -eq $computer)
             $svcCred = $null
-            $remote = $computer -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-            if ($Credential -and $remote) { $svcCred = $Credential }
+            if ($Credential -and -not (Test-IsLocalComputerName $computer)) { $svcCred = $Credential }
             try {
                 Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer" -ForegroundColor DarkCyan
                 $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred)
@@ -1297,12 +1600,13 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
                 }
                 foreach ($node in $topo.Nodes) {
                     $svcCred = $null
-                    $remote = $node.ComputerName -notin @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1')
-                    if ($Credential -and $remote) { $svcCred = $Credential }
-                    Restart-SqlTargetService -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred `
+                    if ($Credential -and -not (Test-IsLocalComputerName $node.ComputerName)) { $svcCred = $Credential }
+                    Restart-SqlTargetService -Computer $node.ComputerName -SqlInstance $node.SqlInstance -Type $typesToRestart `
+                        -Credential $svcCred -SqlCredential $SqlCredential `
                         -Account $restartAccounts -AccountPassword $restartPasswords `
                         -AdWaitSeconds $SyncTimeoutSeconds
-                    Wait-SqlTargetServiceRunning -Computer $node.ComputerName -Type $typesToRestart -Credential $svcCred `
+                    Wait-SqlTargetServiceRunning -Computer $node.ComputerName -SqlInstance $node.SqlInstance -Type $typesToRestart `
+                        -Credential $svcCred -SqlCredential $SqlCredential `
                         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
                 }
             }
