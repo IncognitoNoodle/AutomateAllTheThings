@@ -7,8 +7,8 @@
     Applies SecOps passwords, waits for AD readiness on SQL nodes, then restarts
     (standalone or AG failover/failback). No AD change. No vault.
 
-    Availability Group discovery, sync waits, and failover use SQL authentication
-    (-SqlCredential) so Kerberos/SSPI is not required for those cmdlets.
+    Optional -SqlCredential uses SQL authentication for AG discovery/sync/failover
+    (avoids Kerberos/SSPI). If omitted, Windows auth is used like Rotate.
 
 .EXAMPLE
     .\ApplySqlServiceAccountPassword.ps1 -SqlInstance 'HOST\SQL01' -ListAccounts
@@ -99,15 +99,6 @@ function Get-NodeComputer {
 function Test-SqlAuthFailureMessage {
     param([string]$Message)
     $Message -match 'SSPI|Kerberos|login failed|Login failed|principal name|Cannot generate SSPI|A network-related|timeout|timed out|connection|Connection'
-}
-
-function Resolve-AgSqlCredential {
-    param([PSCredential]$SqlCredential)
-    if ($SqlCredential) { return $SqlCredential }
-    Write-Host 'AG mode: SQL authentication required for AG cmdlets (avoids Kerberos/SSPI).' -ForegroundColor Cyan
-    $cred = Get-Credential -Message 'SQL login for Availability Group operations'
-    if (-not $cred) { throw 'SqlCredential is required for Availability Group operations.' }
-    $cred
 }
 
 function Get-TargetTopology {
@@ -844,26 +835,11 @@ try {
     Set-DbatoolsConfig -FullName sql.connection.encrypt -Value $true
     Set-DbatoolsConfig -FullName sql.connection.trustcert -Value $true
 
-    # AG cmdlets use SQL auth (-SqlCredential) to avoid Kerberos/SSPI.
-    # ListAccounts is read-only; do not force a SQL login prompt.
-    if ($AvailabilityGroup -and -not $ListAccounts) {
-        $SqlCredential = Resolve-AgSqlCredential -SqlCredential $SqlCredential
-    }
+    # -SqlCredential is optional (Windows auth by default; pass SQL auth to avoid Kerberos/SSPI).
+    $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
+        -SqlCredential $SqlCredential -Credential $Credential
 
-    try {
-        $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
-            -SqlCredential $SqlCredential -Credential $Credential
-    } catch {
-        $msg = [string]$_
-        if ($ListAccounts -or $SqlCredential -or -not (Test-SqlAuthFailureMessage $msg)) { throw }
-        Write-Warning 'Windows/Kerberos SQL login failed during topology discovery; prompting for SQL auth.'
-        $SqlCredential = Resolve-AgSqlCredential
-        $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
-            -SqlCredential $SqlCredential -Credential $Credential
-    }
-
-    if ($topo.Mode -eq 'AvailabilityGroup' -and -not $ListAccounts) {
-        $SqlCredential = Resolve-AgSqlCredential -SqlCredential $SqlCredential
+    if ($SqlCredential -and $topo.Mode -eq 'AvailabilityGroup' -and -not $ListAccounts) {
         Write-Host "AG SQL login: $($SqlCredential.UserName)" -ForegroundColor DarkCyan
     }
 
