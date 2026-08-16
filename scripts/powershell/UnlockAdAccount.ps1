@@ -1,21 +1,7 @@
-<#
-.SYNOPSIS
-    Unlock an Active Directory user account.
+# Unlock an AD account. Edit the variables, then run the script.
 
-.EXAMPLE
-    .\UnlockAdAccount.ps1 -Account 'DOMAIN\svcSql'
-
-.EXAMPLE
-    .\UnlockAdAccount.ps1 -Account 'svcSql' -Server 'ucles.internal'
-#>
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory)]
-    [string]$Account,
-
-    [string]$Server
-)
+$Account = 'DOMAIN\svcSql'   # DOMAIN\user, SAM, or user@domain.com
+$Server  = ''                # optional DC/domain DNS, e.g. 'ucles.internal'
 
 $ErrorActionPreference = 'Stop'
 
@@ -28,36 +14,23 @@ $identity = $Account
 if ($Account -match '\\') { $identity = $Account.Split('\')[-1] }
 if ($identity -match '@') { $identity = $identity.Split('@')[0] }
 
-$getParams = @{
-    Identity   = $identity
-    Properties = 'LockedOut', 'Enabled', 'SamAccountName', 'UserPrincipalName'
-    ErrorAction = 'Stop'
-}
-if ($Server) { $getParams.Server = $Server }
+$get = @{ Identity = $identity; Properties = 'LockedOut', 'Enabled', 'SamAccountName', 'UserPrincipalName' }
+if ($Server) { $get.Server = $Server }
 
-$user = Get-ADUser @getParams
-
-Write-Host ("Account:  {0}" -f $user.SamAccountName) -ForegroundColor Cyan
-if ($user.UserPrincipalName) {
-    Write-Host ("UPN:      {0}" -f $user.UserPrincipalName) -ForegroundColor Cyan
-}
-Write-Host ("Enabled:  {0}" -f $user.Enabled) -ForegroundColor Cyan
-Write-Host ("Locked:   {0}" -f $user.LockedOut) -ForegroundColor Cyan
+$user = Get-ADUser @get
+Write-Host "Account: $($user.SamAccountName)"
+Write-Host "Enabled: $($user.Enabled)"
+Write-Host "Locked:  $($user.LockedOut)"
 
 if (-not $user.LockedOut) {
-    Write-Host 'Not locked out - nothing to do.' -ForegroundColor Green
+    Write-Host 'Not locked out - nothing to do.'
     return
 }
 
-$unlockParams = @{ Identity = $user.SamAccountName; ErrorAction = 'Stop' }
-if ($Server) { $unlockParams.Server = $Server }
+$unlock = @{ Identity = $user.SamAccountName }
+if ($Server) { $unlock.Server = $Server }
+Unlock-ADAccount @unlock
 
-Unlock-ADAccount @unlockParams
-Start-Sleep -Seconds 1
-
-$after = Get-ADUser @getParams
-if ($after.LockedOut) {
-    throw "Unlock-ADAccount ran, but $($after.SamAccountName) is still locked out."
-}
-
-Write-Host ("Unlocked: {0}" -f $after.SamAccountName) -ForegroundColor Green
+$after = Get-ADUser @get
+if ($after.LockedOut) { throw "$($after.SamAccountName) is still locked out." }
+Write-Host "Unlocked: $($after.SamAccountName)"
