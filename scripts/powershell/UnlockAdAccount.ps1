@@ -8,6 +8,7 @@
 .EXAMPLE
     .\UnlockAdAccount.ps1 -Account 'svcSql' -Server 'ucles.internal'
 #>
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
