@@ -510,11 +510,31 @@ function Update-NodeServicePassword {
     Update-DbaServiceAccount @p
 }
 
+function Clear-AdServiceAccountExpiration {
+    param([string]$Account)
+    $sam = $Account.Split('\')[-1]
+    if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $adUser = Get-ADUser -Identity $sam -Properties AccountExpirationDate -ErrorAction Stop
+        $exp = $adUser.AccountExpirationDate
+        if ($exp -and ($exp -le (Get-Date))) {
+            Write-Warning "  AD account $sam is expired (AccountExpirationDate=$exp) - Clear-ADAccountExpiration"
+            Clear-ADAccountExpiration -Identity $sam -ErrorAction Stop
+            Start-Sleep -Seconds 2
+        }
+    } catch {
+        $null = $_
+    }
+}
+
 function Unlock-AdServiceAccount {
     param([string]$Account)
     $sam = $Account.Split('\')[-1]
     if ($sam -match '@') { $sam = $sam.Split('@')[0] }
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
+    Clear-AdServiceAccountExpiration -Account $Account
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
         $adUser = Get-ADUser -Identity $sam -Properties LockedOut -ErrorAction Stop

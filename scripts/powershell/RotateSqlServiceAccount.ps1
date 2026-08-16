@@ -663,14 +663,37 @@ Install RSAT ActiveDirectory, or reset AD yourself and re-run with -SkipAdPasswo
     }
     Import-Module ActiveDirectory -ErrorAction Stop
     $sam = $Account.Split('\')[-1]
+    if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    Unlock-AdServiceAccount -Account $Account
     Write-Host "  AD: Set-ADAccountPassword $sam" -ForegroundColor DarkCyan
     Set-ADAccountPassword -Identity $sam -NewPassword $SecurePassword -Reset -ErrorAction Stop
+}
+
+function Clear-AdServiceAccountExpiration {
+    param([string]$Account)
+    $sam = $Account.Split('\')[-1]
+    if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $adUser = Get-ADUser -Identity $sam -Properties AccountExpirationDate -ErrorAction Stop
+        $exp = $adUser.AccountExpirationDate
+        if ($exp -and ($exp -le (Get-Date))) {
+            Write-Warning "  AD account $sam is expired (AccountExpirationDate=$exp) - Clear-ADAccountExpiration"
+            Clear-ADAccountExpiration -Identity $sam -ErrorAction Stop
+            Start-Sleep -Seconds 2
+        }
+    } catch {
+        $null = $_
+    }
 }
 
 function Unlock-AdServiceAccount {
     param([string]$Account)
     $sam = $Account.Split('\')[-1]
+    if ($sam -match '@') { $sam = $sam.Split('@')[0] }
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
+    Clear-AdServiceAccountExpiration -Account $Account
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
         $adUser = Get-ADUser -Identity $sam -Properties LockedOut -ErrorAction Stop
