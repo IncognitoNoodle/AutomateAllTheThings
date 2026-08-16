@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Rotate SQL Engine/Agent/SSRS/SSIS service account passwords (standalone or Always On).
+    Rotate SQL Engine/Agent service account passwords (standalone or Always On).
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
@@ -40,7 +40,7 @@ param(
     [switch]$InstallModule,
 
     [Parameter(ParameterSetName = 'Rotate')]
-    [ValidateRange(12, 128)]
+    [ValidateRange(12, 127)]
     [int]$PasswordLength = 24,
 
     [Parameter(ParameterSetName = 'Rotate')]
@@ -59,15 +59,21 @@ param(
 # === CONFIG (edit here) ===
 # Shared UNC for vault + history + transcripts. Change once for the environment.
 $script:OutputFolder = '\\SERVERNAME\C$\Temp\'
-$script:ServiceTypes = @('Engine', 'Agent', 'SSRS', 'SSIS')
+$script:ServiceTypes = @('Engine', 'Agent')
+$script:VaultKdfIterations = 600000
 
 $ErrorActionPreference = 'Stop'
 $script:DomainDnsSuffixCache = $null
 $script:SqlHostDnsCache = @{}
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $vaultPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault.xml'
-$mutexName = 'Global\SqlServiceAccountVault'
 $vaultCanary = 'SqlServiceAccountVault.v2'
+
+# Mutex name is derived from the resolved vault path, so two environments pointing at
+# different vault files never serialize against each other on the same jump box.
+$vaultPathHashBytes = [Security.Cryptography.SHA1]::Create().ComputeHash(
+    [Text.Encoding]::UTF8.GetBytes($vaultPath.ToLowerInvariant()))
+$mutexName = 'Global\SqlServiceAccountVault_' + ([BitConverter]::ToString($vaultPathHashBytes).Replace('-', ''))
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -116,15 +122,14 @@ function Get-VaultAesKey {
         if ([string]::IsNullOrWhiteSpace($plain)) { throw 'Vault password is empty.' }
         if ($plain.Length -lt 12) { throw 'Vault password must be at least 12 characters.' }
 
-        $pwdBytes = [Text.Encoding]::UTF8.GetBytes($plain)
         $saltBytes = [Convert]::FromBase64String($SaltBase64)
-        $combined = New-Object byte[] ($pwdBytes.Length + $saltBytes.Length)
-        [Array]::Copy($pwdBytes, 0, $combined, 0, $pwdBytes.Length)
-        [Array]::Copy($saltBytes, 0, $combined, $pwdBytes.Length, $saltBytes.Length)
-
-        $sha = [Security.Cryptography.SHA256]::Create()
-        try { return $sha.ComputeHash($combined) }
-        finally { $sha.Dispose() }
+        $kdf = [Security.Cryptography.Rfc2898DeriveBytes]::new(
+            $plain,
+            $saltBytes,
+            $script:VaultKdfIterations,
+            [Security.Cryptography.HashAlgorithmName]::SHA256)
+        try { return $kdf.GetBytes(32) }
+        finally { $kdf.Dispose() }
     } finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     }
@@ -664,23 +669,25 @@ Install RSAT ActiveDirectory, or reset AD yourself and re-run with -SkipAdPasswo
     Import-Module ActiveDirectory -ErrorAction Stop
     $sam = $Account.Split('\')[-1]
     if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    $domain = Resolve-AdAuthDomain -Account $Account
     Unlock-AdServiceAccount -Account $Account
     Write-Host "  AD: Set-ADAccountPassword $sam" -ForegroundColor DarkCyan
-    Set-ADAccountPassword -Identity $sam -NewPassword $SecurePassword -Reset -ErrorAction Stop
+    Set-ADAccountPassword -Identity $sam -NewPassword $SecurePassword -Reset -Server $domain -ErrorAction Stop
 }
 
 function Clear-AdServiceAccountExpiration {
     param([string]$Account)
     $sam = $Account.Split('\')[-1]
     if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    $domain = Resolve-AdAuthDomain -Account $Account
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
-        $adUser = Get-ADUser -Identity $sam -Properties AccountExpirationDate -ErrorAction Stop
+        $adUser = Get-ADUser -Identity $sam -Properties AccountExpirationDate -Server $domain -ErrorAction Stop
         $exp = $adUser.AccountExpirationDate
         if ($exp -and ($exp -le (Get-Date))) {
             Write-Warning "  AD account $sam is expired (AccountExpirationDate=$exp) - Clear-ADAccountExpiration"
-            Clear-ADAccountExpiration -Identity $sam -ErrorAction Stop
+            Clear-ADAccountExpiration -Identity $sam -Server $domain -ErrorAction Stop
             Start-Sleep -Seconds 2
         }
     } catch {
@@ -692,14 +699,15 @@ function Unlock-AdServiceAccount {
     param([string]$Account)
     $sam = $Account.Split('\')[-1]
     if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    $domain = Resolve-AdAuthDomain -Account $Account
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
     Clear-AdServiceAccountExpiration -Account $Account
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
-        $adUser = Get-ADUser -Identity $sam -Properties LockedOut -ErrorAction Stop
+        $adUser = Get-ADUser -Identity $sam -Properties LockedOut -Server $domain -ErrorAction Stop
         if ($adUser.LockedOut) {
             Write-Warning "  AD account $sam is locked out - unlocking"
-            Unlock-ADAccount -Identity $sam -ErrorAction Stop
+            Unlock-ADAccount -Identity $sam -Server $domain -ErrorAction Stop
             Start-Sleep -Seconds 2
         }
     } catch {
@@ -1374,8 +1382,13 @@ try {
     }
     Import-Module dbatools -ErrorAction Stop
 
+    # -SqlCredential is optional (Windows auth by default; pass SQL auth to avoid Kerberos/SSPI).
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
         -SqlCredential $SqlCredential -Credential $Credential
+
+    if ($SqlCredential -and $topo.Mode -eq 'AvailabilityGroup') {
+        Write-Host "AG SQL login: $($SqlCredential.UserName)" -ForegroundColor DarkCyan
+    }
 
     Write-Host "`nMode: $($topo.Mode)" -ForegroundColor Cyan
     $topo.Nodes | Format-Table ComputerName, SqlInstance -AutoSize
@@ -1420,8 +1433,7 @@ try {
     if ($InstanceName) {
         $allServices = @(
             $allServices | Where-Object {
-                $type = [string]$_.ServiceType
-                ($type -in @('SSRS', 'SSIS')) -or ($_.InstanceName -in $InstanceName)
+                $_.InstanceName -in $InstanceName
             }
         )
     }
@@ -1621,7 +1633,7 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
                     -AccountPassword $restartPasswords
             } else {
                 if ($topo.Mode -eq 'AvailabilityGroup' -and -not $needsAgFailover) {
-                    Write-Host 'SSRS/SSIS only: restarting on all nodes (no AG failover).' -ForegroundColor Cyan
+                    Write-Host 'No Engine/Agent in restart set; restarting without AG failover.' -ForegroundColor Cyan
                 }
                 foreach ($node in $topo.Nodes) {
                     $svcCred = $null
