@@ -115,7 +115,6 @@ function Get-VaultPasswordInput {
 }
 
 function Test-SecretEqual {
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'Expected')]
     param([SecureString]$Secret, [string]$Expected)
     if (-not $Secret) { return $false }
 
