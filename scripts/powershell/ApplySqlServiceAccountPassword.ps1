@@ -745,8 +745,10 @@ function Wait-AdCredentialReadyOnNode {
         }
         if ($pending.Count -eq 0) { return }
         $left = [Math]::Max(0, [int]($deadline - (Get-Date)).TotalSeconds)
-        Write-Host ("  AD (SQL nodes): sleeping {0}s before next check ({1}s left)" -f $PollSeconds, $left) -ForegroundColor DarkYellow
-        Start-Sleep -Seconds $PollSeconds
+        if ($left -le 0) { break }
+        $sleepFor = [Math]::Min($PollSeconds, $left)
+        Write-Host ("  AD (SQL nodes): sleeping {0}s before next check ({1}s left)" -f $sleepFor, $left) -ForegroundColor DarkYellow
+        Start-Sleep -Seconds $sleepFor
     } while ((Get-Date) -lt $deadline)
 
     throw @"
@@ -779,8 +781,9 @@ function Wait-AdAfterAuthFailure {
         if (-not $acct) { continue }
         Unlock-AdServiceAccount -Account $acct
         if ($AccountPassword -and $AccountPassword.ContainsKey($acct)) {
+            # Bound retry wait: do not stack the full 1h node timeout on every restart attempt.
             Wait-AdCredentialReadyOnNode -Account $acct -SecurePassword $AccountPassword[$acct] `
-                -ComputerName $Computer -Credential $Credential
+                -ComputerName $Computer -Credential $Credential -TimeoutSeconds 600 -PollSeconds 300
         }
     }
 }
