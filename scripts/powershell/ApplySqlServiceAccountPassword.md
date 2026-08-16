@@ -6,7 +6,7 @@ SecOps already reset the domain password. This script updates SQL Windows servic
 
 - Targets via `-SqlInstance` (same as the rotator); optional `-AvailabilityGroup`
 - Finds **domain AD service accounts** only (skips local / built-in / gMSA)
-- Service types: Engine, Agent, SSRS, SSIS
+- Service types: Engine, Agent
 - `-ListAccounts` — show those service accounts
 - `-Account` + `-SecurePassword` — one or many pairs (same count/order)
 - Updates all supplied service logon caches (`Update-DbaServiceAccount -NoRestart`)
