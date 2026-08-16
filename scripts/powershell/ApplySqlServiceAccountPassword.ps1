@@ -510,11 +510,31 @@ function Update-NodeServicePassword {
     Update-DbaServiceAccount @p
 }
 
+function Clear-AdServiceAccountExpiration {
+    param([string]$Account)
+    $sam = $Account.Split('\')[-1]
+    if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $adUser = Get-ADUser -Identity $sam -Properties AccountExpirationDate -ErrorAction Stop
+        $exp = $adUser.AccountExpirationDate
+        if ($exp -and ($exp -le (Get-Date))) {
+            Write-Warning "  AD account $sam is expired (AccountExpirationDate=$exp) - Clear-ADAccountExpiration"
+            Clear-ADAccountExpiration -Identity $sam -ErrorAction Stop
+            Start-Sleep -Seconds 2
+        }
+    } catch {
+        $null = $_
+    }
+}
+
 function Unlock-AdServiceAccount {
     param([string]$Account)
     $sam = $Account.Split('\')[-1]
     if ($sam -match '@') { $sam = $sam.Split('@')[0] }
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
+    Clear-AdServiceAccountExpiration -Account $Account
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
         $adUser = Get-ADUser -Identity $sam -Properties LockedOut -ErrorAction Stop
@@ -694,7 +714,8 @@ function Wait-AdCredentialReadyOnNode {
         [securestring]$SecurePassword,
         [string[]]$ComputerName,
         [PSCredential]$Credential,
-        [int]$TimeoutSeconds = 300
+        [int]$TimeoutSeconds = 3600,
+        [int]$PollSeconds = 300
     )
 
     $nodes = @($ComputerName | Where-Object { $_ } | Sort-Object -Unique)
@@ -702,7 +723,7 @@ function Wait-AdCredentialReadyOnNode {
 
     $plain = [Net.NetworkCredential]::new('', $SecurePassword).Password
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    Write-Host ("  AD (SQL nodes): waiting for {0} on {1} (up to {2}s)" -f $Account, ($nodes -join ', '), $TimeoutSeconds) -ForegroundColor DarkCyan
+    Write-Host ("  AD (SQL nodes): waiting for {0} on {1} (up to {2}s, poll every {3}s)" -f $Account, ($nodes -join ', '), $TimeoutSeconds, $PollSeconds) -ForegroundColor DarkCyan
 
     $pending = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($n in $nodes) { [void]$pending.Add($n) }
@@ -723,7 +744,11 @@ function Wait-AdCredentialReadyOnNode {
             }
         }
         if ($pending.Count -eq 0) { return }
-        Start-Sleep -Seconds 8
+        $left = [Math]::Max(0, [int]($deadline - (Get-Date)).TotalSeconds)
+        if ($left -le 0) { break }
+        $sleepFor = [Math]::Min($PollSeconds, $left)
+        Write-Host ("  AD (SQL nodes): sleeping {0}s before next check ({1}s left)" -f $sleepFor, $left) -ForegroundColor DarkYellow
+        Start-Sleep -Seconds $sleepFor
     } while ((Get-Date) -lt $deadline)
 
     throw @"
@@ -749,16 +774,16 @@ function Wait-AdAfterAuthFailure {
         [string[]]$Account,
         [hashtable]$AccountPassword,
         [string]$Computer,
-        [PSCredential]$Credential,
-        [int]$TimeoutSeconds
+        [PSCredential]$Credential
     )
     Write-Warning "  Auth/logon failure suspected - unlock, re-check AD on node, retry"
     foreach ($acct in @($Account)) {
         if (-not $acct) { continue }
         Unlock-AdServiceAccount -Account $acct
         if ($AccountPassword -and $AccountPassword.ContainsKey($acct)) {
+            # Bound retry wait: do not stack the full 1h node timeout on every restart attempt.
             Wait-AdCredentialReadyOnNode -Account $acct -SecurePassword $AccountPassword[$acct] `
-                -ComputerName $Computer -Credential $Credential -TimeoutSeconds $TimeoutSeconds
+                -ComputerName $Computer -Credential $Credential -TimeoutSeconds 600 -PollSeconds 300
         }
     }
 }
@@ -773,15 +798,13 @@ function Restart-SqlTargetService {
         [string[]]$Account,
         [hashtable]$AccountPassword,
         [int]$RetryCount = 5,
-        [int]$RetryDelaySeconds = 20,
-        [int]$AdWaitSeconds = 0
+        [int]$RetryDelaySeconds = 20
     )
     $Type = @($Type | Sort-Object -Unique)
     $targets = @(Resolve-RemoteComputerTarget -ComputerName $Computer -SqlInstance $SqlInstance `
             -SqlCredential $SqlCredential -Credential $Credential)
     Initialize-DbaCmWinRm -ComputerName $Computer -Credential $Credential `
         -SqlInstance $SqlInstance -SqlCredential $SqlCredential
-    $retryWait = if ($AdWaitSeconds -gt 0) { $AdWaitSeconds } else { [Math]::Max(60, $RetryDelaySeconds * 3) }
 
     for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
         Write-Host ("  Restart {0} on {1} (attempt {2}/{3}; targets: {4})" -f ($Type -join '/'), $Computer, $attempt, $RetryCount, ($targets -join ', ')) -ForegroundColor Cyan
@@ -813,7 +836,7 @@ function Restart-SqlTargetService {
                 $authFail = $err -match 'authentication|logon|password|credential|dependent service'
                 if (-not $authFail -or $attempt -ge $RetryCount) { throw }
                 Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
-                    -Computer $Computer -Credential $Credential -TimeoutSeconds $retryWait
+                    -Computer $Computer -Credential $Credential
                 Start-Sleep -Seconds $RetryDelaySeconds
                 $result = $null
                 break
@@ -838,7 +861,7 @@ function Restart-SqlTargetService {
         }
 
         Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
-            -Computer $Computer -Credential $Credential -TimeoutSeconds $retryWait
+            -Computer $Computer -Credential $Credential
         Start-Sleep -Seconds $RetryDelaySeconds
     }
 }
@@ -1028,7 +1051,7 @@ function Invoke-GracefulAgApply {
 
     Restart-SqlTargetService -Computer $secondary.ComputerName -SqlInstance $secondary.SqlInstance -Type $ServiceType `
         -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) -SqlCredential $SqlCredential `
-        -Account $Account -AccountPassword $AccountPassword -AdWaitSeconds $SyncTimeoutSeconds
+        -Account $Account -AccountPassword $AccountPassword
     Wait-SqlTargetServiceRunning -Computer $secondary.ComputerName -SqlInstance $secondary.SqlInstance -Type $ServiceType `
         -Credential (Get-RemoteCredential $secondary.ComputerName $Credential) -SqlCredential $SqlCredential `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
@@ -1048,7 +1071,7 @@ function Invoke-GracefulAgApply {
 
     Restart-SqlTargetService -Computer $primary.ComputerName -SqlInstance $primary.SqlInstance -Type $ServiceType `
         -Credential (Get-RemoteCredential $primary.ComputerName $Credential) -SqlCredential $SqlCredential `
-        -Account $Account -AccountPassword $AccountPassword -AdWaitSeconds $SyncTimeoutSeconds
+        -Account $Account -AccountPassword $AccountPassword
     Wait-SqlTargetServiceRunning -Computer $primary.ComputerName -SqlInstance $primary.SqlInstance -Type $ServiceType `
         -Credential (Get-RemoteCredential $primary.ComputerName $Credential) -SqlCredential $SqlCredential `
         -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
@@ -1191,7 +1214,7 @@ try {
                 $accountNodes = @($row.Group.ComputerName | Sort-Object -Unique)
                 Wait-AdCredentialReady -Account $acct -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
                 Wait-AdCredentialReadyOnNode -Account $acct -SecurePassword $securePwd `
-                    -ComputerName $accountNodes -Credential $Credential -TimeoutSeconds $SyncTimeoutSeconds
+                    -ComputerName $accountNodes -Credential $Credential
                 $updatedAccounts.Add($acct)
                 Write-Host '  Service password updated; AD ready on SQL nodes (not restarted yet).' -ForegroundColor Green
             } catch {
@@ -1209,8 +1232,7 @@ try {
             $restartPasswords[$acct] = $passwordMap[$acct]
             Write-Host "`nPre-restart AD check on SQL nodes: $acct" -ForegroundColor Cyan
             Wait-AdCredentialReadyOnNode -Account $acct -SecurePassword $restartPasswords[$acct] `
-                -ComputerName $sqlNodes -Credential $Credential `
-                -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+                -ComputerName $sqlNodes -Credential $Credential
         }
 
         $typesToRestart = @(
@@ -1240,8 +1262,7 @@ try {
             foreach ($node in $topo.Nodes) {
                 Restart-SqlTargetService -Computer $node.ComputerName -SqlInstance $node.SqlInstance -Type $typesToRestart `
                     -Credential (Get-RemoteCredential $node.ComputerName $Credential) -SqlCredential $SqlCredential `
-                    -Account $restartAccounts -AccountPassword $restartPasswords `
-                    -AdWaitSeconds $SyncTimeoutSeconds
+                    -Account $restartAccounts -AccountPassword $restartPasswords
                 Wait-SqlTargetServiceRunning -Computer $node.ComputerName -SqlInstance $node.SqlInstance -Type $typesToRestart `
                     -Credential (Get-RemoteCredential $node.ComputerName $Credential) -SqlCredential $SqlCredential `
                     -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
