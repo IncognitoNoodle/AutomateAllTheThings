@@ -1,4 +1,10 @@
-# ApplySqlServiceAccountPassword.ps1
+# ApplySqlServiceAccountPassword.ps1 (legacy)
+
+> **Prefer the modular playbook:** [`playbooks/sql-service-account-password/`](../../playbooks/sql-service-account-password/README.md)
+
+The single-file script below is kept for reference. Production recovery was hard when the monolithic flow broke mid-way; the playbook splits discover → AD reset → apply (NoRestart) → restart/failover → validate into independently re-runnable stages.
+
+---
 
 SecOps already reset the domain password. This script updates SQL Windows services and restarts once. **No AD change. No password generation. No vault.**
 
