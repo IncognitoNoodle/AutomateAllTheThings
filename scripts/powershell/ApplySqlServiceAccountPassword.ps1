@@ -3,7 +3,7 @@
     Apply SecOps-provided passwords to domain AD SQL service accounts (no AD change).
 
 .DESCRIPTION
-    Discovers domain AD service accounts for Engine/Agent/SSRS/SSIS (not local users).
+    Discovers domain AD service accounts for Engine/Agent (not local users).
     Applies SecOps passwords, waits for AD readiness on SQL nodes, then restarts
     (standalone or AG failover/failback). No AD change. No vault.
 
@@ -58,7 +58,7 @@ param(
 
 # === CONFIG (edit here) ===
 $script:OutputFolder = '\\SERVERNAME\C$\Temp\'
-$script:ServiceTypes = @('Engine', 'Agent', 'SSRS', 'SSIS')
+$script:ServiceTypes = @('Engine', 'Agent')
 
 $ErrorActionPreference = 'Stop'
 $script:DomainDnsSuffixCache = $null
@@ -448,8 +448,7 @@ function Get-SqlTargetService {
     if (-not $InstanceName) { return $all }
 
     $all | Where-Object {
-        $type = [string]$_.ServiceType
-        ($type -in @('SSRS', 'SSIS')) -or ($_.InstanceName -in $InstanceName)
+        $_.InstanceName -in $InstanceName
     }
 }
 
@@ -1146,7 +1145,7 @@ try {
     $domainAccounts = @(Get-DomainSqlServiceAccount -Services $allServices)
 
     if ($ListAccounts) {
-        Write-Host "`nDomain AD service accounts (Engine/Agent/SSRS/SSIS):" -ForegroundColor Cyan
+        Write-Host "`nDomain AD service accounts (Engine/Agent):" -ForegroundColor Cyan
         if (-not $domainAccounts) {
             Write-Warning 'No domain AD service accounts found.'
             return
@@ -1257,7 +1256,7 @@ try {
                 -AccountPassword $restartPasswords
         } else {
             if ($topo.Mode -eq 'AvailabilityGroup' -and -not $needsAgFailover) {
-                Write-Host 'SSRS/SSIS only: restarting on all nodes (no AG failover).' -ForegroundColor Cyan
+                Write-Host 'No Engine/Agent types to restart via AG failover path.' -ForegroundColor Cyan
             }
             foreach ($node in $topo.Nodes) {
                 Restart-SqlTargetService -Computer $node.ComputerName -SqlInstance $node.SqlInstance -Type $typesToRestart `
