@@ -5,8 +5,7 @@
 .DESCRIPTION
     Updates the service logon password cache on all topology nodes via
     Update-DbaServiceAccount -NoRestart. Does NOT restart services and does NOT
-    failover. Waits until AD validates on mgmt host + each affected SQL node
-    before declaring success. Re-run safely if interrupted.
+    failover. Re-validates AD on affected nodes before success. Re-run safely if interrupted.
 
 .EXAMPLE
     $p = ConvertTo-SecureString 'NewPw!' -AsPlainText -Force
@@ -20,7 +19,6 @@ param(
     [string]$SqlInstance,
 
     [string[]]$AvailabilityGroup,
-
     [string[]]$InstanceName,
 
     [Parameter(Mandatory)]
@@ -30,13 +28,11 @@ param(
     [SecureString[]]$SecurePassword,
 
     [PSCredential]$Credential,
-
     [PSCredential]$SqlCredential,
-
-    [string]$OutputFolder = '\\SERVERNAME\C$\Temp\SqlServiceAccountRotation\',
+    [string]$OutputFolder,
 
     [ValidateRange(30, 7200)]
-    [int]$SyncTimeoutSeconds = 300,
+    [int]$MgmtTimeoutSeconds = 300,
 
     [ValidateRange(60, 14400)]
     [int]$NodeTimeoutSeconds = 3600,
@@ -48,17 +44,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-Import-Module (Join-Path $here 'Common\SqlServiceAccount.Common.psm1') -Force
+$here = $PSScriptRoot
+. (Join-Path $here 'Common\SqlServiceAccount.Common.ps1')
 
-$OutputFolder = Initialize-SsaOutputFolder -OutputFolder $OutputFolder
+$OutputFolder = Resolve-SsaOutputFolder -OutputFolder $OutputFolder
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $passwordMap = Resolve-AccountPasswordMap -Account $Account -SecurePassword $SecurePassword
 
 Start-Transcript -Path (Join-Path $OutputFolder "03-Apply_$timestamp.log") -NoClobber | Out-Null
 
 try {
-    Import-SsaDependencies -InstallModule:$InstallModule
+    Import-SsaDependencies -InstallModule:$InstallModule -PreferActiveDirectory
     Write-SsaBanner 'Stage 03 — Apply service password (NoRestart)'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
@@ -122,7 +118,7 @@ try {
         if ($ok) {
             try {
                 $accountNodes = @($row.Group.ComputerName | Sort-Object -Unique)
-                Wait-AdCredentialReady -Account $acct -SecurePassword $securePwd -TimeoutSeconds $SyncTimeoutSeconds
+                Wait-AdCredentialReady -Account $acct -SecurePassword $securePwd -TimeoutSeconds $MgmtTimeoutSeconds
                 Wait-AdCredentialReadyOnNode -Account $acct -SecurePassword $securePwd `
                     -ComputerName $accountNodes -Credential $Credential `
                     -TimeoutSeconds $NodeTimeoutSeconds -PollSeconds $NodePollSeconds
@@ -135,19 +131,20 @@ try {
         }
     }
 
-    $statePath = Join-Path $OutputFolder "03-ApplyState_$timestamp.json"
-    [pscustomobject]@{
-        CompletedAt       = (Get-Date).ToString('o')
-        Mode              = $topo.Mode
-        UpdatedAccounts   = @($updated)
-        Failed            = $anyFailures
-        Nodes             = @($topo.Nodes | Select-Object ComputerName, SqlInstance, Role)
-        AgNames           = @($topo.AgNames)
-        OriginalPrimary   = $topo.OriginalPrimary
-        TypesTouched      = @(
-            $targets | ForEach-Object { $_.Group } | ForEach-Object { [string]$_.ServiceType } | Sort-Object -Unique
-        )
-    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath -Encoding UTF8
+    $typesTouched = @(
+        $targets | ForEach-Object { $_.Group } | ForEach-Object { [string]$_.ServiceType } | Sort-Object -Unique
+    )
+
+    $null = Save-SsaStageState -OutputFolder $OutputFolder -Stage '03-apply' -State ([pscustomobject]@{
+            CompletedAt     = (Get-Date).ToString('o')
+            Mode            = $topo.Mode
+            UpdatedAccounts = @($updated)
+            Failed          = $anyFailures
+            Nodes           = @($topo.Nodes | Select-Object ComputerName, SqlInstance, Role)
+            AgNames         = @($topo.AgNames)
+            OriginalPrimary = $topo.OriginalPrimary
+            TypesTouched    = $typesTouched
+        })
 
     if ($updated.Count) {
         Write-Host "`nUpdated account(s): $($updated -join ', ')" -ForegroundColor Green

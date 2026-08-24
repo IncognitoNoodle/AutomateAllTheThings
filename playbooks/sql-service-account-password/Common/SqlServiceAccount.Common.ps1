@@ -1,20 +1,222 @@
 <#
 .SYNOPSIS
-    Shared helpers for the SQL service-account password playbook.
+    Shared helpers for the SQL service-account password playbook (dot-source .ps1).
 
 .DESCRIPTION
     Learned from production ApplySqlServiceAccountPassword / RotateSqlServiceAccount:
     topology discovery (standalone + AG), domain account detection, AD unlock /
     never-expire, slow ValidateCredentials waits (mgmt + per-node), SPN listing,
     Update-DbaServiceAccount -NoRestart, AG sync wait, and graceful restart order.
+
+    Dot-source from each stage (not Import-Module):
+      . (Join-Path $PSScriptRoot 'Common\SqlServiceAccount.Common.ps1')
 #>
 
-$script:ServiceTypes = @('Engine', 'Agent', 'SSRS', 'SSIS')
+$script:SsaCommonRoot = $PSScriptRoot
+. (Join-Path $script:SsaCommonRoot 'Config.ps1')
+
+$script:ServiceTypes = @($script:SsaServiceTypes)
 $script:DomainDnsSuffixCache = $null
 $script:SqlHostDnsCache = @{}
 
 function Get-SsaServiceTypes {
-    , @($script:ServiceTypes)
+    return @($script:ServiceTypes)
+}
+
+function Resolve-SsaOutputFolder {
+    param([string]$OutputFolder)
+    if ([string]::IsNullOrWhiteSpace($OutputFolder)) {
+        $OutputFolder = $script:SsaDefaultOutputFolder
+    }
+    Initialize-SsaOutputFolder -OutputFolder $OutputFolder
+}
+
+function Add-SsaFinding {
+    param(
+        [Parameter(Mandatory)][System.Collections.IList]$Findings,
+        [Parameter(Mandatory)][ValidateSet('Critical', 'Warning', 'Info')][string]$Severity,
+        [Parameter(Mandatory)][string]$Area,
+        [Parameter(Mandatory)][string]$Item,
+        [Parameter(Mandatory)][string]$Detail,
+        [Parameter(Mandatory)][string]$Action
+    )
+    $Findings.Add([pscustomobject]@{
+            Severity = $Severity
+            Area     = $Area
+            Item     = $Item
+            Detail   = $Detail
+            Action   = $Action
+        }) | Out-Null
+}
+
+function Show-SsaFindings {
+    param(
+        [Parameter(Mandatory)][System.Collections.IList]$Findings,
+        [string]$EmptyMessage = 'No issues found.'
+    )
+    if ($Findings.Count -eq 0) {
+        Write-Host $EmptyMessage -ForegroundColor Green
+        return 0
+    }
+    $Findings | Sort-Object @{ Expression = { switch ($_.Severity) { 'Critical' { 0 } 'Warning' { 1 } default { 2 } } } }, Area, Item |
+        Format-Table Severity, Area, Item, Detail, Action -Wrap -AutoSize
+    return @($Findings | Where-Object Severity -eq 'Critical').Count
+}
+
+function Resolve-SsaNodeList {
+    param(
+        [string[]]$ComputerName,
+        [string]$OutputFolder,
+        [string]$SqlInstance,
+        [string[]]$AvailabilityGroup,
+        [PSCredential]$Credential,
+        [PSCredential]$SqlCredential
+    )
+
+    $nodes = @($ComputerName | Where-Object { $_ } | Sort-Object -Unique)
+    if ($nodes) { return $nodes }
+
+    if ($OutputFolder) {
+        $disc = Read-SsaDiscovery -OutputFolder $OutputFolder
+        if ($disc -and $disc.Nodes) {
+            $nodes = @($disc.Nodes.ComputerName | Sort-Object -Unique)
+            if ($nodes) {
+                Write-Host "Using nodes from discovery-latest.json: $($nodes -join ', ')" -ForegroundColor DarkCyan
+                return $nodes
+            }
+        }
+    }
+
+    if ($SqlInstance) {
+        $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
+            -SqlCredential $SqlCredential -Credential $Credential
+        $nodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
+        Write-Host "Using nodes from topology ($($topo.Mode)): $($nodes -join ', ')" -ForegroundColor DarkCyan
+        return $nodes
+    }
+
+    @()
+}
+
+function Save-SsaStageState {
+    param(
+        [Parameter(Mandatory)][string]$OutputFolder,
+        [Parameter(Mandatory)][string]$Stage,
+        [Parameter(Mandatory)]$State
+    )
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $latest = Join-Path $OutputFolder ("{0}-latest.json" -f $Stage)
+    $archive = Join-Path $OutputFolder ("{0}-{1}.json" -f $Stage, $stamp)
+    $json = ($State | ConvertTo-Json -Depth 8)
+    Set-Content -LiteralPath $latest -Value $json -Encoding UTF8
+    Set-Content -LiteralPath $archive -Value $json -Encoding UTF8
+    Write-Host "  State saved: $latest" -ForegroundColor DarkCyan
+    return $latest
+}
+
+function Read-SsaStageState {
+    param(
+        [Parameter(Mandatory)][string]$OutputFolder,
+        [Parameter(Mandatory)][string]$Stage
+    )
+    $latest = Join-Path $OutputFolder ("{0}-latest.json" -f $Stage)
+    if (-not (Test-Path -LiteralPath $latest)) { return $null }
+    Get-Content -LiteralPath $latest -Raw | ConvertFrom-Json
+}
+
+function Invoke-SsaAgFailover {
+    param(
+        [Parameter(Mandatory)][string]$TargetSqlInstance,
+        [Parameter(Mandatory)][string[]]$AgNames,
+        [PSCredential]$SqlCredential
+    )
+    $fo = @{
+        SqlInstance       = $TargetSqlInstance
+        AvailabilityGroup = $AgNames
+        Confirm           = $false
+        EnableException   = $true
+    }
+    if ($SqlCredential) { $fo.SqlCredential = $SqlCredential }
+    Invoke-DbaAgFailover @fo | Out-Null
+}
+
+function Invoke-SsaGracefulAgRestart {
+    param(
+        [Parameter(Mandatory)][object[]]$Nodes,
+        [Parameter(Mandatory)][string[]]$AgNames,
+        [Parameter(Mandatory)][string]$OriginalPrimary,
+        [Parameter(Mandatory)][string[]]$ServiceType,
+        [PSCredential]$Credential,
+        [PSCredential]$SqlCredential,
+        [int]$SyncTimeoutSeconds = 300,
+        [string[]]$Account,
+        [hashtable]$AccountPassword,
+        [switch]$Failback
+    )
+
+    $bySql = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($n in $Nodes) { $bySql[$n.SqlInstance] = $n }
+
+    $primarySql = $OriginalPrimary
+    if (-not $bySql.ContainsKey($primarySql)) {
+        $mapped = $Nodes | Where-Object {
+            (Test-ReplicaMatch -ReplicaName $primarySql -SqlInstance $_.SqlInstance) -or
+            (Test-ComputerNameMatch -Left $_.ComputerName -Right ($primarySql.Split('\')[0]))
+        } | Select-Object -First 1
+        if (-not $mapped) { throw "Could not map primary '$primarySql' to discovered nodes." }
+        $primarySql = $mapped.SqlInstance
+    }
+    $primary = $bySql[$primarySql]
+    $secondary = $Nodes | Where-Object { $_.SqlInstance -ne $primarySql } | Select-Object -First 1
+    if (-not $secondary) { throw 'AG mode requires at least two replicas.' }
+
+    Write-Host "`n=== AG graceful restart (failback default: OFF) ===" -ForegroundColor Cyan
+    Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
+    Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
+    Write-Host 'Order: secondary restart → sync → failover → former primary restart → sync' -ForegroundColor Yellow
+
+    Restart-SqlTargetService -Computer $secondary.ComputerName -SqlInstance $secondary.SqlInstance -Type $ServiceType `
+        -Credential (Get-RemoteCredential -Computer $secondary.ComputerName -Credential $Credential) `
+        -SqlCredential $SqlCredential -Account $Account -AccountPassword $AccountPassword
+    Wait-SqlTargetServiceRunning -Computer $secondary.ComputerName -SqlInstance $secondary.SqlInstance -Type $ServiceType `
+        -Credential (Get-RemoteCredential -Computer $secondary.ComputerName -Credential $Credential) `
+        -SqlCredential $SqlCredential -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+    Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
+        -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
+
+    Write-Host "  Failover -> $($secondary.SqlInstance)" -ForegroundColor Cyan
+    Invoke-SsaAgFailover -TargetSqlInstance $secondary.SqlInstance -AgNames $AgNames -SqlCredential $SqlCredential
+    Start-Sleep -Seconds 3
+    Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
+        -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
+
+    Restart-SqlTargetService -Computer $primary.ComputerName -SqlInstance $primary.SqlInstance -Type $ServiceType `
+        -Credential (Get-RemoteCredential -Computer $primary.ComputerName -Credential $Credential) `
+        -SqlCredential $SqlCredential -Account $Account -AccountPassword $AccountPassword
+    Wait-SqlTargetServiceRunning -Computer $primary.ComputerName -SqlInstance $primary.SqlInstance -Type $ServiceType `
+        -Credential (Get-RemoteCredential -Computer $primary.ComputerName -Credential $Credential) `
+        -SqlCredential $SqlCredential -TimeoutSeconds ([Math]::Min(180, $SyncTimeoutSeconds))
+    Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
+        -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
+
+    $currentPrimary = $secondary.SqlInstance
+    if ($Failback) {
+        Write-Host "  Failback -> $($primary.SqlInstance)" -ForegroundColor Cyan
+        Invoke-SsaAgFailover -TargetSqlInstance $primary.SqlInstance -AgNames $AgNames -SqlCredential $SqlCredential
+        Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
+            -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
+        $currentPrimary = $primary.SqlInstance
+        Write-Host "  Primary restored on $($primary.SqlInstance)." -ForegroundColor Green
+    } else {
+        Write-Host "  Done. Primary is now on $($secondary.SqlInstance) (no failback)." -ForegroundColor Green
+    }
+
+    [pscustomobject]@{
+        OriginalPrimary = $primary.SqlInstance
+        CurrentPrimary  = $currentPrimary
+        Secondary       = $secondary.SqlInstance
+        FailedBack      = [bool]$Failback
+    }
 }
 
 function Write-SsaBanner {
@@ -42,7 +244,11 @@ Current value: $OutputFolder
 }
 
 function Import-SsaDependencies {
-    param([switch]$InstallModule, [switch]$NeedActiveDirectory)
+    param(
+        [switch]$InstallModule,
+        [switch]$NeedActiveDirectory,
+        [switch]$PreferActiveDirectory
+    )
 
     if (-not (Get-Module -ListAvailable -Name dbatools)) {
         if (-not $InstallModule) { throw 'dbatools missing. Install it or pass -InstallModule.' }
@@ -52,9 +258,14 @@ function Import-SsaDependencies {
     Set-DbatoolsConfig -FullName sql.connection.encrypt -Value $true
     Set-DbatoolsConfig -FullName sql.connection.trustcert -Value $true
 
-    if ($NeedActiveDirectory) {
+    $wantAd = $NeedActiveDirectory -or $PreferActiveDirectory
+    if ($wantAd) {
         if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-            throw 'ActiveDirectory module (RSAT) is required for this stage.'
+            if ($NeedActiveDirectory) {
+                throw 'ActiveDirectory module (RSAT) is required for this stage.'
+            }
+            Write-Warning 'ActiveDirectory module not available; AD unlock/status checks will be skipped.'
+            return
         }
         Import-Module ActiveDirectory -ErrorAction Stop
     }
@@ -1147,5 +1358,3 @@ function Read-SsaDiscovery {
     if (-not (Test-Path -LiteralPath $latest)) { return $null }
     Get-Content -LiteralPath $latest -Raw | ConvertFrom-Json
 }
-
-Export-ModuleMember -Function *

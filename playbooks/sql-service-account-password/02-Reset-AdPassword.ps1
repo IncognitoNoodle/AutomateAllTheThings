@@ -4,22 +4,21 @@
 
 .DESCRIPTION
     Resets the domain password for a SQL service account (or waits only if SecOps already
-    reset it). Unlocks the account, clears account expiration, optionally sets
-    PasswordNeverExpires, then validates the password on the management host and on each
-    SQL node (WinRM ValidateCredentials) so you do not restart SQL against a stale DC.
+    reset it). Unlocks the account, clears account expiration, sets PasswordNeverExpires
+    by default, then validates the password on the management host and on each SQL node
+    (WinRM ValidateCredentials) so you do not restart SQL against a stale DC.
 
 .EXAMPLE
     $p = ConvertTo-SecureString 'NewPw!' -AsPlainText -Force
     .\02-Reset-AdPassword.ps1 -Account 'DOMAIN\svcSql' -SecurePassword $p `
-        -ComputerName 'SQL01','SQL02'
+        -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1'
 
 .EXAMPLE
-    # SecOps already reset AD — only wait for replication on nodes
     .\02-Reset-AdPassword.ps1 -Account 'DOMAIN\svcSql' -SecurePassword $p `
         -ComputerName 'SQL01','SQL02' -WaitOnly
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
-[CmdletBinding(DefaultParameterSetName = 'Reset')]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory)]
     [string]$Account,
@@ -28,23 +27,17 @@ param(
     [securestring]$SecurePassword,
 
     [string[]]$ComputerName,
-
     [string]$SqlInstance,
-
     [string[]]$AvailabilityGroup,
-
     [PSCredential]$Credential,
-
     [PSCredential]$SqlCredential,
+    [string]$OutputFolder,
 
-    [string]$OutputFolder = '\\SERVERNAME\C$\Temp\SqlServiceAccountRotation\',
-
-    # Service accounts should not expire passwords by default (opt out with -PasswordNeverExpires:$false)
     [bool]$PasswordNeverExpires = $true,
-
-    [Parameter(ParameterSetName = 'WaitOnly')]
     [switch]$WaitOnly,
+    [switch]$RequireNodes,
 
+    # Defaults align with Common\Config.ps1 (override there for env-wide changes)
     [ValidateRange(30, 7200)]
     [int]$MgmtTimeoutSeconds = 300,
 
@@ -58,10 +51,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-Import-Module (Join-Path $here 'Common\SqlServiceAccount.Common.psm1') -Force
+$here = $PSScriptRoot
+. (Join-Path $here 'Common\SqlServiceAccount.Common.ps1')
 
-$OutputFolder = Initialize-SsaOutputFolder -OutputFolder $OutputFolder
+$OutputFolder = Resolve-SsaOutputFolder -OutputFolder $OutputFolder
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 Start-Transcript -Path (Join-Path $OutputFolder "02-ResetAd_$timestamp.log") -NoClobber | Out-Null
 
@@ -69,23 +62,14 @@ try {
     Import-SsaDependencies -InstallModule:$InstallModule -NeedActiveDirectory
     Write-SsaBanner 'Stage 02 — AD password reset / unlock / replication wait'
 
-    # Resolve nodes: explicit -ComputerName, else discovery JSON, else -SqlInstance topology
-    $nodes = @($ComputerName | Where-Object { $_ } | Sort-Object -Unique)
+    $nodes = @(Resolve-SsaNodeList -ComputerName $ComputerName -OutputFolder $OutputFolder `
+            -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
+            -Credential $Credential -SqlCredential $SqlCredential)
+
     if (-not $nodes) {
-        $disc = Read-SsaDiscovery -OutputFolder $OutputFolder
-        if ($disc -and $disc.Nodes) {
-            $nodes = @($disc.Nodes.ComputerName | Sort-Object -Unique)
-            Write-Host "Using nodes from discovery-latest.json: $($nodes -join ', ')" -ForegroundColor DarkCyan
-        }
-    }
-    if (-not $nodes -and $SqlInstance) {
-        $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
-            -SqlCredential $SqlCredential -Credential $Credential
-        $nodes = @($topo.Nodes.ComputerName | Sort-Object -Unique)
-        Write-Host "Using nodes from topology ($($topo.Mode)): $($nodes -join ', ')" -ForegroundColor DarkCyan
-    }
-    if (-not $nodes) {
-        Write-Warning 'No SQL nodes supplied. Will validate on mgmt host only. Pass -ComputerName or -SqlInstance for per-node replication checks.'
+        $msg = 'No SQL nodes resolved. Pass -ComputerName, -SqlInstance, or run stage 01 first.'
+        if ($RequireNodes) { throw $msg }
+        Write-Warning "$msg Validating on mgmt host only."
     }
 
     Write-Host "Account: $Account" -ForegroundColor Cyan
@@ -115,7 +99,7 @@ try {
 
     if ($nodes.Count -gt 0) {
         Write-Host "`nWaiting for AD replication / acceptance on SQL nodes..." -ForegroundColor Cyan
-        Write-Host 'Slow poll by design (avoids lockouts). Do not restart SQL until this passes.' -ForegroundColor Yellow
+        Write-Host ("Slow poll every {0}s (avoids lockouts). Do not restart SQL until this passes." -f $NodePollSeconds) -ForegroundColor Yellow
         Wait-AdCredentialReadyOnNode -Account $Account -SecurePassword $SecurePassword `
             -ComputerName $nodes -Credential $Credential `
             -TimeoutSeconds $NodeTimeoutSeconds -PollSeconds $NodePollSeconds
@@ -125,16 +109,16 @@ try {
     Write-Host "`nAD status after:" -ForegroundColor Cyan
     $after | Format-List Account, Enabled, LockedOut, PasswordExpired, PasswordNeverExpires, AccountExpirationDate, PasswordLastSet, BadPwdCount
 
-    $statusPath = Join-Path $OutputFolder "02-AdReady_$($after.SamAccount)_$timestamp.json"
-    [pscustomobject]@{
-        Account           = $Account
-        WaitOnly          = [bool]$WaitOnly
-        NodesValidated    = $nodes
-        PasswordLastSet   = $after.PasswordLastSet
-        PasswordNeverExpires = $after.PasswordNeverExpires
-        LockedOut         = $after.LockedOut
-        CompletedAt       = (Get-Date).ToString('o')
-    } | ConvertTo-Json | Set-Content -LiteralPath $statusPath -Encoding UTF8
+    $null = Save-SsaStageState -OutputFolder $OutputFolder -Stage '02-ad' -State ([pscustomobject]@{
+            Account              = $Account
+            SamAccount           = $after.SamAccount
+            WaitOnly             = [bool]$WaitOnly
+            NodesValidated       = $nodes
+            PasswordLastSet      = $after.PasswordLastSet
+            PasswordNeverExpires = $after.PasswordNeverExpires
+            LockedOut            = $after.LockedOut
+            CompletedAt          = (Get-Date).ToString('o')
+        })
 
     Write-Host "`nAD ready. Next: .\03-Apply-ServicePassword.ps1 (Update-DbaServiceAccount -NoRestart)" -ForegroundColor Green
 } finally {

@@ -1,6 +1,8 @@
 # ApplySqlServiceAccountPassword.ps1 (legacy)
 
 > **Prefer the modular playbook:** [`playbooks/sql-service-account-password/`](../../playbooks/sql-service-account-password/README.md)
+>
+> Stages are separate `.ps1` scripts; shared helpers are **dot-sourced** from `Common/SqlServiceAccount.Common.ps1` (not a `.psm1` module).
 
 The single-file script below is kept for reference. Production recovery was hard when the monolithic flow broke mid-way; the playbook splits discover → AD reset → apply (NoRestart) → restart/failover → validate into independently re-runnable stages.
 
