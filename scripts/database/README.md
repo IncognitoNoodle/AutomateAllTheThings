@@ -68,12 +68,14 @@ scripts/database/
 │   │
 │   └── cloud/                   # Azure-specific scripts
 │       ├── 01_azure_sql_database_automatic_tuning.sql
-│       └── 02_azure_backup_to_blob_storage.sql
+│       ├── 02_azure_backup_to_blob_storage.sql
+│       └── 03_azure_sql_database_health_check.sql
 │
 └── (postgresql/ and mysql/ folders - optional, to be added)
 
 resources/database/              # Documentation and playbooks
     ├── daily_dba_checklist.md
+    ├── azure_sql_database_paas_healthcheck.md
     └── runbooks/
         ├── tempdb_full_incident_response.md
         └── transaction_log_full.md
@@ -160,8 +162,11 @@ resources/database/              # Documentation and playbooks
 **Scripts**:
 - **`01_azure_sql_database_automatic_tuning.sql`**: Configures and monitors Azure SQL Database Automatic Tuning.
 - **`02_azure_backup_to_blob_storage.sql`**: Configures backups to Azure Blob Storage for Managed Instance.
+- **`03_azure_sql_database_health_check.sql`**: PaaS daily health pack (resource stats, storage, waits, blocking, Query Store).
 
-**Business Application**: Leverages Azure's AI-powered automation and cloud-native backup strategies.
+**Playbook**: `resources/database/azure_sql_database_paas_healthcheck.md` — senior Cloud DBA checklist covering Azure Monitor, HA/DR, security, and elastic pools.
+
+**Business Application**: Leverages Azure's AI-powered automation and cloud-native backup strategies; operationalizes daily PaaS health checks without IaaS assumptions.
 
 ## Prerequisites
 
@@ -404,6 +409,7 @@ When discussing these scripts in interviews, be prepared to explain:
 
 Located in `resources/database/`:
 - **`daily_dba_checklist.md`**: Daily operational checklist
+- **`azure_sql_database_paas_healthcheck.md`**: Azure SQL Database (PaaS) senior Cloud DBA health check
 - **`runbooks/tempdb_full_incident_response.md`**: TempDB incident response
 - **`runbooks/transaction_log_full.md`**: Transaction log incident response
 
