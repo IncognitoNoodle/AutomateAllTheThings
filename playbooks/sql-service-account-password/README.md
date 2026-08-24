@@ -1,121 +1,139 @@
-# SQL Service Account Password Playbook
+# SQL service account password
 
-Modular, recoverable process for rotating / applying domain passwords on SQL Server service accounts (Engine, Agent, SSRS, SSIS), including Always On Availability Groups.
+Scripts to change domain passwords for SQL Engine, Agent, SSRS, and SSIS (standalone or Always On).
 
-This replaces the monolithic `scripts/powershell/ApplySqlServiceAccountPassword.ps1` / `RotateSqlServiceAccount.ps1` flow. Each stage is independently re-runnable. If anything breaks, resume from the last successful stage.
+Run stages in order. If a stage fails, fix the issue and re-run that stage.
 
-See [AUDIT.md](./AUDIT.md) for the design/audit notes.
+| Stage | Script | What it does |
+|------|--------|--------------|
+| 01 | `01-Discover-ServiceAccounts.ps1` | List services/accounts/SPNs, flag problems |
+| 02 | `02-Reset-AdPassword.ps1` | Reset AD password, unlock, never-expire, wait for node replication |
+| 03 | `03-Apply-ServicePassword.ps1` | `Update-DbaServiceAccount -NoRestart` on all nodes |
+| 04 | `04-Restart-Services.ps1` | Restart services; AG failover if Engine/Agent |
+| 05 | `05-Validate-Health.ps1` | Confirm services, AD, SPNs, AG sync |
 
-## Why modular?
+Shared code: `Common/SqlServiceAccount.Common.ps1` (dot-sourced).  
+Defaults: `Common/Config.ps1`.
 
-Production pain: one big script failed mid-way (AD lag, lockout, WinRM, failover), and recovery was unclear. Stages create **hard checkpoints**:
+## Requirements
 
-| Stage | Changes AD? | Restarts SQL? | Failover? | Safe to re-run? |
-|------|-------------|---------------|-----------|-----------------|
-| 01 Discover | No | No | No | Yes (read-only) |
-| 02 AD reset | Yes | No | No | Yes (`-WaitOnly` if SecOps reset) |
-| 03 Apply service password | No | No (`-NoRestart`) | No | Yes |
-| 04 Restart / failover | No | Yes | Optional | Yes |
-| 05 Validate | No | No | No | Yes |
-
-## Recommended senior-DBA tactic (lockout-safe)
-
-1. **Discover** — inventory accounts, service state, SPNs, AG topology. Fix blockers first.
-2. **AD reset once** — set password, unlock, never-expire. Wait until the new password validates on the **management host and every SQL node** (slow poll, default 5 minutes).
-3. **Apply on all nodes with `-NoRestart`** — update Windows service logon cache everywhere while services keep running.
-4. **Restart / failover as a separate stage**
-   - Standalone: restart targeted types.
-   - AG Engine/Agent: secondary restart → sync → failover → former primary restart. **Failback off by default.**
-   - SSRS/SSIS only: restart those types on all nodes; no AG failover.
-5. **Validate** — services Running, SPNs present, AG databases Synchronized/Synchronizing, account not locked.
-
-## Folder layout
-
-```
-playbooks/sql-service-account-password/
-├── README.md
-├── AUDIT.md
-├── Common/
-│   ├── Config.ps1                      # edit OutputFolder here
-│   └── SqlServiceAccount.Common.ps1    # dot-sourced helpers (not a .psm1 module)
-├── 01-Discover-ServiceAccounts.ps1
-├── 02-Reset-AdPassword.ps1
-├── 03-Apply-ServicePassword.ps1
-├── 04-Restart-Services.ps1
-└── 05-Validate-Health.ps1
-```
-
-Stages load helpers with:
+- Windows jump box with **dbatools**, **ActiveDirectory** (RSAT), WinRM to SQL nodes, `setspn.exe`
+- Rights to reset the AD account, update SQL services, and (for AG) failover
+- Set the log path in `Common/Config.ps1`:
 
 ```powershell
-. (Join-Path $PSScriptRoot 'Common\SqlServiceAccount.Common.ps1')
+$script:SsaDefaultOutputFolder = '\\FileServer\Share\SqlServiceAccountRotation\'
 ```
 
-## Prerequisites
+Or pass `-OutputFolder` on each run.
 
-- Jump box with: **dbatools**, **ActiveDirectory** (RSAT), WinRM to SQL nodes, `setspn.exe`
-- Rights: AD reset on the service accounts; local admin on SQL nodes; AG failover rights
-- Edit `Common\Config.ps1` → `$script:SsaDefaultOutputFolder` (or pass `-OutputFolder` each run)
+## Order of operations
 
-## Quick start
+1. Discover and clear Critical findings.
+2. Reset AD **once**, then wait until the password works on the jump box **and every SQL node** (default poll 5 minutes — avoids lockouts).
+3. Update the service password on **all** nodes with `-NoRestart` (services keep running).
+4. Restart:
+   - Standalone: restart the service types you changed.
+   - AG + Engine/Agent: restart secondary → wait sync → failover → restart old primary. Failback is off unless you ask for it.
+   - SSRS/SSIS only: restart those on all nodes (no failover).
+5. Validate.
+
+Do not restart SQL until stage 02/03 report the new password is accepted on the nodes.
+
+## Examples
 
 ```powershell
 cd playbooks\sql-service-account-password
+$p = ConvertTo-SecureString 'NewComplexPw!' -AsPlainText -Force
 
-# 1) Discover
+# 1 — inventory
 .\01-Discover-ServiceAccounts.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1'
 
-# 2) AD password (per account)
-$p = ConvertTo-SecureString 'NewComplexPw!' -AsPlainText -Force
+# 2 — AD (skip reset if SecOps already did it: add -WaitOnly)
 .\02-Reset-AdPassword.ps1 -Account 'DOMAIN\svcSql' -SecurePassword $p `
   -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' -RequireNodes
 
-# 3) Apply to Windows services (no restart)
+# 3 — service logon cache only
 .\03-Apply-ServicePassword.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
   -Account 'DOMAIN\svcSql' -SecurePassword $p
 
-# 4) Restart + graceful AG failover (no automatic failback)
+# 4 — restart / failover
 .\04-Restart-Services.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
   -Account 'DOMAIN\svcSql' -SecurePassword $p
 
-# Optional later:
-# .\04-Restart-Services.ps1 ... -FailbackOnly -OriginalPrimary 'SQL01\INST'
+# optional failback later
+# .\04-Restart-Services.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
+#   -FailbackOnly -OriginalPrimary 'SQL01\INST'
 
-# 5) Validate
+# 5 — check
 .\05-Validate-Health.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
   -Account 'DOMAIN\svcSql'
 ```
 
-Stage JSON checkpoints under OutputFolder: `discovery-latest.json`, `02-ad-latest.json`, `03-apply-latest.json`, `04-restart-latest.json`, `05-validate-latest.json`.
+Multiple accounts: pass matching arrays to `-Account` and `-SecurePassword`.
 
-## Recovery cheat sheet
+Optional SQL auth for AG work (when Kerberos is flaky):
 
-| Symptom | Resume at | Action |
-|---------|-----------|--------|
-| Wrong account / SPN / service Stopped | 01 | Fix manually, re-discover |
-| AD reset done, nodes still reject password | 02 | `-WaitOnly`; check DC replication / unlock |
-| Service cache not updated | 03 | Re-run apply (`-NoRestart`) |
-| Secondary restarted, failover not done | 04 | Re-run 04 |
-| Failover done, old primary not restarted | 04 | Re-run 04 |
-| Want original primary back | 04 | `-FailbackOnly -OriginalPrimary ...` |
-| Everything up, unsure of sync | 05 | Re-run validate |
+```powershell
+$sql = Get-Credential -Message 'SQL login'
+.\01-Discover-ServiceAccounts.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' -SqlCredential $sql
+```
 
-## SPN check (used in 01 / 05)
+## Stage reference
+
+### 01 Discover
+- Reads Engine/Agent/SSRS/SSIS on all AG replicas (or the single instance).
+- Prints domain accounts, service state, `setspn -L` output.
+- Writes `discovery-latest.json`.
+- `-FailOnCritical` exits 1 if Critical findings exist.
+- `-ListOnly` prints account table only.
+
+### 02 Reset AD
+- `Set-ADAccountPassword`, unlock, clear expiration, `PasswordNeverExpires` (default `$true`).
+- Waits on jump box + SQL nodes via `ValidateCredentials`.
+- `-WaitOnly` — only unlock/wait (password already set).
+- `-RequireNodes` — fail if no SQL nodes resolved.
+- `-ComputerName` optional; otherwise uses discovery JSON or `-SqlInstance` topology.
+- Writes `02-ad-latest.json`.
+
+### 03 Apply (NoRestart)
+- Updates Windows service passwords on every node; does not restart.
+- Re-checks AD on those nodes before success.
+- Writes `03-apply-latest.json` (includes `TypesTouched` for stage 04).
+
+### 04 Restart
+- Uses types from `03-apply-latest.json` when present, else from `-Account` / `-Type`.
+- Pre-restart AD check (slow poll).
+- AG Engine/Agent path as above; `-Failback` to fail back in the same run.
+- `-FailbackOnly` + `-OriginalPrimary` (or last restart/discovery JSON) to fail back later.
+- Writes `04-restart-latest.json`.
+
+### 05 Validate
+- Services Running, AD not locked/expired, SPNs present, AG DBs Synchronized or Synchronizing.
+- Exit 1 on Critical findings.
+- Writes `05-validate-latest.json`.
+
+## If something fails
+
+| Problem | Re-run |
+|---------|--------|
+| Bad inventory / SPN / service stopped | `01` |
+| Nodes still reject new password | `02 -WaitOnly` |
+| Service password not updated | `03` |
+| Restart or failover incomplete | `04` |
+| Need original AG primary back | `04 -FailbackOnly -OriginalPrimary '...'` |
+| Sync / health unsure | `05` |
+
+Transcripts and `*-latest.json` files are under the OutputFolder.
+
+## SPNs
 
 ```text
 setspn -L DOMAIN\AccountSam
 ```
 
-Example: `setspn -L UCLES\CRTPRDAG02_SQL`
+## Notes
 
-## Relationship to legacy scripts
-
-| Legacy | Status |
-|--------|--------|
-| `scripts/powershell/ApplySqlServiceAccountPassword.ps1` | Prefer this playbook |
-| `scripts/powershell/RotateSqlServiceAccount.ps1` | Prefer stages 02–04 |
-
-## Security notes
-
-- Passwords are not written to transcripts as plain text by design; still protect OutputFolder.
-- Do not commit real passwords, transcripts, or discovery dumps with secrets.
+- Domain accounts only (skips LocalSystem, NT SERVICE, local users, gMSA).
+- Protect the OutputFolder share; don’t commit passwords or transcripts.
+- Older one-shot scripts: `scripts/powershell/ApplySqlServiceAccountPassword.ps1`, `RotateSqlServiceAccount.ps1`.
