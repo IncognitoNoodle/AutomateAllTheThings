@@ -12,7 +12,7 @@
       . (Join-Path $PSScriptRoot 'Common\SqlServiceAccount.Common.ps1')
 #>
 
-$script:SsaCommonRoot = $PSScriptRoot
+$script:SsaCommonRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 . (Join-Path $script:SsaCommonRoot 'Config.ps1')
 
 $script:ServiceTypes = @($script:SsaServiceTypes)
