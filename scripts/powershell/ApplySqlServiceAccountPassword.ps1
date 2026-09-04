@@ -173,6 +173,7 @@ function Get-SqlHostFqdn {
     if (-not (Get-Command Invoke-DbaQuery -ErrorAction SilentlyContinue)) { return $null }
 
     $fqdn = $null
+    $conn = $null
     try {
         # Machine DNS domain (not service-account DEFAULT_DOMAIN()).
         $q = @'
@@ -186,19 +187,21 @@ SELECT
     CAST(SERVERPROPERTY('MachineName') AS nvarchar(128)) AS MachineName,
     @domain AS DnsDomain;
 '@
+        $conn = Connect-SqlAuthInstance -SqlInstance $SqlInstance -SqlCredential $SqlCredential
         $p = @{
-            SqlInstance     = $SqlInstance
+            SqlInstance     = $conn
             Query           = $q
             EnableException = $true
             ErrorAction     = 'Stop'
         }
-        if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
         $row = @(Invoke-DbaQuery @p) | Select-Object -First 1
         if ($row -and $row.MachineName -and $row.DnsDomain) {
             $fqdn = '{0}.{1}' -f ([string]$row.MachineName).Trim(), ([string]$row.DnsDomain).Trim().TrimStart('.')
         }
     } catch {
         $null = $_
+    } finally {
+        Disconnect-SqlAuthInstance -Connection $conn
     }
 
     $script:SqlHostDnsCache[$SqlInstance] = $fqdn
@@ -340,9 +343,94 @@ function Get-NodeComputer {
     throw "Could not resolve computer name for $Instance"
 }
 
+function Test-SqlSspiFailure {
+    param([string]$Message)
+    [bool]($Message -match 'SSPI context|target principal name is incorrect|No Kerberos key found|target principal name')
+}
+
 function Test-SqlAuthFailureMessage {
     param([string]$Message)
     $Message -match 'SSPI|Kerberos|login failed|Login failed|principal name|Cannot generate SSPI|A network-related|timeout|timed out|connection|Connection'
+}
+
+function Get-SqlSspiGuidance {
+    param([string]$SqlInstance)
+    @"
+Windows authentication to SQL instance '$SqlInstance' failed because of Kerberos/SSPI.
+Check SQL service SPNs, DNS, delegation/trust, and the account running this script.
+For AG discovery, synchronization checks, and failover, pass -SqlCredential with a SQL-authenticated login.
+"@
+}
+
+function Assert-SqlCredential {
+    param([PSCredential]$SqlCredential)
+    if (-not $SqlCredential) { return }
+
+    $user = [string]$SqlCredential.UserName
+    if ([string]::IsNullOrWhiteSpace($user)) {
+        throw '-SqlCredential has an empty UserName.'
+    }
+    if ($user -match '\\') {
+        Write-Warning @"
+-SqlCredential UserName '$user' looks like Windows auth (DOMAIN\user).
+SQL authentication needs a SQL login name only (as in SSMS 'SQL Server Authentication'), e.g. 'sa' or 'sql_rotator'.
+Recreate with: `$SqlCredential = Get-Credential -UserName 'YourSqlLogin'
+"@
+    }
+}
+
+function Connect-SqlAuthInstance {
+    param(
+        [Parameter(Mandatory)][string]$SqlInstance,
+        [PSCredential]$SqlCredential
+    )
+
+    $p = @{
+        SqlInstance            = $SqlInstance
+        TrustServerCertificate = $true
+        ErrorAction            = 'Stop'
+    }
+    $connectCommand = Get-Command Connect-DbaInstance -ErrorAction Stop
+    if ($connectCommand.Parameters.ContainsKey('EnableException')) {
+        $p.EnableException = $true
+    }
+    if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
+
+    try {
+        return Connect-DbaInstance @p
+    } catch {
+        $msg = [string]$_
+        if ($SqlCredential -and (Test-SqlSspiFailure -Message $msg)) {
+            throw @"
+-SqlCredential was supplied ('$($SqlCredential.UserName)') but the connection to '$SqlInstance' still failed with Kerberos/SSPI.
+SQL auth was not applied, or the endpoint ignored it.
+Check: UserName is a SQL login (not DOMAIN\user); SSMS SQL auth works to exactly '$SqlInstance'; login is enabled and not locked.
+Original error: $msg
+"@
+        }
+        if ($SqlCredential) {
+            throw "SQL auth connect failed for '$($SqlCredential.UserName)' @ '$SqlInstance': $msg"
+        }
+        if (Test-SqlSspiFailure -Message $msg) {
+            throw "$(Get-SqlSspiGuidance -SqlInstance $SqlInstance)`nOriginal error: $msg"
+        }
+        throw
+    }
+}
+
+function Disconnect-SqlAuthInstance {
+    param([object]$Connection)
+    if (-not $Connection) { return }
+
+    try {
+        if ($Connection.ConnectionContext) {
+            $Connection.ConnectionContext.Disconnect()
+        } elseif ($Connection -is [IDisposable]) {
+            $Connection.Dispose()
+        }
+    } catch {
+        $null = $_
+    }
 }
 
 function Get-TargetTopology {
@@ -353,28 +441,48 @@ function Get-TargetTopology {
         [PSCredential]$Credential
     )
 
-    $agParams = @{
-        SqlInstance     = $SqlInstance
-        EnableException = $true
-        WarningAction   = 'SilentlyContinue'
-        ErrorAction     = 'Stop'
-    }
-    if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
-    if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
-
-    $ags = @()
+    $agNames = @()
+    $replicaSql = @()
+    $originalPrimary = $null
+    $conn = $null
     try {
+        $conn = Connect-SqlAuthInstance -SqlInstance $SqlInstance -SqlCredential $SqlCredential
+        $agParams = @{
+            SqlInstance     = $conn
+            EnableException = $true
+            WarningAction   = 'SilentlyContinue'
+            ErrorAction     = 'Stop'
+        }
+        if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
+
         $ags = @(Get-DbaAvailabilityGroup @agParams)
+        if ($ags) {
+            $agNames = @($ags.Name | Select-Object -Unique)
+            $replicaSql = @($ags | ForEach-Object { $_.AvailabilityReplicas.Name } | Select-Object -Unique)
+            $originalPrimary = $ags[0].PrimaryReplicaServerName
+        }
     } catch {
         $msg = [string]$_
+        if (Test-SqlSspiFailure -Message $msg) {
+            if ($SqlCredential) {
+                throw @"
+-SqlCredential was supplied ('$($SqlCredential.UserName)') but the connection to '$SqlInstance' still failed with Kerberos/SSPI.
+SQL auth was not applied, or the endpoint ignored it.
+Check: UserName is a SQL login (not DOMAIN\user); SSMS SQL auth works to exactly '$SqlInstance'; login is enabled and not locked.
+Original error: $msg
+"@
+            }
+            throw "$(Get-SqlSspiGuidance -SqlInstance $SqlInstance)`nOriginal error: $msg"
+        }
         if ($msg -notmatch 'HADR|Availability Group|not configured|is not enabled') { throw }
         if ($AvailabilityGroup) {
             throw "Instance $SqlInstance has no HADR/AG configured, but -AvailabilityGroup was specified."
         }
-        $ags = @()
+    } finally {
+        Disconnect-SqlAuthInstance -Connection $conn
     }
 
-    if (-not $ags) {
+    if (-not $agNames) {
         $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential -SqlCredential $SqlCredential
         return [pscustomobject]@{
             Mode            = 'Standalone'
@@ -384,8 +492,6 @@ function Get-TargetTopology {
         }
     }
 
-    $agNames = @($ags.Name | Select-Object -Unique)
-    $replicaSql = @($ags | ForEach-Object { $_.AvailabilityReplicas.Name } | Select-Object -Unique)
     if ($replicaSql.Count -lt 1) { throw "AGs found ($($agNames -join ', ')) but no replicas." }
 
     $nodes = foreach ($rep in $replicaSql) {
@@ -400,7 +506,7 @@ function Get-TargetTopology {
         Mode            = 'AvailabilityGroup'
         Nodes           = $nodes
         AgNames         = $agNames
-        OriginalPrimary = $ags[0].PrimaryReplicaServerName
+        OriginalPrimary = $originalPrimary
     }
 }
 
@@ -951,62 +1057,118 @@ function Wait-AgReady {
         [int]$TimeoutSeconds
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    $attempt = 0
-    $authWarned = $false
+    $lastSqlError = $null
     do {
-        $attempt++
+        $conn = $null
+        $ags = @()
+        $queryFailed = $false
+        $ready = $false
         try {
-            $p = @{
-                SqlInstance         = $SqlInstance
-                AvailabilityGroup   = $AgNames
-                EnableException     = $true
-                WarningAction       = 'SilentlyContinue'
-                ErrorAction         = 'Stop'
-            }
-            if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
-            $ags = @(Get-DbaAvailabilityGroup @p)
-        } catch {
-            $msg = [string]$_
-            if ((Test-SqlAuthFailureMessage $msg)) {
-                if (-not $authWarned -or ($attempt % 6) -eq 0) {
-                    Write-Host "  Wait sync: $SqlInstance not accepting SQL login yet (retrying)" -ForegroundColor DarkYellow
-                    $authWarned = $true
+            try {
+                $conn = Connect-SqlAuthInstance -SqlInstance $SqlInstance -SqlCredential $SqlCredential
+                $p = @{
+                    SqlInstance       = $conn
+                    AvailabilityGroup = $AgNames
+                    EnableException   = $true
+                    WarningAction     = 'SilentlyContinue'
+                    ErrorAction       = 'Stop'
                 }
-            } else {
-                Write-Host ("  Wait sync: {0} - {1}" -f $SqlInstance, $msg.Split("`n")[0]) -ForegroundColor DarkYellow
+                $ags = @(Get-DbaAvailabilityGroup @p)
+                $lastSqlError = $null
+            } catch {
+                $lastSqlError = [string]$_
+                if (Test-SqlSspiFailure -Message $lastSqlError) {
+                    if ($SqlCredential) {
+                        throw @"
+-SqlCredential was supplied ('$($SqlCredential.UserName)') but the connection to '$SqlInstance' still failed with Kerberos/SSPI.
+SQL auth was not applied, or the endpoint ignored it.
+Check: UserName is a SQL login (not DOMAIN\user); SSMS SQL auth works to exactly '$SqlInstance'; login is enabled and not locked.
+Original error: $lastSqlError
+"@
+                    }
+                    Write-Host "  Wait sync: $SqlInstance Windows authentication not ready (Kerberos/SSPI; retrying)" -ForegroundColor DarkYellow
+                } elseif (Test-SqlAuthFailureMessage $lastSqlError) {
+                    Write-Host "  Wait sync: $SqlInstance not accepting SQL login yet (retrying)" -ForegroundColor DarkYellow
+                } else {
+                    Write-Host ("  Wait sync: {0} - {1}" -f $SqlInstance, $lastSqlError.Split("`n")[0]) -ForegroundColor DarkYellow
+                }
+                $queryFailed = $true
             }
-            Start-Sleep -Seconds 5
-            continue
+
+            if (-not $queryFailed) {
+                if ($ags.Count -eq 0) {
+                    Write-Host "  Wait sync: no AG data from $SqlInstance yet" -ForegroundColor DarkYellow
+                } else {
+                    $pending = foreach ($ag in $ags) {
+                        $target = $ag.AvailabilityReplicas | Where-Object {
+                            Test-ReplicaMatch $_.Name $SecondarySqlInstance
+                        } | Select-Object -First 1
+                        if (-not $target) {
+                            [pscustomobject]@{ Ag = $ag.Name; Why = "missing $SecondarySqlInstance" }
+                            continue
+                        }
+                        $sync = [string]$target.RollupSynchronizationState
+                        $connectionState = [string]$target.ConnectionState
+                        $mode = [string]$target.AvailabilityMode
+                        $ok = ($connectionState -eq 'Connected') -and (
+                            $sync -eq 'Synchronized' -or
+                            ($mode -match 'Asynchronous' -and $sync -eq 'Synchronizing')
+                        )
+                        if (-not $ok) {
+                            [pscustomobject]@{ Ag = $ag.Name; Why = "$($target.Name) $connectionState/$sync" }
+                        }
+                    }
+                    if (-not $pending) {
+                        $ready = $true
+                    } else {
+                        Write-Host ("  Wait sync: " + (($pending | ForEach-Object {
+                                        "$($_.Ag)=$($_.Why)"
+                                    }) -join '; ')) -ForegroundColor DarkYellow
+                    }
+                }
+            }
+        } finally {
+            Disconnect-SqlAuthInstance -Connection $conn
         }
 
-        if ($ags.Count -eq 0) {
-            Write-Host "  Wait sync: no AG data from $SqlInstance yet" -ForegroundColor DarkYellow
-            Start-Sleep -Seconds 5
-            continue
-        }
-
-        $pending = foreach ($ag in $ags) {
-            $target = $ag.AvailabilityReplicas | Where-Object { Test-ReplicaMatch $_.Name $SecondarySqlInstance } | Select-Object -First 1
-            if (-not $target) {
-                [pscustomobject]@{ Ag = $ag.Name; Why = "missing $SecondarySqlInstance" }
-                continue
-            }
-            $sync = [string]$target.RollupSynchronizationState
-            $conn = [string]$target.ConnectionState
-            $mode = [string]$target.AvailabilityMode
-            $ok = ($conn -eq 'Connected') -and (
-                $sync -eq 'Synchronized' -or
-                ($mode -match 'Asynchronous' -and $sync -eq 'Synchronizing')
-            )
-            if (-not $ok) {
-                [pscustomobject]@{ Ag = $ag.Name; Why = "$($target.Name) $conn/$sync" }
-            }
-        }
-        if (-not $pending) { return }
-        Write-Host ("  Wait sync: " + (($pending | ForEach-Object { "$($_.Ag)=$($_.Why)" }) -join '; ')) -ForegroundColor DarkYellow
+        if ($ready) { return }
         Start-Sleep -Seconds 5
     } while ((Get-Date) -lt $deadline)
+    if ($lastSqlError -and (Test-SqlSspiFailure -Message $lastSqlError) -and -not $SqlCredential) {
+        throw "AG sync timeout (${TimeoutSeconds}s) waiting on $SecondarySqlInstance`n$(Get-SqlSspiGuidance -SqlInstance $SqlInstance)"
+    }
     throw "AG sync timeout (${TimeoutSeconds}s) waiting on $SecondarySqlInstance"
+}
+
+function Invoke-ConnectedAgFailover {
+    param(
+        [Parameter(Mandatory)][string]$SqlInstance,
+        [Parameter(Mandatory)][string[]]$AvailabilityGroup,
+        [PSCredential]$SqlCredential
+    )
+
+    $conn = $null
+    try {
+        $conn = Connect-SqlAuthInstance -SqlInstance $SqlInstance -SqlCredential $SqlCredential
+        Invoke-DbaAgFailover -SqlInstance $conn -AvailabilityGroup $AvailabilityGroup `
+            -Confirm:$false -EnableException | Out-Null
+    } catch {
+        $msg = [string]$_
+        if ($SqlCredential -and (Test-SqlSspiFailure -Message $msg)) {
+            throw @"
+-SqlCredential was supplied ('$($SqlCredential.UserName)') but the connection to '$SqlInstance' still failed with Kerberos/SSPI.
+SQL auth was not applied, or the endpoint ignored it.
+Check: UserName is a SQL login (not DOMAIN\user); SSMS SQL auth works to exactly '$SqlInstance'; login is enabled and not locked.
+Original error: $msg
+"@
+        }
+        if ((-not $SqlCredential) -and (Test-SqlSspiFailure -Message $msg)) {
+            throw "$(Get-SqlSspiGuidance -SqlInstance $SqlInstance)`nOriginal error: $msg"
+        }
+        throw
+    } finally {
+        Disconnect-SqlAuthInstance -Connection $conn
+    }
 }
 
 function Invoke-GracefulAgApply {
@@ -1059,12 +1221,8 @@ function Invoke-GracefulAgApply {
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
     Write-Host "  Failover -> $($secondary.SqlInstance)" -ForegroundColor Cyan
-    $fo = @{
-        SqlInstance = $secondary.SqlInstance; AvailabilityGroup = $AgNames
-        Confirm = $false; EnableException = $true
-    }
-    if ($SqlCredential) { $fo.SqlCredential = $SqlCredential }
-    Invoke-DbaAgFailover @fo | Out-Null
+    Invoke-ConnectedAgFailover -SqlInstance $secondary.SqlInstance `
+        -AvailabilityGroup $AgNames -SqlCredential $SqlCredential
     Start-Sleep -Seconds 3
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -1079,12 +1237,8 @@ function Invoke-GracefulAgApply {
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
     Write-Host "  Failback -> $($primary.SqlInstance)" -ForegroundColor Cyan
-    $fb = @{
-        SqlInstance = $primary.SqlInstance; AvailabilityGroup = $AgNames
-        Confirm = $false; EnableException = $true
-    }
-    if ($SqlCredential) { $fb.SqlCredential = $SqlCredential }
-    Invoke-DbaAgFailover @fb | Out-Null
+    Invoke-ConnectedAgFailover -SqlInstance $primary.SqlInstance `
+        -AvailabilityGroup $AgNames -SqlCredential $SqlCredential
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
     Write-Host "  Done. Primary restored on $($primary.SqlInstance)." -ForegroundColor Green
@@ -1123,12 +1277,20 @@ try {
     Set-DbatoolsConfig -FullName sql.connection.trustcert -Value $true
 
     # -SqlCredential is optional (Windows auth by default; pass SQL auth to avoid Kerberos/SSPI).
+    if ($SqlCredential) {
+        Assert-SqlCredential -SqlCredential $SqlCredential
+        Write-Host "SQL authentication will be used as '$($SqlCredential.UserName)'." -ForegroundColor DarkCyan
+        $sqlProbe = $null
+        try {
+            $sqlProbe = Connect-SqlAuthInstance -SqlInstance $SqlInstance -SqlCredential $SqlCredential
+            Write-Host "SQL auth probe OK: $SqlInstance" -ForegroundColor Green
+        } finally {
+            Disconnect-SqlAuthInstance -Connection $sqlProbe
+        }
+    }
+
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
         -SqlCredential $SqlCredential -Credential $Credential
-
-    if ($SqlCredential -and $topo.Mode -eq 'AvailabilityGroup' -and -not $ListAccounts) {
-        Write-Host "AG SQL login: $($SqlCredential.UserName)" -ForegroundColor DarkCyan
-    }
 
     Write-Host "`nMode: $($topo.Mode)" -ForegroundColor Cyan
     $topo.Nodes | Format-Table ComputerName, SqlInstance -AutoSize

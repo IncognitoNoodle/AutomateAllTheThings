@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Rotate SQL Engine/Agent/SSRS/SSIS service account passwords (standalone or Always On).
+    Rotate SQL Engine/Agent service account passwords (standalone or Always On).
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
@@ -40,7 +40,7 @@ param(
     [switch]$InstallModule,
 
     [Parameter(ParameterSetName = 'Rotate')]
-    [ValidateRange(12, 128)]
+    [ValidateRange(12, 127)]
     [int]$PasswordLength = 24,
 
     [Parameter(ParameterSetName = 'Rotate')]
@@ -59,15 +59,21 @@ param(
 # === CONFIG (edit here) ===
 # Shared UNC for vault + history + transcripts. Change once for the environment.
 $script:OutputFolder = '\\SERVERNAME\C$\Temp\'
-$script:ServiceTypes = @('Engine', 'Agent', 'SSRS', 'SSIS')
+$script:ServiceTypes = @('Engine', 'Agent')
+$script:VaultKdfIterations = 600000
 
 $ErrorActionPreference = 'Stop'
 $script:DomainDnsSuffixCache = $null
 $script:SqlHostDnsCache = @{}
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $vaultPath = Join-Path $script:OutputFolder 'SqlServiceAccountVault.xml'
-$mutexName = 'Global\SqlServiceAccountVault'
 $vaultCanary = 'SqlServiceAccountVault.v2'
+
+# Mutex name is derived from the resolved vault path, so two environments pointing at
+# different vault files never serialize against each other on the same jump box.
+$vaultPathHashBytes = [Security.Cryptography.SHA1]::Create().ComputeHash(
+    [Text.Encoding]::UTF8.GetBytes($vaultPath.ToLowerInvariant()))
+$mutexName = 'Global\SqlServiceAccountVault_' + ([BitConverter]::ToString($vaultPathHashBytes).Replace('-', ''))
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -108,13 +114,51 @@ function Get-VaultPasswordInput {
     return $p1
 }
 
+function Test-SecretEqual {
+    param([SecureString]$Secret, [string]$Expected)
+    if (-not $Secret) { return $false }
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secret)
+    try {
+        $actual = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        return $actual -ceq $Expected
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
 function Get-VaultAesKey {
-    param([SecureString]$VaultPassword, [string]$SaltBase64)
+    param(
+        [SecureString]$VaultPassword,
+        [string]$SaltBase64,
+        [int]$Iterations = $script:VaultKdfIterations
+    )
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($VaultPassword)
     try {
         $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
         if ([string]::IsNullOrWhiteSpace($plain)) { throw 'Vault password is empty.' }
         if ($plain.Length -lt 12) { throw 'Vault password must be at least 12 characters.' }
+        if ($Iterations -lt 100000) { throw "Vault PBKDF2 iteration count is too low: $Iterations" }
+
+        $saltBytes = [Convert]::FromBase64String($SaltBase64)
+        $kdf = [Security.Cryptography.Rfc2898DeriveBytes]::new(
+            $plain,
+            $saltBytes,
+            $Iterations,
+            [Security.Cryptography.HashAlgorithmName]::SHA256)
+        try { return $kdf.GetBytes(32) }
+        finally { $kdf.Dispose() }
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+function Get-LegacyVaultAesKey {
+    param([SecureString]$VaultPassword, [string]$SaltBase64)
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($VaultPassword)
+    try {
+        $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        if ([string]::IsNullOrWhiteSpace($plain)) { throw 'Vault password is empty.' }
 
         $pwdBytes = [Text.Encoding]::UTF8.GetBytes($plain)
         $saltBytes = [Convert]::FromBase64String($SaltBase64)
@@ -124,7 +168,11 @@ function Get-VaultAesKey {
 
         $sha = [Security.Cryptography.SHA256]::Create()
         try { return $sha.ComputeHash($combined) }
-        finally { $sha.Dispose() }
+        finally {
+            $sha.Dispose()
+            [Array]::Clear($pwdBytes, 0, $pwdBytes.Length)
+            [Array]::Clear($combined, 0, $combined.Length)
+        }
     } finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     }
@@ -151,7 +199,7 @@ function Open-PasswordVault {
     <#
       Returns @{ Doc = hashtable; Key = byte[]; Password = SecureString }
       Doc shape:
-        Version, Salt, Check, Accounts = @{ account = @{ EncryptedPassword; ... } }
+        Version, Iterations, Salt, Check, Accounts = @{ account = @{ EncryptedPassword; ... } }
     #>
     param(
         [string]$Path,
@@ -171,17 +219,22 @@ Delete vault.key (and preferably recreate the vault) - this script now uses a pa
         Write-Host 'No vault yet - creating a new password-protected vault.' -ForegroundColor Cyan
         $vaultPwd = Get-VaultPasswordInput -VaultPassword $VaultPassword -ConfirmNew -Unattended:$Unattended
         $salt = New-VaultSalt
-        $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $salt
+        $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $salt -Iterations $script:VaultKdfIterations
         $checkSecret = [System.Security.SecureString]::new()
-        foreach ($ch in $vaultCanary.ToCharArray()) { $checkSecret.AppendChar($ch) }
-        $checkSecret.MakeReadOnly()
-        $doc = @{
-            Version  = 2
-            Salt     = $salt
-            Check    = (Protect-Secret -Secret $checkSecret -Key $key)
-            Accounts = @{}
+        try {
+            foreach ($ch in $vaultCanary.ToCharArray()) { $checkSecret.AppendChar($ch) }
+            $checkSecret.MakeReadOnly()
+            $doc = @{
+                Version    = 3
+                Iterations = $script:VaultKdfIterations
+                Salt       = $salt
+                Check      = (Protect-Secret -Secret $checkSecret -Key $key)
+                Accounts   = @{}
+            }
+        } finally {
+            $checkSecret.Dispose()
         }
-        return @{ Doc = $doc; Key = $key; Password = $vaultPwd; IsNew = $true }
+        return @{ Doc = $doc; Key = $key; Password = $vaultPwd; IsNew = $true; NeedsSave = $true }
     }
 
     $raw = Import-Clixml -Path $Path
@@ -198,16 +251,78 @@ This is likely a legacy vault. Back it up, remove it, and let the script create 
     if ($raw.Accounts -isnot [hashtable]) { $raw.Accounts = @{} + $raw.Accounts }
 
     $vaultPwd = Get-VaultPasswordInput -VaultPassword $VaultPassword -Unattended:$Unattended
-    $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $raw.Salt
+
+    if ([int]$raw.Version -eq 3) {
+        if (-not $raw.Iterations) { throw 'Version 3 vault is missing Iterations.' }
+        $key = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $raw.Salt -Iterations ([int]$raw.Iterations)
+        $valid = $false
+        $probe = $null
+        try {
+            $probe = Unprotect-Secret -CipherText $raw.Check -Key $key
+            $valid = Test-SecretEqual -Secret $probe -Expected $vaultCanary
+        } catch {
+            $valid = $false
+        } finally {
+            if ($probe) { $probe.Dispose() }
+        }
+        if (-not $valid) {
+            [Array]::Clear($key, 0, $key.Length)
+            throw 'Wrong vault password (or vault is corrupt).'
+        }
+        return @{ Doc = $raw; Key = $key; Password = $vaultPwd; IsNew = $false; NeedsSave = $false }
+    }
+
+    if ([int]$raw.Version -ne 2) {
+        throw "Unsupported vault version '$($raw.Version)'."
+    }
+
+    Write-Warning 'Legacy version 2 vault detected; upgrading key derivation to PBKDF2.'
+    $legacyKey = Get-LegacyVaultAesKey -VaultPassword $vaultPwd -SaltBase64 $raw.Salt
+    $legacyValid = $false
+    $legacyProbe = $null
     try {
-        $probe = Unprotect-Secret -CipherText $raw.Check -Key $key
-        $probePlain = [Net.NetworkCredential]::new('', $probe).Password
-        if ($probePlain -ne $vaultCanary) { throw 'Vault password check failed.' }
+        $legacyProbe = Unprotect-Secret -CipherText $raw.Check -Key $legacyKey
+        $legacyValid = Test-SecretEqual -Secret $legacyProbe -Expected $vaultCanary
     } catch {
+        $legacyValid = $false
+    } finally {
+        if ($legacyProbe) { $legacyProbe.Dispose() }
+    }
+    if (-not $legacyValid) {
+        [Array]::Clear($legacyKey, 0, $legacyKey.Length)
         throw 'Wrong vault password (or vault is corrupt).'
     }
 
-    return @{ Doc = $raw; Key = $key; Password = $vaultPwd; IsNew = $false }
+    $newKey = Get-VaultAesKey -VaultPassword $vaultPwd -SaltBase64 $raw.Salt -Iterations $script:VaultKdfIterations
+    $keepNewKey = $false
+    try {
+        foreach ($account in @($raw.Accounts.Keys)) {
+            $entry = $raw.Accounts[$account]
+            if (-not $entry.EncryptedPassword) { continue }
+            $secret = Unprotect-Secret -CipherText $entry.EncryptedPassword -Key $legacyKey
+            try {
+                $entry.EncryptedPassword = Protect-Secret -Secret $secret -Key $newKey
+            } finally {
+                $secret.Dispose()
+            }
+        }
+
+        $newCheck = [System.Security.SecureString]::new()
+        try {
+            foreach ($ch in $vaultCanary.ToCharArray()) { $newCheck.AppendChar($ch) }
+            $newCheck.MakeReadOnly()
+            $raw.Check = Protect-Secret -Secret $newCheck -Key $newKey
+        } finally {
+            $newCheck.Dispose()
+        }
+        $raw.Version = 3
+        $raw.Iterations = $script:VaultKdfIterations
+        $keepNewKey = $true
+        return @{ Doc = $raw; Key = $newKey; Password = $vaultPwd; IsNew = $false; NeedsSave = $true }
+    } finally {
+        [Array]::Clear($legacyKey, 0, $legacyKey.Length)
+        if (-not $keepNewKey) { [Array]::Clear($newKey, 0, $newKey.Length) }
+    }
 }
 
 function Write-VaultAtomic {
@@ -215,7 +330,8 @@ function Write-VaultAtomic {
     $temp = "$Path.tmp"
     $Doc | Export-Clixml -Path $temp -Force
     $round = Import-Clixml -Path $temp
-    if (-not $round.Accounts -or -not $round.Check -or -not $round.Salt) {
+    if (-not $round.Accounts -or -not $round.Check -or -not $round.Salt -or
+        [int]$round.Version -ne 3 -or -not $round.Iterations) {
         Remove-Item $temp -Force -ErrorAction SilentlyContinue
         throw 'Vault integrity check failed - previous vault untouched.'
     }
@@ -418,6 +534,7 @@ function Get-SqlHostFqdn {
     if (-not (Get-Command Invoke-DbaQuery -ErrorAction SilentlyContinue)) { return $null }
 
     $fqdn = $null
+    $conn = $null
     try {
         # Machine DNS domain (not service-account DEFAULT_DOMAIN()).
         $q = @'
@@ -431,19 +548,21 @@ SELECT
     CAST(SERVERPROPERTY('MachineName') AS nvarchar(128)) AS MachineName,
     @domain AS DnsDomain;
 '@
+        $conn = Connect-SqlAuthInstance -SqlInstance $SqlInstance -SqlCredential $SqlCredential
         $p = @{
-            SqlInstance     = $SqlInstance
+            SqlInstance     = $conn
             Query           = $q
             EnableException = $true
             ErrorAction     = 'Stop'
         }
-        if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
         $row = @(Invoke-DbaQuery @p) | Select-Object -First 1
         if ($row -and $row.MachineName -and $row.DnsDomain) {
             $fqdn = '{0}.{1}' -f ([string]$row.MachineName).Trim(), ([string]$row.DnsDomain).Trim().TrimStart('.')
         }
     } catch {
         $null = $_
+    } finally {
+        Disconnect-SqlAuthInstance -Connection $conn
     }
 
     $script:SqlHostDnsCache[$SqlInstance] = $fqdn
@@ -585,6 +704,93 @@ function Get-NodeComputer {
     throw "Could not resolve computer name for $Instance"
 }
 
+function Test-SqlSspiFailure {
+    param([string]$Message)
+    [bool]($Message -match '(?i)SSPI|Kerberos|target principal name|Cannot generate SSPI context|untrusted domain|NT AUTHORITY\\ANONYMOUS LOGON')
+}
+
+function Get-SqlSspiGuidance {
+    param([string]$SqlInstance)
+    @"
+Windows authentication to SQL instance '$SqlInstance' failed because of Kerberos/SSPI.
+Check SQL service SPNs, DNS, delegation/trust, and the account running this script.
+For AG discovery, synchronization checks, and failover, pass -SqlCredential with a SQL-authenticated login.
+"@
+}
+
+function Assert-SqlCredential {
+    param([PSCredential]$SqlCredential)
+    if (-not $SqlCredential) { return }
+
+    $user = [string]$SqlCredential.UserName
+    if ([string]::IsNullOrWhiteSpace($user)) {
+        throw '-SqlCredential has an empty UserName.'
+    }
+    if ($user -match '\\') {
+        Write-Warning @"
+-SqlCredential UserName '$user' looks like Windows auth (DOMAIN\user).
+SQL authentication needs a SQL login name only (as in SSMS 'SQL Server Authentication'), e.g. 'sa' or 'sql_rotator'.
+Recreate with: `$SqlCredential = Get-Credential -UserName 'YourSqlLogin'
+"@
+    }
+}
+
+function Connect-SqlAuthInstance {
+    param(
+        [Parameter(Mandatory)][string]$SqlInstance,
+        [PSCredential]$SqlCredential
+    )
+
+    $p = @{
+        SqlInstance            = $SqlInstance
+        TrustServerCertificate = $true
+        ErrorAction            = 'Stop'
+    }
+    # Connect-DbaInstance throws by default and historically exposes
+    # -DisableException instead of the usual dbatools -EnableException.
+    $connectCommand = Get-Command Connect-DbaInstance -ErrorAction Stop
+    if ($connectCommand.Parameters.ContainsKey('EnableException')) {
+        $p.EnableException = $true
+    }
+    if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
+
+    try {
+        return Connect-DbaInstance @p
+    } catch {
+        $msg = [string]$_
+        if ($SqlCredential -and (Test-SqlSspiFailure -Message $msg)) {
+            throw @"
+-SqlCredential was supplied ('$($SqlCredential.UserName)') but the connection to '$SqlInstance' still failed with Kerberos/SSPI.
+SQL auth was not applied, or the endpoint ignored it.
+Check: UserName is a SQL login (not DOMAIN\user); SSMS SQL auth works to exactly '$SqlInstance'; login is enabled and not locked.
+Original error: $msg
+"@
+        }
+        if ($SqlCredential) {
+            throw "SQL auth connect failed for '$($SqlCredential.UserName)' @ '$SqlInstance': $msg"
+        }
+        if (Test-SqlSspiFailure -Message $msg) {
+            throw "$(Get-SqlSspiGuidance -SqlInstance $SqlInstance)`nOriginal error: $msg"
+        }
+        throw
+    }
+}
+
+function Disconnect-SqlAuthInstance {
+    param([object]$Connection)
+    if (-not $Connection) { return }
+
+    try {
+        if ($Connection.ConnectionContext) {
+            $Connection.ConnectionContext.Disconnect()
+        } elseif ($Connection -is [IDisposable]) {
+            $Connection.Dispose()
+        }
+    } catch {
+        $null = $_
+    }
+}
+
 function Get-TargetTopology {
     param(
         [string]$SqlInstance,
@@ -593,26 +799,53 @@ function Get-TargetTopology {
         [PSCredential]$Credential
     )
 
-    $agParams = @{ SqlInstance = $SqlInstance; EnableException = $true }
-    if ($SqlCredential) { $agParams.SqlCredential = $SqlCredential }
-    if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
-
     # Standalone instances throw from Get-DbaAvailabilityGroup ("HADR is not configured").
     # Treat that as Mode=Standalone. Real connection failures still bubble up.
-    $ags = @()
+    $agNames = @()
+    $replicaSql = @()
+    $originalPrimary = $null
+    $conn = $null
     try {
+        $conn = Connect-SqlAuthInstance -SqlInstance $SqlInstance -SqlCredential $SqlCredential
+        $agParams = @{
+            SqlInstance     = $conn
+            EnableException = $true
+        }
+        if ($AvailabilityGroup) { $agParams.AvailabilityGroup = $AvailabilityGroup }
+
         $ags = @(Get-DbaAvailabilityGroup @agParams)
+        if ($ags) {
+            $agNames = @($ags.Name | Select-Object -Unique)
+            $replicaSql = @(
+                $ags |
+                    ForEach-Object { $_.AvailabilityReplicas.Name } |
+                    Select-Object -Unique
+            )
+            $originalPrimary = $ags[0].PrimaryReplicaServerName
+        }
     } catch {
         $msg = [string]$_
+        if (Test-SqlSspiFailure -Message $msg) {
+            if ($SqlCredential) {
+                throw @"
+-SqlCredential was supplied ('$($SqlCredential.UserName)') but the connection to '$SqlInstance' still failed with Kerberos/SSPI.
+SQL auth was not applied, or the endpoint ignored it.
+Check: UserName is a SQL login (not DOMAIN\user); SSMS SQL auth works to exactly '$SqlInstance'; login is enabled and not locked.
+Original error: $msg
+"@
+            }
+            throw "$(Get-SqlSspiGuidance -SqlInstance $SqlInstance)`nOriginal error: $msg"
+        }
         $isNoHadr = $msg -match 'HADR|Availability Group|not configured|is not enabled'
         if (-not $isNoHadr) { throw }
         if ($AvailabilityGroup) {
             throw "Instance $SqlInstance has no HADR/AG configured, but -AvailabilityGroup was specified."
         }
-        $ags = @()
+    } finally {
+        Disconnect-SqlAuthInstance -Connection $conn
     }
 
-    if (-not $ags) {
+    if (-not $agNames) {
         $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential -SqlCredential $SqlCredential
         return [pscustomobject]@{
             Mode            = 'Standalone'
@@ -623,12 +856,6 @@ function Get-TargetTopology {
         }
     }
 
-    $agNames = @($ags.Name | Select-Object -Unique)
-    $replicaSql = @(
-        $ags |
-            ForEach-Object { $_.AvailabilityReplicas.Name } |
-            Select-Object -Unique
-    )
     if ($replicaSql.Count -lt 1) { throw "AGs found ($($agNames -join ', ')) but no replicas." }
 
     $nodes = foreach ($rep in $replicaSql) {
@@ -647,7 +874,7 @@ function Get-TargetTopology {
         SeedSqlInstance = $SqlInstance
         Nodes           = $nodes
         AgNames         = $agNames
-        OriginalPrimary = $ags[0].PrimaryReplicaServerName
+        OriginalPrimary = $originalPrimary
     }
 }
 
@@ -664,23 +891,25 @@ Install RSAT ActiveDirectory, or reset AD yourself and re-run with -SkipAdPasswo
     Import-Module ActiveDirectory -ErrorAction Stop
     $sam = $Account.Split('\')[-1]
     if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    $domain = Resolve-AdAuthDomain -Account $Account
     Unlock-AdServiceAccount -Account $Account
     Write-Host "  AD: Set-ADAccountPassword $sam" -ForegroundColor DarkCyan
-    Set-ADAccountPassword -Identity $sam -NewPassword $SecurePassword -Reset -ErrorAction Stop
+    Set-ADAccountPassword -Identity $sam -NewPassword $SecurePassword -Reset -Server $domain -ErrorAction Stop
 }
 
 function Clear-AdServiceAccountExpiration {
     param([string]$Account)
     $sam = $Account.Split('\')[-1]
     if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    $domain = Resolve-AdAuthDomain -Account $Account
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
-        $adUser = Get-ADUser -Identity $sam -Properties AccountExpirationDate -ErrorAction Stop
+        $adUser = Get-ADUser -Identity $sam -Properties AccountExpirationDate -Server $domain -ErrorAction Stop
         $exp = $adUser.AccountExpirationDate
         if ($exp -and ($exp -le (Get-Date))) {
             Write-Warning "  AD account $sam is expired (AccountExpirationDate=$exp) - Clear-ADAccountExpiration"
-            Clear-ADAccountExpiration -Identity $sam -ErrorAction Stop
+            Clear-ADAccountExpiration -Identity $sam -Server $domain -ErrorAction Stop
             Start-Sleep -Seconds 2
         }
     } catch {
@@ -692,14 +921,15 @@ function Unlock-AdServiceAccount {
     param([string]$Account)
     $sam = $Account.Split('\')[-1]
     if ($sam -match '@') { $sam = $sam.Split('@')[0] }
+    $domain = Resolve-AdAuthDomain -Account $Account
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
     Clear-AdServiceAccountExpiration -Account $Account
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
-        $adUser = Get-ADUser -Identity $sam -Properties LockedOut -ErrorAction Stop
+        $adUser = Get-ADUser -Identity $sam -Properties LockedOut -Server $domain -ErrorAction Stop
         if ($adUser.LockedOut) {
             Write-Warning "  AD account $sam is locked out - unlocking"
-            Unlock-ADAccount -Identity $sam -ErrorAction Stop
+            Unlock-ADAccount -Identity $sam -Server $domain -ErrorAction Stop
             Start-Sleep -Seconds 2
         }
     } catch {
@@ -1125,51 +1355,116 @@ function Wait-AgReady {
         [int]$TimeoutSeconds
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastSqlError = $null
     do {
+        $conn = $null
+        $ags = @()
+        $queryFailed = $false
+        $ready = $false
         try {
-            $p = @{
-                SqlInstance       = $SqlInstance
-                AvailabilityGroup = $AgNames
-                EnableException   = $true
-                WarningAction     = 'SilentlyContinue'
-                ErrorAction       = 'Stop'
+            try {
+                $conn = Connect-SqlAuthInstance -SqlInstance $SqlInstance -SqlCredential $SqlCredential
+                $p = @{
+                    SqlInstance       = $conn
+                    AvailabilityGroup = $AgNames
+                    EnableException   = $true
+                    WarningAction     = 'SilentlyContinue'
+                    ErrorAction       = 'Stop'
+                }
+                $ags = @(Get-DbaAvailabilityGroup @p)
+                $lastSqlError = $null
+            } catch {
+                $lastSqlError = [string]$_
+                if (Test-SqlSspiFailure -Message $lastSqlError) {
+                    if ($SqlCredential) {
+                        throw @"
+-SqlCredential was supplied ('$($SqlCredential.UserName)') but the connection to '$SqlInstance' still failed with Kerberos/SSPI.
+SQL auth was not applied, or the endpoint ignored it.
+Check: UserName is a SQL login (not DOMAIN\user); SSMS SQL auth works to exactly '$SqlInstance'; login is enabled and not locked.
+Original error: $lastSqlError
+"@
+                    }
+                    Write-Host "  Wait sync: $SqlInstance Windows authentication not ready (Kerberos/SSPI; retrying)" -ForegroundColor DarkYellow
+                } else {
+                    Write-Host ("  Wait sync: {0} - {1}" -f $SqlInstance, $lastSqlError.Split("`n")[0]) -ForegroundColor DarkYellow
+                }
+                $queryFailed = $true
             }
-            if ($SqlCredential) { $p.SqlCredential = $SqlCredential }
-            $ags = @(Get-DbaAvailabilityGroup @p)
-        } catch {
-            Write-Host ("  Wait sync: {0} - {1}" -f $SqlInstance, ([string]$_).Split("`n")[0]) -ForegroundColor DarkYellow
-            Start-Sleep -Seconds 5
-            continue
+
+            if (-not $queryFailed) {
+                if ($ags.Count -eq 0) {
+                    Write-Host "  Wait sync: no AG data from $SqlInstance yet" -ForegroundColor DarkYellow
+                } else {
+                    $pending = foreach ($ag in $ags) {
+                        $target = $ag.AvailabilityReplicas | Where-Object {
+                            Test-ReplicaMatch $_.Name $SecondarySqlInstance
+                        } | Select-Object -First 1
+                        if (-not $target) {
+                            [pscustomobject]@{ Ag = $ag.Name; Why = "missing $SecondarySqlInstance" }
+                            continue
+                        }
+                        $sync = [string]$target.RollupSynchronizationState
+                        $connectionState = [string]$target.ConnectionState
+                        $mode = [string]$target.AvailabilityMode
+                        $ok = ($connectionState -eq 'Connected') -and (
+                            $sync -eq 'Synchronized' -or
+                            ($mode -match 'Asynchronous' -and $sync -eq 'Synchronizing')
+                        )
+                        if (-not $ok) {
+                            [pscustomobject]@{ Ag = $ag.Name; Why = "$($target.Name) $connectionState/$sync" }
+                        }
+                    }
+                    if (-not $pending) {
+                        $ready = $true
+                    } else {
+                        Write-Host ("  Wait sync: " + (($pending | ForEach-Object {
+                                        "$($_.Ag)=$($_.Why)"
+                                    }) -join '; ')) -ForegroundColor DarkYellow
+                    }
+                }
+            }
+        } finally {
+            Disconnect-SqlAuthInstance -Connection $conn
         }
 
-        if ($ags.Count -eq 0) {
-            Write-Host "  Wait sync: no AG data from $SqlInstance yet" -ForegroundColor DarkYellow
-            Start-Sleep -Seconds 5
-            continue
-        }
-
-        $pending = foreach ($ag in $ags) {
-            $target = $ag.AvailabilityReplicas | Where-Object { Test-ReplicaMatch $_.Name $SecondarySqlInstance } | Select-Object -First 1
-            if (-not $target) {
-                [pscustomobject]@{ Ag = $ag.Name; Why = "missing $SecondarySqlInstance" }
-                continue
-            }
-            $sync = [string]$target.RollupSynchronizationState
-            $conn = [string]$target.ConnectionState
-            $mode = [string]$target.AvailabilityMode
-            $ok = ($conn -eq 'Connected') -and (
-                $sync -eq 'Synchronized' -or
-                ($mode -match 'Asynchronous' -and $sync -eq 'Synchronizing')
-            )
-            if (-not $ok) {
-                [pscustomobject]@{ Ag = $ag.Name; Why = "$($target.Name) $conn/$sync" }
-            }
-        }
-        if (-not $pending) { return }
-        Write-Host ("  Wait sync: " + (($pending | ForEach-Object { "$($_.Ag)=$($_.Why)" }) -join '; ')) -ForegroundColor DarkYellow
+        if ($ready) { return }
         Start-Sleep -Seconds 5
     } while ((Get-Date) -lt $deadline)
+    if ($lastSqlError -and (Test-SqlSspiFailure -Message $lastSqlError) -and -not $SqlCredential) {
+        throw "AG sync timeout (${TimeoutSeconds}s) waiting on $SecondarySqlInstance`n$(Get-SqlSspiGuidance -SqlInstance $SqlInstance)"
+    }
     throw "AG sync timeout (${TimeoutSeconds}s) waiting on $SecondarySqlInstance"
+}
+
+function Invoke-ConnectedAgFailover {
+    param(
+        [Parameter(Mandatory)][string]$SqlInstance,
+        [Parameter(Mandatory)][string[]]$AvailabilityGroup,
+        [PSCredential]$SqlCredential
+    )
+
+    $conn = $null
+    try {
+        $conn = Connect-SqlAuthInstance -SqlInstance $SqlInstance -SqlCredential $SqlCredential
+        Invoke-DbaAgFailover -SqlInstance $conn -AvailabilityGroup $AvailabilityGroup `
+            -Confirm:$false -EnableException | Out-Null
+    } catch {
+        $msg = [string]$_
+        if ($SqlCredential -and (Test-SqlSspiFailure -Message $msg)) {
+            throw @"
+-SqlCredential was supplied ('$($SqlCredential.UserName)') but the connection to '$SqlInstance' still failed with Kerberos/SSPI.
+SQL auth was not applied, or the endpoint ignored it.
+Check: UserName is a SQL login (not DOMAIN\user); SSMS SQL auth works to exactly '$SqlInstance'; login is enabled and not locked.
+Original error: $msg
+"@
+        }
+        if ((-not $SqlCredential) -and (Test-SqlSspiFailure -Message $msg)) {
+            throw "$(Get-SqlSspiGuidance -SqlInstance $SqlInstance)`nOriginal error: $msg"
+        }
+        throw
+    } finally {
+        Disconnect-SqlAuthInstance -Connection $conn
+    }
 }
 
 function Invoke-GracefulAgApply {
@@ -1225,12 +1520,8 @@ function Invoke-GracefulAgApply {
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
 
     Write-Host "  Failover -> $($secondary.SqlInstance)" -ForegroundColor Cyan
-    $fo = @{
-        SqlInstance = $secondary.SqlInstance; AvailabilityGroup = $AgNames
-        Confirm = $false; EnableException = $true
-    }
-    if ($SqlCredential) { $fo.SqlCredential = $SqlCredential }
-    Invoke-DbaAgFailover @fo | Out-Null
+    Invoke-ConnectedAgFailover -SqlInstance $secondary.SqlInstance `
+        -AvailabilityGroup $AgNames -SqlCredential $SqlCredential
     Start-Sleep -Seconds 3
     Wait-AgReady -SqlInstance $secondary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $primary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
@@ -1252,12 +1543,8 @@ function Invoke-GracefulAgApply {
     }
 
     Write-Host "  Failback -> $($primary.SqlInstance)" -ForegroundColor Cyan
-    $fb = @{
-        SqlInstance = $primary.SqlInstance; AvailabilityGroup = $AgNames
-        Confirm = $false; EnableException = $true
-    }
-    if ($SqlCredential) { $fb.SqlCredential = $SqlCredential }
-    Invoke-DbaAgFailover @fb | Out-Null
+    Invoke-ConnectedAgFailover -SqlInstance $primary.SqlInstance `
+        -AvailabilityGroup $AgNames -SqlCredential $SqlCredential
     Wait-AgReady -SqlInstance $primary.SqlInstance -AgNames $AgNames -SecondarySqlInstance $secondary.SqlInstance `
         -SqlCredential $SqlCredential -TimeoutSeconds $SyncTimeoutSeconds
     Write-Host "  Done. Primary restored on $($primary.SqlInstance)." -ForegroundColor Green
@@ -1303,8 +1590,8 @@ function Write-VaultHistoryCsv {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-Set-DbatoolsConfig sql.connection.encrypt $true
-Set-DbatoolsConfig sql.connection.trustcert $true
+Set-DbatoolsConfig -FullName 'sql.connection.encrypt' -Value $true
+Set-DbatoolsConfig -FullName 'sql.connection.trustcert' -Value $true
 
 if ($script:OutputFolder -match 'SERVERNAME' -or [string]::IsNullOrWhiteSpace($script:OutputFolder)) {
     throw @"
@@ -1324,6 +1611,8 @@ if (-not (Test-Path $script:OutputFolder)) {
 }
 
 $transcript = $PSCmdlet.ParameterSetName -eq 'Rotate'
+$vaultKey = $null
+$vaultPwdReady = $null
 if ($transcript) {
     Start-Transcript -Path (Join-Path $script:OutputFolder "RotateSqlServiceAccount_$timestamp.log") -NoClobber | Out-Null
 }
@@ -1340,9 +1629,13 @@ try {
 
     $opened = Invoke-WithVaultLock {
         $o = Open-PasswordVault -Path $vaultPath -VaultPassword $vaultPwdReady -Unattended:$unattend
-        if ($o.IsNew) {
+        if ($o.NeedsSave) {
             Write-VaultAtomic -Doc $o.Doc -Path $vaultPath
-            Write-Host "Vault created: $vaultPath" -ForegroundColor Cyan
+            if ($o.IsNew) {
+                Write-Host "Vault created: $vaultPath" -ForegroundColor Cyan
+            } else {
+                Write-Host "Vault upgraded to version 3 PBKDF2: $vaultPath" -ForegroundColor Cyan
+            }
         }
         $o
     }
@@ -1373,6 +1666,18 @@ try {
         Install-Module dbatools -Scope CurrentUser -Force -AllowClobber
     }
     Import-Module dbatools -ErrorAction Stop
+
+    if ($SqlCredential) {
+        Assert-SqlCredential -SqlCredential $SqlCredential
+        Write-Host "SQL authentication will be used as '$($SqlCredential.UserName)'." -ForegroundColor DarkCyan
+        $sqlProbe = $null
+        try {
+            $sqlProbe = Connect-SqlAuthInstance -SqlInstance $SqlInstance -SqlCredential $SqlCredential
+            Write-Host "SQL authentication probe succeeded for '$SqlInstance'." -ForegroundColor Green
+        } finally {
+            Disconnect-SqlAuthInstance -Connection $sqlProbe
+        }
+    }
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
         -SqlCredential $SqlCredential -Credential $Credential
@@ -1420,8 +1725,7 @@ try {
     if ($InstanceName) {
         $allServices = @(
             $allServices | Where-Object {
-                $type = [string]$_.ServiceType
-                ($type -in @('SSRS', 'SSIS')) -or ($_.InstanceName -in $InstanceName)
+                $_.InstanceName -in $InstanceName
             }
         )
     }
@@ -1621,7 +1925,7 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
                     -AccountPassword $restartPasswords
             } else {
                 if ($topo.Mode -eq 'AvailabilityGroup' -and -not $needsAgFailover) {
-                    Write-Host 'SSRS/SSIS only: restarting on all nodes (no AG failover).' -ForegroundColor Cyan
+                    Write-Host 'No Engine/Agent in restart set; restarting without AG failover.' -ForegroundColor Cyan
                 }
                 foreach ($node in $topo.Nodes) {
                     $svcCred = $null
@@ -1656,5 +1960,7 @@ then re-run with -SkipAdPasswordReset once ValidateCredentials works (to update 
     if ($anyFailures) { Write-Warning 'One or more updates failed.'; exit 1 }
     if ($skippedConflicts) { Write-Warning "$($skippedConflicts.Count) shared account(s) skipped."; exit 2 }
 } finally {
+    if ($vaultKey) { [Array]::Clear($vaultKey, 0, $vaultKey.Length) }
+    if ($vaultPwdReady) { $vaultPwdReady.Dispose() }
     if ($transcript) { Stop-Transcript | Out-Null }
 }
