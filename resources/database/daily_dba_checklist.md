@@ -67,11 +67,16 @@ This checklist outlines critical daily tasks for SQL Server Database Administrat
 ## Cloud-Specific Checks
 
 ### Azure SQL Database
-- [ ] **Azure Portal Review**
-  - Check Query Performance Insights
+- [ ] **PaaS health check (senior Cloud DBA pack)**
+  - Follow `resources/database/azure_sql_database_paas_healthcheck.md`
+  - Run `scripts/database/mssql/cloud/03_azure_sql_database_health_check.sql` in each prod DB
+  - Confirm Resource Health = Available; review Service Health for the region
+  - Check DTU/vCore: CPU, data IO, log write, workers %, sessions %, storage %
+  - Review Query Performance Insight / Query Store regressions
   - Review Automatic Tuning recommendations
-  - Verify DTU/VCore utilization
-  - Check long-term retention backup status
+  - Verify geo-replication / failover group lag vs RPO
+  - Confirm PITR earliest restore point + LTR policy as required
+  - Spot-check auditing, Defender for SQL, TDE, firewall / Private Link
 
 ### Azure SQL Managed Instance
 - [ ] **Managed Instance Health**
