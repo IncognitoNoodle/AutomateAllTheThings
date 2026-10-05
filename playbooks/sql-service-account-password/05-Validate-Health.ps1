@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Stage 05 — Validate services, AD account health, SPNs, and AG database sync.
+    Stage 05 - Validate services, AD account health, SPNs, and AG database sync.
 
 .DESCRIPTION
     Post-change verification. Confirms Engine/Agent/SSRS/SSIS are Running, domain
@@ -36,20 +36,25 @@ Start-Transcript -Path (Join-Path $OutputFolder "05-Validate_$timestamp.log") -N
 
 try {
     Import-SsaDependencies -InstallModule:$InstallModule -PreferActiveDirectory
-    Write-SsaBanner 'Stage 05 — Validate health / AG sync / SPNs'
+    Write-SsaBanner 'Stage 05 - Validate health / AG sync / SPNs'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
         -SqlCredential $SqlCredential -Credential $Credential
     Write-Host "Mode: $($topo.Mode)" -ForegroundColor Cyan
-    $topo.Nodes | Format-Table ComputerName, SqlInstance, Role -AutoSize
+    $topo.Nodes | Format-Table ComputerName, SqlInstance, Role -AutoSize | Out-Host
 
     $services = @(Get-SqlTargetService -Nodes $topo.Nodes -InstanceName $InstanceName `
             -Credential $Credential -SqlCredential $SqlCredential)
 
     Write-Host "`nService state:" -ForegroundColor Cyan
-    $services | Select-Object ComputerName, ServiceName, ServiceType, State, StartName |
+    $services |
+        Select-Object ComputerName, ServiceName,
+            @{ Name = 'ServiceType'; Expression = { [string]$_.ServiceType } },
+            @{ Name = 'State'; Expression = { [string]$_.State } },
+            StartName |
         Sort-Object ComputerName, ServiceType |
-        Format-Table -AutoSize
+        Format-Table -AutoSize |
+        Out-Host
 
     $findings = [System.Collections.Generic.List[object]]::new()
 
@@ -103,7 +108,7 @@ try {
             if (-not $dbRows) {
                 Add-SsaFinding $findings Warning AG ($topo.AgNames -join ',') 'No database replica rows returned' 'Check AG membership / permissions'
             } else {
-                $dbRows | Format-Table AvailabilityGroup, DatabaseName, Replica, SynchronizationState, SynchronizationHealth, IsSuspended -AutoSize
+                $dbRows | Format-Table AvailabilityGroup, DatabaseName, Replica, SynchronizationState, SynchronizationHealth, IsSuspended -AutoSize | Out-Host
                 foreach ($r in $dbRows) {
                     if ($r.IsSuspended) {
                         Add-SsaFinding $findings Critical AG "$($r.AvailabilityGroup)/$($r.DatabaseName)" "Suspended on $($r.Replica)" 'Resume data movement'
@@ -144,15 +149,18 @@ try {
     }
 
     Write-SsaBanner 'Validation findings'
-    $critCount = Show-SsaFindings -Findings $findings `
-        -EmptyMessage 'All checks passed. Services, AD, and AG sync look healthy.'
+    $critCount = [int](Show-SsaFindings -Findings $findings `
+            -EmptyMessage 'All checks passed. Services, AD, and AG sync look healthy.')
 
     $null = Save-SsaStageState -OutputFolder $OutputFolder -Stage '05-validate' -State ([pscustomobject]@{
             CompletedAt   = (Get-Date).ToString('o')
             Mode          = $topo.Mode
             CriticalCount = $critCount
             Findings      = @($findings)
-            Services      = @($services | Select-Object ComputerName, ServiceName, ServiceType, State, StartName)
+            Services      = @($services | Select-Object ComputerName, ServiceName,
+                @{ Name = 'ServiceType'; Expression = { [string]$_.ServiceType } },
+                @{ Name = 'State'; Expression = { [string]$_.State } },
+                StartName)
         })
 
     if ($critCount -gt 0) {

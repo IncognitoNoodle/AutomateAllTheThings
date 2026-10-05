@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Stage 02 — Reset AD password, unlock, clear expiration / never-expire, wait for node replication.
+    Stage 02 - Reset AD password, unlock, clear expiration / never-expire, wait for node replication.
 
 .DESCRIPTION
     Resets the domain password for a SQL service account (or waits only if SecOps already
@@ -60,7 +60,7 @@ Start-Transcript -Path (Join-Path $OutputFolder "02-ResetAd_$timestamp.log") -No
 
 try {
     Import-SsaDependencies -InstallModule:$InstallModule -NeedActiveDirectory
-    Write-SsaBanner 'Stage 02 — AD password reset / unlock / replication wait'
+    Write-SsaBanner 'Stage 02 - AD password reset / unlock / replication wait'
 
     $nodes = @(Resolve-SsaNodeList -ComputerName $ComputerName -OutputFolder $OutputFolder `
             -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `

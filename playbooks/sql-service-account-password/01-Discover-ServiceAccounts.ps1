@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Stage 01 — Discover SQL service accounts, service health, and SPNs (AG-aware).
+    Stage 01 - Discover SQL service accounts, service health, and SPNs (AG-aware).
 
 .DESCRIPTION
     Read-only pre-flight. Identifies domain service accounts for Engine/Agent/SSRS/SSIS
@@ -42,7 +42,7 @@ Start-Transcript -Path (Join-Path $OutputFolder "01-Discover_$timestamp.log") -N
 
 try {
     Import-SsaDependencies -InstallModule:$InstallModule -PreferActiveDirectory
-    Write-SsaBanner 'Stage 01 — Discover service accounts / health / SPNs'
+    Write-SsaBanner 'Stage 01 - Discover service accounts / health / SPNs'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
         -SqlCredential $SqlCredential -Credential $Credential
@@ -59,9 +59,14 @@ try {
     }
 
     Write-Host "`nServices (all nodes):" -ForegroundColor Cyan
-    $services | Select-Object ComputerName, ServiceName, ServiceType, State, StartMode, StartName |
+    $services |
+        Select-Object ComputerName, ServiceName,
+            @{ Name = 'ServiceType'; Expression = { [string]$_.ServiceType } },
+            @{ Name = 'State'; Expression = { [string]$_.State } },
+            StartMode, StartName |
         Sort-Object ComputerName, ServiceType, ServiceName |
-        Format-Table -AutoSize
+        Format-Table -AutoSize |
+        Out-Host
 
     $domainAccounts = @(Get-DomainSqlServiceAccount -Services $services)
     Write-Host "`nDomain AD service accounts:" -ForegroundColor Cyan
@@ -69,7 +74,8 @@ try {
         Write-Warning 'No domain AD service accounts found (local/built-in/gMSA only).'
     } else {
         $domainAccounts | Select-Object Account, ServiceTypes, ServiceCount, Computers, Services |
-            Format-Table -AutoSize
+            Format-Table -AutoSize |
+            Out-Host
     }
 
     $spnReports = [System.Collections.Generic.List[object]]::new()
@@ -167,8 +173,8 @@ try {
     }
 
     Write-SsaBanner 'Findings / recommended fixes'
-    $critCount = Show-SsaFindings -Findings $findings `
-        -EmptyMessage 'No issues found. Safe to proceed to stage 02 (AD) or 03 (apply) as planned.'
+    $critCount = [int](Show-SsaFindings -Findings $findings `
+            -EmptyMessage 'No issues found. Safe to proceed to stage 02 (AD) or 03 (apply) as planned.')
     if ($critCount -gt 0) {
         Write-Warning "$critCount critical finding(s). Resolve before stage 03/04."
     }

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Stage 03 — Apply SecOps/AD password to Windows SQL services (NoRestart).
+    Stage 03 - Apply SecOps/AD password to Windows SQL services (NoRestart).
 
 .DESCRIPTION
     Updates the service logon password cache on all topology nodes via
@@ -55,7 +55,7 @@ Start-Transcript -Path (Join-Path $OutputFolder "03-Apply_$timestamp.log") -NoCl
 
 try {
     Import-SsaDependencies -InstallModule:$InstallModule -PreferActiveDirectory
-    Write-SsaBanner 'Stage 03 — Apply service password (NoRestart)'
+    Write-SsaBanner 'Stage 03 - Apply service password (NoRestart)'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
         -SqlCredential $SqlCredential -Credential $Credential
@@ -96,18 +96,29 @@ try {
 
         foreach ($computer in @($row.Group.ComputerName | Select-Object -Unique)) {
             if (-not $ok) { break }
-            $nodeServices = @($row.Group | Where-Object ComputerName -eq $computer)
+            $nodeServices = @(
+                $row.Group |
+                    Where-Object ComputerName -eq $computer |
+                    Sort-Object @{ Expression = { Get-SsaServiceTypeRank $_.ServiceType } }, ServiceName
+            )
+            $nodeSql = $null
+            $topoNode = @($topo.Nodes | Where-Object { Test-ComputerNameMatch $_.ComputerName $computer } | Select-Object -First 1)
+            if ($topoNode) { $nodeSql = [string]$topoNode[0].SqlInstance }
             $svcCred = Get-RemoteCredential -Computer $computer -Credential $Credential
             try {
-                Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer ($(($nodeServices.ServiceName) -join ', '))" -ForegroundColor DarkCyan
-                $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred)
+                Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer ($(($nodeServices | ForEach-Object { "$($_.ServiceName)[$($_.ServiceType)]" }) -join ', '))" -ForegroundColor DarkCyan
+                $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd `
+                        -Credential $svcCred -SqlInstance $nodeSql -SqlCredential $SqlCredential)
                 $failed = @($result | Where-Object { $_.Status -eq 'Failed' })
+                $okCount = @($result | Where-Object { $_.Status -ne 'Failed' }).Count
                 if ($failed.Count -gt 0) {
-                    Write-Host "  FAILED @ ${computer}: $((($failed).Message) -join '; ')" -ForegroundColor Red
+                    Write-Host "  FAILED @ ${computer}: $((($failed | ForEach-Object { "$($_.ServiceName): $($_.Message)" }) -join '; '))" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
-                } elseif ($result.Count -eq 0) {
-                    Write-Host "  FAILED @ ${computer}: Update-DbaServiceAccount returned no result" -ForegroundColor Red
+                } elseif ($result.Count -eq 0 -or $okCount -lt $nodeServices.Count) {
+                    Write-Host "  FAILED @ ${computer}: Update-DbaServiceAccount returned incomplete result (got $($result.Count), expected $($nodeServices.Count))" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
+                } else {
+                    Write-Host "  Applied on $computer : $(($result | ForEach-Object { "$($_.ServiceName)=$($_.Status)" }) -join ', ')" -ForegroundColor Green
                 }
             } catch {
                 Write-Host "  FAILED @ ${computer}: $_" -ForegroundColor Red
@@ -123,7 +134,7 @@ try {
                     -ComputerName $accountNodes -Credential $Credential `
                     -TimeoutSeconds $NodeTimeoutSeconds -PollSeconds $NodePollSeconds
                 $updated.Add($acct)
-                Write-Host '  Service password updated; AD ready on SQL nodes (services still running — not restarted).' -ForegroundColor Green
+                Write-Host '  Service password updated; AD ready on SQL nodes (services still running - not restarted).' -ForegroundColor Green
             } catch {
                 Write-Host "  FAILED (AD wait): $_" -ForegroundColor Red
                 $ok = $false; $anyFailures = $true
@@ -154,7 +165,7 @@ try {
         exit 1
     }
 
-    Write-Host "`nNext: .\04-Restart-Services.ps1 (restart + optional AG failover — separate on purpose)" -ForegroundColor Cyan
+    Write-Host "`nNext: .\04-Restart-Services.ps1 (restart + optional AG failover - separate on purpose)" -ForegroundColor Cyan
 } finally {
     Stop-Transcript | Out-Null
 }
