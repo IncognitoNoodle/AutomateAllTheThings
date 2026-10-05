@@ -58,9 +58,13 @@ function Show-SsaFindings {
         Write-Host $EmptyMessage -ForegroundColor Green
         return 0
     }
-    $Findings | Sort-Object @{ Expression = { switch ($_.Severity) { 'Critical' { 0 } 'Warning' { 1 } default { 2 } } } }, Area, Item |
-        Format-Table Severity, Area, Item, Detail, Action -Wrap -AutoSize
-    return @($Findings | Where-Object Severity -eq 'Critical').Count
+    # Out-Host: Format-* must not enter the success stream. Assigning Format-Table
+    # to $critCount then doing $critCount -gt 0 throws NotIcomparable (FormatStartData).
+    $Findings |
+        Sort-Object @{ Expression = { switch ($_.Severity) { 'Critical' { 0 } 'Warning' { 1 } default { 2 } } } }, Area, Item |
+        Format-Table Severity, Area, Item, Detail, Action -Wrap -AutoSize |
+        Out-Host
+    return [int](@($Findings | Where-Object Severity -eq 'Critical').Count)
 }
 
 function Resolve-SsaNodeList {
@@ -1044,17 +1048,105 @@ function Resolve-AccountPasswordMap {
     $map
 }
 
-function Update-NodeServicePassword {
-    param([object[]]$Services, [securestring]$SecurePassword, [PSCredential]$Credential)
-    $p = @{
-        InputObject     = $Services
-        SecurePassword  = $SecurePassword
-        NoRestart       = $true
-        Confirm         = $false
-        EnableException = $true
+function Get-SsaServiceTypeRank {
+    param([string]$ServiceType)
+    switch ([string]$ServiceType) {
+        'Engine' { 0 }
+        'Agent' { 1 }
+        'SSRS' { 2 }
+        'SSIS' { 3 }
+        default { 9 }
     }
-    if ($Credential) { $p.Credential = $Credential }
-    Update-DbaServiceAccount @p
+}
+
+function Get-SsaRestartTypeOrder {
+    param([string[]]$Type)
+    $Type = @($Type | Where-Object { $_ } | Sort-Object -Unique)
+    $preferred = @('Engine', 'Agent', 'SSRS', 'SSIS')
+    $ordered = @($preferred | Where-Object { $_ -in $Type })
+    $ordered += @($Type | Where-Object { $_ -notin $preferred })
+    return $ordered
+}
+
+function Update-NodeServicePassword {
+    param(
+        [object[]]$Services,
+        [securestring]$SecurePassword,
+        [PSCredential]$Credential,
+        [string]$SqlInstance,
+        [PSCredential]$SqlCredential
+    )
+    # One service at a time, Engine before Agent — bulk Update-DbaServiceAccount
+    # can return empty/partial results and leave SQL Agent on the old password.
+    $ordered = @(
+        $Services | Sort-Object @{ Expression = { Get-SsaServiceTypeRank $_.ServiceType } }, ServiceName
+    )
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($svc in $ordered) {
+        $computer = [string]$svc.ComputerName
+        $svcName = [string]$svc.ServiceName
+        $svcType = [string]$svc.ServiceType
+        Initialize-DbaCmWinRm -ComputerName $computer -Credential $Credential `
+            -SqlInstance $SqlInstance -SqlCredential $SqlCredential
+
+        $updated = $false
+        $lastErr = $null
+        foreach ($t in @(Resolve-RemoteComputerTarget -ComputerName $computer `
+                    -SqlInstance $SqlInstance -SqlCredential $SqlCredential -Credential $Credential)) {
+            try {
+                # Prefer the resolved name for WinRM; keep topology ComputerName on the object.
+                $svc.ComputerName = $t
+                $p = @{
+                    InputObject     = $svc
+                    SecurePassword  = $SecurePassword
+                    NoRestart       = $true
+                    Confirm         = $false
+                    EnableException = $true
+                }
+                if ($Credential) { $p.Credential = $Credential }
+                $chunk = @(Update-DbaServiceAccount @p)
+                $svc.ComputerName = $computer
+                if ($chunk.Count -eq 0) {
+                    $lastErr = "Update-DbaServiceAccount returned no result for $svcName"
+                    Write-Host "  Update empty @ ${t}\${svcName}; trying next name..." -ForegroundColor DarkYellow
+                    continue
+                }
+                foreach ($row in $chunk) {
+                    if (-not $row.ComputerName) {
+                        $row | Add-Member -NotePropertyName ComputerName -NotePropertyValue $computer -Force
+                    } else {
+                        $row.ComputerName = $computer
+                    }
+                    $results.Add($row)
+                }
+                $updated = $true
+                Write-Host ("  Updated {0}\{1} [{2}] via {3}" -f $computer, $svcName, $svcType, $t) -ForegroundColor DarkCyan
+                break
+            } catch {
+                $svc.ComputerName = $computer
+                $lastErr = $_
+                if (Test-WinRmComputerNameFailure ([string]$_)) {
+                    Write-Host ("  Update-DbaServiceAccount WinRM failed on {0}\{1}; trying next name..." -f $t, $svcName) -ForegroundColor DarkYellow
+                    continue
+                }
+                throw
+            }
+        }
+
+        if (-not $updated) {
+            $msg = if ($lastErr) { [string]$lastErr } else { "No WinRM target worked for $computer\$svcName" }
+            $results.Add([pscustomobject]@{
+                    ComputerName = $computer
+                    ServiceName  = $svcName
+                    ServiceType  = $svcType
+                    Status       = 'Failed'
+                    Message      = $msg
+                })
+        }
+    }
+
+    return @($results)
 }
 
 function Test-RestartAuthFailure {
@@ -1064,7 +1156,19 @@ function Test-RestartAuthFailure {
             @($_.Status, $_.State, $_.Message, $_.ServiceName) -join ' '
         }
     ) -join ' | '
-    return [bool]($text -match 'authentication|logon failure|correct authentication|password|credentials|dependent service')
+    # "dependent service" is Engine-not-ready timing (Agent), not a bad password.
+    return [bool]($text -match 'authentication|logon failure|correct authentication|password|credentials')
+}
+
+function Test-RestartDependencyFailure {
+    param([object[]]$Results, [string]$ErrorText)
+    $text = @(
+        $Results | ForEach-Object {
+            @($_.Status, $_.State, $_.Message, $_.ServiceName) -join ' '
+        }
+    ) -join ' | '
+    if ($ErrorText) { $text = "$text | $ErrorText" }
+    return [bool]($text -match 'dependent service|dependency|cannot start|start pending|marked for deletion')
 }
 
 function Wait-AdAfterAuthFailure {
@@ -1097,69 +1201,97 @@ function Restart-SqlTargetService {
         [int]$RetryCount = 5,
         [int]$RetryDelaySeconds = 20
     )
-    $Type = @($Type | Sort-Object -Unique)
+    # Engine before Agent — Agent start fails while Engine is down ("dependent service").
+    $Type = @(Get-SsaRestartTypeOrder -Type $Type)
     $targets = @(Resolve-RemoteComputerTarget -ComputerName $Computer -SqlInstance $SqlInstance `
             -SqlCredential $SqlCredential -Credential $Credential)
     Initialize-DbaCmWinRm -ComputerName $Computer -Credential $Credential `
         -SqlInstance $SqlInstance -SqlCredential $SqlCredential
 
-    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
-        Write-Host ("  Restart {0} on {1} (attempt {2}/{3}; targets: {4})" -f ($Type -join '/'), $Computer, $attempt, $RetryCount, ($targets -join ', ')) -ForegroundColor Cyan
-        $result = $null
-        $lastErr = $null
-        $winRmOnlyFailures = $true
-        foreach ($t in $targets) {
-            try {
-                $p = @{
-                    ComputerName    = $t
-                    Type            = $Type
-                    Force           = $true
-                    Confirm         = $false
-                    EnableException = $true
+    foreach ($oneType in $Type) {
+        $typeDone = $false
+        for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+            Write-Host ("  Restart {0} on {1} (attempt {2}/{3}; targets: {4})" -f $oneType, $Computer, $attempt, $RetryCount, ($targets -join ', ')) -ForegroundColor Cyan
+            $result = $null
+            $lastErr = $null
+            $winRmOnlyFailures = $true
+            foreach ($t in $targets) {
+                try {
+                    $p = @{
+                        ComputerName    = $t
+                        Type            = $oneType
+                        Force           = $true
+                        Confirm         = $false
+                        EnableException = $true
+                    }
+                    if ($Credential) { $p.Credential = $Credential }
+                    $result = @(Restart-DbaService @p)
+                    $winRmOnlyFailures = $false
+                    break
+                } catch {
+                    $lastErr = $_
+                    $err = [string]$_
+                    if (Test-WinRmComputerNameFailure $err) {
+                        Write-Warning ("  Restart-DbaService WinRM failed on {0}: {1}" -f $t, $err.Split("`n")[0])
+                        continue
+                    }
+                    $winRmOnlyFailures = $false
+                    Write-Warning "  Restart-DbaService threw on ${t}: $err"
+                    if (Test-RestartDependencyFailure -Results @() -ErrorText $err) {
+                        if ($attempt -ge $RetryCount) { throw }
+                        Write-Warning "  Dependency/timing failure for $oneType — waiting before retry (not AD unlock)"
+                        Start-Sleep -Seconds $RetryDelaySeconds
+                        $result = $null
+                        break
+                    }
+                    $authFail = $err -match 'authentication|logon|password|credential'
+                    if (-not $authFail -or $attempt -ge $RetryCount) { throw }
+                    Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
+                        -Computer $Computer -Credential $Credential
+                    Start-Sleep -Seconds $RetryDelaySeconds
+                    $result = $null
+                    break
                 }
-                if ($Credential) { $p.Credential = $Credential }
-                $result = @(Restart-DbaService @p)
-                $winRmOnlyFailures = $false
-                break
-            } catch {
-                $lastErr = $_
-                $err = [string]$_
-                if (Test-WinRmComputerNameFailure $err) {
-                    Write-Warning ("  Restart-DbaService WinRM failed on {0}: {1}" -f $t, $err.Split("`n")[0])
-                    continue
-                }
-                $winRmOnlyFailures = $false
-                Write-Warning "  Restart-DbaService threw on ${t}: $err"
-                $authFail = $err -match 'authentication|logon|password|credential|dependent service'
-                if (-not $authFail -or $attempt -ge $RetryCount) { throw }
-                Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
-                    -Computer $Computer -Credential $Credential
-                Start-Sleep -Seconds $RetryDelaySeconds
-                $result = $null
+            }
+
+            if ($null -eq $result) {
+                if ($winRmOnlyFailures -and $lastErr) { throw $lastErr }
+                if ($lastErr -and $attempt -ge $RetryCount) { throw $lastErr }
+                continue
+            }
+
+            # Only Status=Failed is a hard restart failure. State may still be StartPending;
+            # Wait-SqlTargetServiceRunning below (and callers) cover readiness.
+            $bad = @($result | Where-Object { $_.Status -eq 'Failed' })
+            if (-not $bad) {
+                Wait-SqlTargetServiceRunning -Computer $Computer -SqlInstance $SqlInstance -Type $oneType `
+                    -Credential $Credential -SqlCredential $SqlCredential `
+                    -TimeoutSeconds ([Math]::Max(120, $RetryDelaySeconds * 6))
+                $typeDone = $true
                 break
             }
+
+            $names = ($bad.ServiceName) -join ', '
+            Write-Warning "  Restart failed on ${Computer}: $names ($oneType)"
+            if (Test-RestartDependencyFailure -Results $bad) {
+                if ($attempt -ge $RetryCount) {
+                    throw "Restart failed on ${Computer}: $names ($oneType) — dependency/timing"
+                }
+                Write-Warning "  Dependency/timing failure for $oneType — waiting before retry (not AD unlock)"
+                Start-Sleep -Seconds $RetryDelaySeconds
+                continue
+            }
+            if (-not (Test-RestartAuthFailure -Results $bad) -or $attempt -ge $RetryCount) {
+                throw "Restart failed on ${Computer}: $names ($oneType)"
+            }
+
+            Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
+                -Computer $Computer -Credential $Credential
+            Start-Sleep -Seconds $RetryDelaySeconds
         }
-
-        if ($null -eq $result) {
-            if ($winRmOnlyFailures -and $lastErr) { throw $lastErr }
-            if ($lastErr -and $attempt -ge $RetryCount) { throw $lastErr }
-            continue
+        if (-not $typeDone) {
+            throw "Restart did not complete for $oneType on $Computer after $RetryCount attempt(s)."
         }
-
-        $bad = @($result | Where-Object {
-                $_.Status -eq 'Failed' -or [string]$_.State -ne 'Running'
-            })
-        if (-not $bad) { return }
-
-        $names = ($bad.ServiceName) -join ', '
-        Write-Warning "  Restart failed on ${Computer}: $names"
-        if (-not (Test-RestartAuthFailure -Results $bad) -or $attempt -ge $RetryCount) {
-            throw "Restart failed on ${Computer}: $names"
-        }
-
-        Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
-            -Computer $Computer -Credential $Credential
-        Start-Sleep -Seconds $RetryDelaySeconds
     }
 }
 

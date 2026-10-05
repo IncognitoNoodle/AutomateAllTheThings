@@ -13,7 +13,8 @@ Run stages in order. If a stage fails, fix the issue and re-run that stage.
 | 05 | `05-Validate-Health.ps1` | Confirm services, AD, SPNs, AG sync |
 
 Shared code: `Common/SqlServiceAccount.Common.ps1` (dot-sourced).  
-Defaults: `Common/Config.ps1`.
+Defaults: `Common/Config.ps1`.  
+Audit log: `AUDIT.md` (IComparable / Agent restart / apply fixes).
 
 ## Requirements
 

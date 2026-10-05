@@ -96,18 +96,29 @@ try {
 
         foreach ($computer in @($row.Group.ComputerName | Select-Object -Unique)) {
             if (-not $ok) { break }
-            $nodeServices = @($row.Group | Where-Object ComputerName -eq $computer)
+            $nodeServices = @(
+                $row.Group |
+                    Where-Object ComputerName -eq $computer |
+                    Sort-Object @{ Expression = { Get-SsaServiceTypeRank $_.ServiceType } }, ServiceName
+            )
+            $nodeSql = $null
+            $topoNode = @($topo.Nodes | Where-Object { Test-ComputerNameMatch $_.ComputerName $computer } | Select-Object -First 1)
+            if ($topoNode) { $nodeSql = [string]$topoNode[0].SqlInstance }
             $svcCred = Get-RemoteCredential -Computer $computer -Credential $Credential
             try {
-                Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer ($(($nodeServices.ServiceName) -join ', '))" -ForegroundColor DarkCyan
-                $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd -Credential $svcCred)
+                Write-Host "  Update-DbaServiceAccount -NoRestart @ $computer ($(($nodeServices | ForEach-Object { "$($_.ServiceName)[$($_.ServiceType)]" }) -join ', '))" -ForegroundColor DarkCyan
+                $result = @(Update-NodeServicePassword -Services $nodeServices -SecurePassword $securePwd `
+                        -Credential $svcCred -SqlInstance $nodeSql -SqlCredential $SqlCredential)
                 $failed = @($result | Where-Object { $_.Status -eq 'Failed' })
+                $okCount = @($result | Where-Object { $_.Status -ne 'Failed' }).Count
                 if ($failed.Count -gt 0) {
-                    Write-Host "  FAILED @ ${computer}: $((($failed).Message) -join '; ')" -ForegroundColor Red
+                    Write-Host "  FAILED @ ${computer}: $((($failed | ForEach-Object { "$($_.ServiceName): $($_.Message)" }) -join '; '))" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
-                } elseif ($result.Count -eq 0) {
-                    Write-Host "  FAILED @ ${computer}: Update-DbaServiceAccount returned no result" -ForegroundColor Red
+                } elseif ($result.Count -eq 0 -or $okCount -lt $nodeServices.Count) {
+                    Write-Host "  FAILED @ ${computer}: Update-DbaServiceAccount returned incomplete result (got $($result.Count), expected $($nodeServices.Count))" -ForegroundColor Red
                     $ok = $false; $anyFailures = $true
+                } else {
+                    Write-Host "  Applied on $computer : $(($result | ForEach-Object { "$($_.ServiceName)=$($_.Status)" }) -join ', ')" -ForegroundColor Green
                 }
             } catch {
                 Write-Host "  FAILED @ ${computer}: $_" -ForegroundColor Red
