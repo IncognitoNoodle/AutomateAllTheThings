@@ -31,11 +31,11 @@ Or pass `-OutputFolder` on each run.
 ## Order of operations
 
 1. Discover and clear Critical findings.
-2. Reset AD **once**, then wait until the password works on the jump box **and every SQL node** (default poll 5 minutes — avoids lockouts).
+2. Reset AD **once**, then wait until the password works on the jump box **and every SQL node** (default poll 5 minutes - avoids lockouts).
 3. Update the service password on **all** nodes with `-NoRestart` (services keep running).
 4. Restart:
    - Standalone: restart the service types you changed.
-   - AG + Engine/Agent: restart secondary → wait sync → failover → restart old primary. Failback is off unless you ask for it.
+   - AG + Engine/Agent: restart secondary -> wait sync -> failover -> restart old primary. Failback is off unless you ask for it.
    - SSRS/SSIS only: restart those on all nodes (no failover).
 5. Validate.
 
@@ -47,18 +47,18 @@ Do not restart SQL until stage 02/03 report the new password is accepted on the 
 cd playbooks\sql-service-account-password
 $p = ConvertTo-SecureString 'NewComplexPw!' -AsPlainText -Force
 
-# 1 — inventory
+# 1 - inventory
 .\01-Discover-ServiceAccounts.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1'
 
-# 2 — AD (skip reset if SecOps already did it: add -WaitOnly)
+# 2 - AD (skip reset if SecOps already did it: add -WaitOnly)
 .\02-Reset-AdPassword.ps1 -Account 'DOMAIN\svcSql' -SecurePassword $p `
   -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' -RequireNodes
 
-# 3 — service logon cache only
+# 3 - service logon cache only
 .\03-Apply-ServicePassword.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
   -Account 'DOMAIN\svcSql' -SecurePassword $p
 
-# 4 — restart / failover
+# 4 - restart / failover
 .\04-Restart-Services.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
   -Account 'DOMAIN\svcSql' -SecurePassword $p
 
@@ -66,7 +66,7 @@ $p = ConvertTo-SecureString 'NewComplexPw!' -AsPlainText -Force
 # .\04-Restart-Services.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
 #   -FailbackOnly -OriginalPrimary 'SQL01\INST'
 
-# 5 — check
+# 5 - check
 .\05-Validate-Health.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
   -Account 'DOMAIN\svcSql'
 ```
@@ -92,8 +92,8 @@ $sql = Get-Credential -Message 'SQL login'
 ### 02 Reset AD
 - `Set-ADAccountPassword`, unlock, clear expiration, `PasswordNeverExpires` (default `$true`).
 - Waits on jump box + SQL nodes via `ValidateCredentials`.
-- `-WaitOnly` — only unlock/wait (password already set).
-- `-RequireNodes` — fail if no SQL nodes resolved.
+- `-WaitOnly` - only unlock/wait (password already set).
+- `-RequireNodes` - fail if no SQL nodes resolved.
 - `-ComputerName` optional; otherwise uses discovery JSON or `-SqlInstance` topology.
 - Writes `02-ad-latest.json`.
 
@@ -136,5 +136,5 @@ setspn -L DOMAIN\AccountSam
 ## Notes
 
 - Domain accounts only (skips LocalSystem, NT SERVICE, local users, gMSA).
-- Protect the OutputFolder share; don’t commit passwords or transcripts.
+- Protect the OutputFolder share; don't commit passwords or transcripts.
 - Older one-shot scripts: `scripts/powershell/ApplySqlServiceAccountPassword.ps1`, `RotateSqlServiceAccount.ps1`.

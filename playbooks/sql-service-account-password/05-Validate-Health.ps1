@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Stage 05 — Validate services, AD account health, SPNs, and AG database sync.
+    Stage 05 - Validate services, AD account health, SPNs, and AG database sync.
 
 .DESCRIPTION
     Post-change verification. Confirms Engine/Agent/SSRS/SSIS are Running, domain
@@ -36,7 +36,7 @@ Start-Transcript -Path (Join-Path $OutputFolder "05-Validate_$timestamp.log") -N
 
 try {
     Import-SsaDependencies -InstallModule:$InstallModule -PreferActiveDirectory
-    Write-SsaBanner 'Stage 05 — Validate health / AG sync / SPNs'
+    Write-SsaBanner 'Stage 05 - Validate health / AG sync / SPNs'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
         -SqlCredential $SqlCredential -Credential $Credential

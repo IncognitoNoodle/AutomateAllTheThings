@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
-    Stage 04 — Restart SQL services and (for AG Engine/Agent) graceful failover.
+    Stage 04 - Restart SQL services and (for AG Engine/Agent) graceful failover.
 
 .DESCRIPTION
     Separated from password apply so a failure mid-restart is recoverable without
     re-touching AD or service caches.
 
     Standalone: restart targeted types on the node.
-    AG + Engine/Agent: restart secondary → wait sync → failover → restart former
-    primary → wait sync. Failback is OFF by default. Use -Failback or -FailbackOnly.
+    AG + Engine/Agent: restart secondary -> wait sync -> failover -> restart former
+    primary -> wait sync. Failback is OFF by default. Use -Failback or -FailbackOnly.
 
     SSRS/SSIS-only: restart those types on all nodes; no AG failover.
 
@@ -75,7 +75,7 @@ Start-Transcript -Path (Join-Path $OutputFolder "04-Restart_$timestamp.log") -No
 
 try {
     Import-SsaDependencies -InstallModule:$InstallModule -PreferActiveDirectory
-    Write-SsaBanner 'Stage 04 — Restart services / graceful AG failover'
+    Write-SsaBanner 'Stage 04 - Restart services / graceful AG failover'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
         -SqlCredential $SqlCredential -Credential $Credential
@@ -102,7 +102,7 @@ try {
         $currentPrimary = $topo.OriginalPrimary
         Write-Host "FailbackOnly: target=$desired (live primary=$currentPrimary)" -ForegroundColor Cyan
         if (Test-ReplicaMatch -ReplicaName $currentPrimary -SqlInstance $desired) {
-            Write-Host "Already primary on $desired — nothing to do." -ForegroundColor Green
+            Write-Host "Already primary on $desired - nothing to do." -ForegroundColor Green
             return
         }
 
@@ -191,7 +191,7 @@ try {
             -Failback:$Failback
     } else {
         if ($topo.Mode -eq 'AvailabilityGroup' -and -not $needsAgFailover) {
-            Write-Host 'SSRS/SSIS only (or non-Engine/Agent): restarting on all nodes — no AG failover.' -ForegroundColor Cyan
+            Write-Host 'SSRS/SSIS only (or non-Engine/Agent): restarting on all nodes - no AG failover.' -ForegroundColor Cyan
         }
         foreach ($node in $topo.Nodes) {
             Restart-SqlTargetService -Computer $node.ComputerName -SqlInstance $node.SqlInstance -Type $typesToRestart `

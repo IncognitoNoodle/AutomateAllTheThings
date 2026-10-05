@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Stage 03 — Apply SecOps/AD password to Windows SQL services (NoRestart).
+    Stage 03 - Apply SecOps/AD password to Windows SQL services (NoRestart).
 
 .DESCRIPTION
     Updates the service logon password cache on all topology nodes via
@@ -55,7 +55,7 @@ Start-Transcript -Path (Join-Path $OutputFolder "03-Apply_$timestamp.log") -NoCl
 
 try {
     Import-SsaDependencies -InstallModule:$InstallModule -PreferActiveDirectory
-    Write-SsaBanner 'Stage 03 — Apply service password (NoRestart)'
+    Write-SsaBanner 'Stage 03 - Apply service password (NoRestart)'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
         -SqlCredential $SqlCredential -Credential $Credential
@@ -134,7 +134,7 @@ try {
                     -ComputerName $accountNodes -Credential $Credential `
                     -TimeoutSeconds $NodeTimeoutSeconds -PollSeconds $NodePollSeconds
                 $updated.Add($acct)
-                Write-Host '  Service password updated; AD ready on SQL nodes (services still running — not restarted).' -ForegroundColor Green
+                Write-Host '  Service password updated; AD ready on SQL nodes (services still running - not restarted).' -ForegroundColor Green
             } catch {
                 Write-Host "  FAILED (AD wait): $_" -ForegroundColor Red
                 $ok = $false; $anyFailures = $true
@@ -165,7 +165,7 @@ try {
         exit 1
     }
 
-    Write-Host "`nNext: .\04-Restart-Services.ps1 (restart + optional AG failover — separate on purpose)" -ForegroundColor Cyan
+    Write-Host "`nNext: .\04-Restart-Services.ps1 (restart + optional AG failover - separate on purpose)" -ForegroundColor Cyan
 } finally {
     Stop-Transcript | Out-Null
 }

@@ -6,9 +6,9 @@ Living audit of `playbooks/sql-service-account-password`. Updated 2026-10-05 aft
 
 | Topic | Verdict |
 |-------|---------|
-| `.psm1` vs `.ps1` | **`.ps1`** — ops runbook, not a published module |
+| `.psm1` vs `.ps1` | **`.ps1`** - ops runbook, not a published module |
 | One vs many scripts | **5 stage scripts** + shared Common + Config |
-| Apply vs restart | **Separated** (03 vs 04) — main production recovery lesson |
+| Apply vs restart | **Separated** (03 vs 04) - main production recovery lesson |
 
 ## Issues found and fixed (2026-08-24)
 
@@ -30,10 +30,10 @@ Living audit of `playbooks/sql-service-account-password`. Updated 2026-10-05 aft
 
 | # | Severity | Script | Issue | Fix |
 |---|----------|--------|-------|-----|
-| 12 | **Critical** | Common / 01 / 05 | `Show-SsaFindings` piped `Format-Table` into the success stream. `$critCount = Show-SsaFindings` then `$critCount -gt 0` threw **`NotIcomparable` / `FormatStartData`** (exactly the validate error). | `Format-Table \| Out-Host`; return `[int]` count only. Stages cast `[int](Show-SsaFindings …)`. |
-| 13 | **High** | Common | `Restart-DbaService -Type Engine,Agent` together: Agent hits **dependent service** / StartPending while Engine is down; treated as auth failure → useless AD unlock retries; Agent left stopped. | Restart **one type at a time** in order **Engine → Agent → SSRS → SSIS**; wait Running after each; dependency failures retry without AD unlock. |
-| 14 | **High** | Common / 03 | Bulk `Update-DbaServiceAccount` on Engine+Agent could return **empty/partial** results; no WinRM name fallback — password looked “applied” or failed opaquely; Agent often still on old password. | Update **per service** (Engine first); WinRM target retry like restart; synthesize Failed rows; stage 03 requires one success per service. |
-| 15 | Medium | 01 / 05 | `Sort-Object … ServiceType` on dbatools enum objects can also trip non-IComparable compares under `$ErrorActionPreference Stop`. | Project `[string]` ServiceType/State before sort/format. |
+| 12 | **Critical** | Common / 01 / 05 | `Show-SsaFindings` piped `Format-Table` into the success stream. `$critCount = Show-SsaFindings` then `$critCount -gt 0` threw **`NotIcomparable` / `FormatStartData`** (exactly the validate error). | `Format-Table \| Out-Host`; return `[int]` count only. Stages cast `[int](Show-SsaFindings ...)`. |
+| 13 | **High** | Common | `Restart-DbaService -Type Engine,Agent` together: Agent hits **dependent service** / StartPending while Engine is down; treated as auth failure -> useless AD unlock retries; Agent left stopped. | Restart **one type at a time** in order **Engine -> Agent -> SSRS -> SSIS**; wait Running after each; dependency failures retry without AD unlock. |
+| 14 | **High** | Common / 03 | Bulk `Update-DbaServiceAccount` on Engine+Agent could return **empty/partial** results; no WinRM name fallback - password looked "applied" or failed opaquely; Agent often still on old password. | Update **per service** (Engine first); WinRM target retry like restart; synthesize Failed rows; stage 03 requires one success per service. |
+| 15 | Medium | 01 / 05 | `Sort-Object ... ServiceType` on dbatools enum objects can also trip non-IComparable compares under `$ErrorActionPreference Stop`. | Project `[string]` ServiceType/State before sort/format. |
 
 ### Root cause of the validate crash
 
@@ -43,7 +43,7 @@ because it is not IComparable.
 FullyQualifiedErrorId : NotIcomparable,05-Validate-Health.ps1
 ```
 
-When stage 05 found Critical issues (e.g. Agent not Running), `Show-SsaFindings` emitted Format-* objects **and** the integer count into `$critCount`. Comparing that array with `-gt 0` compared `FormatStartData` → terminating error, masking the real findings.
+When stage 05 found Critical issues (e.g. Agent not Running), `Show-SsaFindings` emitted Format-* objects **and** the integer count into `$critCount`. Comparing that array with `-gt 0` compared `FormatStartData` -> terminating error, masking the real findings.
 
 ### SQL Agent restart
 
@@ -55,13 +55,13 @@ Stage 03 now fails closed if any service on a node is missing from Update result
 
 ## Residual risks (accepted)
 
-- Live SQL/AD/WinRM not executable in this Linux cloud agent — static audit + logic review only.
+- Live SQL/AD/WinRM not executable in this Linux cloud agent - static audit + logic review only.
 - `setspn.exe` / RSAT / dbatools required on the Windows jump box.
-- Keep node AD poll intervals ≥ 5 minutes to avoid lockouts.
+- Keep node AD poll intervals >= 5 minutes to avoid lockouts.
 - Async AG replicas report `Synchronizing` (treated as OK).
 
 ## Recommended run order
 
-`01 → 02 → 03 → 04 → 05` — resume from last successful stage after failure.
+`01 -> 02 -> 03 -> 04 -> 05` - resume from last successful stage after failure.
 
 If Agent is still down after a bad run: re-run **03** (confirm apply), then **04** with `-Account`/`-SecurePassword`, then **05**.

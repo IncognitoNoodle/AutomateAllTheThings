@@ -177,7 +177,7 @@ function Invoke-SsaGracefulAgRestart {
     Write-Host "`n=== AG graceful restart (failback default: OFF) ===" -ForegroundColor Cyan
     Write-Host "Primary:   $($primary.SqlInstance) [$($primary.ComputerName)]" -ForegroundColor Cyan
     Write-Host "Secondary: $($secondary.SqlInstance) [$($secondary.ComputerName)]" -ForegroundColor Cyan
-    Write-Host 'Order: secondary restart → sync → failover → former primary restart → sync' -ForegroundColor Yellow
+    Write-Host 'Order: secondary restart -> sync -> failover -> former primary restart -> sync' -ForegroundColor Yellow
 
     Restart-SqlTargetService -Computer $secondary.ComputerName -SqlInstance $secondary.SqlInstance -Type $ServiceType `
         -Credential (Get-RemoteCredential -Computer $secondary.ComputerName -Credential $Credential) `
@@ -1076,7 +1076,7 @@ function Update-NodeServicePassword {
         [string]$SqlInstance,
         [PSCredential]$SqlCredential
     )
-    # One service at a time, Engine before Agent — bulk Update-DbaServiceAccount
+    # One service at a time, Engine before Agent - bulk Update-DbaServiceAccount
     # can return empty/partial results and leave SQL Agent on the old password.
     $ordered = @(
         $Services | Sort-Object @{ Expression = { Get-SsaServiceTypeRank $_.ServiceType } }, ServiceName
@@ -1201,7 +1201,7 @@ function Restart-SqlTargetService {
         [int]$RetryCount = 5,
         [int]$RetryDelaySeconds = 20
     )
-    # Engine before Agent — Agent start fails while Engine is down ("dependent service").
+    # Engine before Agent - Agent start fails while Engine is down ("dependent service").
     $Type = @(Get-SsaRestartTypeOrder -Type $Type)
     $targets = @(Resolve-RemoteComputerTarget -ComputerName $Computer -SqlInstance $SqlInstance `
             -SqlCredential $SqlCredential -Credential $Credential)
@@ -1239,7 +1239,7 @@ function Restart-SqlTargetService {
                     Write-Warning "  Restart-DbaService threw on ${t}: $err"
                     if (Test-RestartDependencyFailure -Results @() -ErrorText $err) {
                         if ($attempt -ge $RetryCount) { throw }
-                        Write-Warning "  Dependency/timing failure for $oneType — waiting before retry (not AD unlock)"
+                        Write-Warning "  Dependency/timing failure for $oneType - waiting before retry (not AD unlock)"
                         Start-Sleep -Seconds $RetryDelaySeconds
                         $result = $null
                         break
@@ -1275,9 +1275,9 @@ function Restart-SqlTargetService {
             Write-Warning "  Restart failed on ${Computer}: $names ($oneType)"
             if (Test-RestartDependencyFailure -Results $bad) {
                 if ($attempt -ge $RetryCount) {
-                    throw "Restart failed on ${Computer}: $names ($oneType) — dependency/timing"
+                    throw "Restart failed on ${Computer}: $names ($oneType) - dependency/timing"
                 }
-                Write-Warning "  Dependency/timing failure for $oneType — waiting before retry (not AD unlock)"
+                Write-Warning "  Dependency/timing failure for $oneType - waiting before retry (not AD unlock)"
                 Start-Sleep -Seconds $RetryDelaySeconds
                 continue
             }

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Stage 01 — Discover SQL service accounts, service health, and SPNs (AG-aware).
+    Stage 01 - Discover SQL service accounts, service health, and SPNs (AG-aware).
 
 .DESCRIPTION
     Read-only pre-flight. Identifies domain service accounts for Engine/Agent/SSRS/SSIS
@@ -42,7 +42,7 @@ Start-Transcript -Path (Join-Path $OutputFolder "01-Discover_$timestamp.log") -N
 
 try {
     Import-SsaDependencies -InstallModule:$InstallModule -PreferActiveDirectory
-    Write-SsaBanner 'Stage 01 — Discover service accounts / health / SPNs'
+    Write-SsaBanner 'Stage 01 - Discover service accounts / health / SPNs'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
         -SqlCredential $SqlCredential -Credential $Credential
