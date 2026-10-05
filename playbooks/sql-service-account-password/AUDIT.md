@@ -34,7 +34,7 @@ Living audit of `playbooks/sql-service-account-password`. Updated 2026-10-05 aft
 | 13 | **High** | Common | `Restart-DbaService -Type Engine,Agent` together: Agent hits **dependent service** / StartPending while Engine is down; treated as auth failure -> useless AD unlock retries; Agent left stopped. | Restart **one type at a time** in order **Engine -> Agent -> SSRS -> SSIS**; wait Running after each; dependency failures retry without AD unlock. |
 | 14 | **High** | Common / 03 | Bulk `Update-DbaServiceAccount` on Engine+Agent could return **empty/partial** results; no WinRM name fallback - password looked "applied" or failed opaquely; Agent often still on old password. | Update **per service** (Engine first); WinRM target retry like restart; synthesize Failed rows; stage 03 requires one success per service. |
 | 15 | Medium | 01 / 05 | `Sort-Object ... ServiceType` on dbatools enum objects can also trip non-IComparable compares under `$ErrorActionPreference Stop`. | Project `[string]` ServiceType/State before sort/format. |
-| 16 | Medium | All | Em dashes (`-`) and arrows (`->`) in `.ps1` strings/comments showed as **`€` / `€"`** on Windows PowerShell (UTF-8 read as Windows-1252). | Replaced with ASCII `-` / `->` / `...` across playbook scripts and docs. |
+| 16 | Medium | All | Em dashes / arrows in `.ps1` strings showed as mojibake on Windows PowerShell (UTF-8 misread as Windows-1252). | Replaced with ASCII `-` / `->` / `...` across playbook scripts and docs. |
 
 ### Root cause of the validate crash
 
