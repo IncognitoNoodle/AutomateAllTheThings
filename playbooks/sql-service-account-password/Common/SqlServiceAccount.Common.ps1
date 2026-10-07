@@ -1359,7 +1359,6 @@ function Invoke-SsaServiceStartOrRestart {
     $p = @{
         ComputerName    = $ComputerTarget
         Type            = $Type
-        Force           = $true
         Confirm         = $false
         EnableException = $true
     }
