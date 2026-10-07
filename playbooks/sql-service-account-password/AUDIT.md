@@ -36,6 +36,7 @@ Living audit of `playbooks/sql-service-account-password`. Updated 2026-10-05 aft
 | 15 | Medium | 01 / 05 | `Sort-Object ... ServiceType` on dbatools enum objects can also trip non-IComparable compares under `$ErrorActionPreference Stop`. | Project `[string]` ServiceType/State before sort/format. |
 | 16 | Medium | All | Em dashes / arrows in `.ps1` strings showed as mojibake on Windows PowerShell (UTF-8 misread as Windows-1252). | Replaced with ASCII `-` / `->` / `...` across playbook scripts and docs. |
 | 17 | **High** | 01 / Common | Discover treated Stopped Engine/Agent and expired passwords as Critical and required live SQL - blocked return-to-service when VMs powered on with expired accounts. | Stopped services = Info; expired/locked = Warning -> stage 02. `-ComputerName` / SQL-unreachable offline topology via WinRM. Stage 04 skips AG failover while Offline. |
+| 18 | **High** | Common | `Restart-DbaService` on already-Stopped Engine left service Stopped (manual Start worked). Also "refused the network connection" not treated as offline SQL. | Probe state: **Start** when Stopped, **Restart** when Running; Start fallback; pass InstanceName; expand offline SQL match for connection refused. |
 
 ### Root cause of the validate crash
 
