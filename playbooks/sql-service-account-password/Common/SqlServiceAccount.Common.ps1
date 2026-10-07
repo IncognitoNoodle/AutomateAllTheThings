@@ -1533,6 +1533,7 @@ function Wait-SqlTargetServiceRunning {
     if ([string]::IsNullOrWhiteSpace($Computer)) { return }
     $Type = @($Type | Where-Object { $_ } | Sort-Object -Unique)
     if (-not $Type) { return }
+    $instanceName = Get-SsaInstanceNameFromSqlInstance -SqlInstance $SqlInstance
 
     $label = $Type -join '/'
     $targets = @(Resolve-RemoteComputerTarget -ComputerName $Computer -SqlInstance $SqlInstance `
@@ -1553,6 +1554,7 @@ function Wait-SqlTargetServiceRunning {
                     EnableException = $true
                     ErrorAction     = 'Stop'
                 }
+                if ($instanceName) { $gp.InstanceName = $instanceName }
                 if ($Credential) { $gp.Credential = $Credential }
                 $svcs = @(Get-DbaService @gp)
                 $probed = $true
