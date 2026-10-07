@@ -30,16 +30,39 @@ Or pass `-OutputFolder` on each run.
 
 ## Order of operations
 
-1. Discover and clear Critical findings.
+1. Discover (services do **not** need to be Running). Clear **Critical** findings only (disabled AD account, etc.). Stopped Engine/Agent and expired passwords are expected on return-to-service.
 2. Reset AD **once**, then wait until the password works on the jump box **and every SQL node** (default poll 5 minutes - avoids lockouts).
-3. Update the service password on **all** nodes with `-NoRestart` (services keep running).
-4. Restart:
-   - Standalone: restart the service types you changed.
-   - AG + Engine/Agent: restart secondary -> wait sync -> failover -> restart old primary. Failback is off unless you ask for it.
+3. Update the service password on **all** nodes with `-NoRestart` (works while services are Stopped).
+4. Restart / start:
+   - Standalone or offline RTS: restart the service types you changed on each node.
+   - AG + Engine/Agent (live SQL): restart secondary -> wait sync -> failover -> restart old primary. Failback is off unless you ask for it.
    - SSRS/SSIS only: restart those on all nodes (no failover).
-5. Validate.
+5. Validate (here Engine/Agent **must** be Running).
 
 Do not restart SQL until stage 02/03 report the new password is accepted on the nodes.
+
+## Return-to-service (machines just powered on, password expired)
+
+OS is up; SQL Engine/Agent stay Stopped because the domain account password/expiration blocks logon. Discover via WinRM - do not wait for SQL to be Running:
+
+```powershell
+.\01-Discover-ServiceAccounts.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
+  -ComputerName 'SQL01','SQL02'
+
+.\02-Reset-AdPassword.ps1 -Account 'DOMAIN\svcSql' -SecurePassword $p `
+  -ComputerName 'SQL01','SQL02' -RequireNodes
+
+.\03-Apply-ServicePassword.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
+  -ComputerName 'SQL01','SQL02' -Account 'DOMAIN\svcSql' -SecurePassword $p
+
+.\04-Restart-Services.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' `
+  -ComputerName 'SQL01','SQL02' -Account 'DOMAIN\svcSql' -SecurePassword $p
+
+# After Engine is up, validate live (omit -ComputerName so AG sync is checked)
+.\05-Validate-Health.ps1 -SqlInstance 'SQL01\INST' -AvailabilityGroup 'AG1' -Account 'DOMAIN\svcSql'
+```
+
+If you omit `-ComputerName` and SQL is unreachable, discover falls back to the `-SqlInstance` host only and warns you to pass every AG node explicitly.
 
 ## Examples
 
@@ -83,9 +106,12 @@ $sql = Get-Credential -Message 'SQL login'
 ## Stage reference
 
 ### 01 Discover
-- Reads Engine/Agent/SSRS/SSIS on all AG replicas (or the single instance).
+- Reads Engine/Agent/SSRS/SSIS on all AG replicas (or the single instance) via WinRM/CIM.
+- **Services need not be Running** (expired-password return-to-service supported).
+- `-ComputerName` forces offline topology when SQL is down; auto-fallback if SQL connect fails.
+- Stopped Engine/Agent = Info; password/account expired = Warning (proceed to stage 02). Disabled AD = Critical.
 - Prints domain accounts, service state, `setspn -L` output.
-- Writes `discovery-latest.json`.
+- Writes `discovery-latest.json` (includes `Offline` flag).
 - `-FailOnCritical` exits 1 if Critical findings exist.
 - `-ListOnly` prints account table only.
 
@@ -118,7 +144,8 @@ $sql = Get-Credential -Message 'SQL login'
 
 | Problem | Re-run |
 |---------|--------|
-| Bad inventory / SPN / service stopped | `01` |
+| Bad inventory / SPN / offline nodes incomplete | `01` with `-ComputerName` |
+| Machines on, SQL Stopped (expired password) | `01 -ComputerName ...` then `02 -> 03 -> 04` |
 | Nodes still reject new password | `02 -WaitOnly` |
 | Service password not updated | `03` |
 | Restart or failover incomplete | `04` |

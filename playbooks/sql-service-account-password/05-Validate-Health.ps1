@@ -18,6 +18,7 @@ param(
     [string]$SqlInstance,
 
     [string[]]$AvailabilityGroup,
+    [string[]]$ComputerName,
     [string[]]$InstanceName,
     [string[]]$Account,
     [PSCredential]$Credential,
@@ -39,9 +40,13 @@ try {
     Write-SsaBanner 'Stage 05 - Validate health / AG sync / SPNs'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
+        -ComputerName $ComputerName -OutputFolder $OutputFolder `
         -SqlCredential $SqlCredential -Credential $Credential
-    Write-Host "Mode: $($topo.Mode)" -ForegroundColor Cyan
+    Write-Host "Mode: $($topo.Mode)$(if ($topo.Offline) { ' [OFFLINE]' })" -ForegroundColor Cyan
     $topo.Nodes | Format-Table ComputerName, SqlInstance, Role -AutoSize | Out-Host
+    if ($topo.Offline) {
+        Write-Warning 'Validate ran offline (SQL still unreachable). Service Running checks use WinRM; AG sync checks are skipped until SQL is up.'
+    }
 
     $services = @(Get-SqlTargetService -Nodes $topo.Nodes -InstanceName $InstanceName `
             -Credential $Credential -SqlCredential $SqlCredential)
@@ -101,7 +106,7 @@ try {
         }
     }
 
-    if ($topo.Mode -eq 'AvailabilityGroup') {
+    if ($topo.Mode -eq 'AvailabilityGroup' -and -not $topo.Offline) {
         Write-Host "`nAG database synchronization:" -ForegroundColor Cyan
         try {
             $dbRows = @(Get-AgDatabaseSyncStatus -SqlInstance $SqlInstance -AgNames $topo.AgNames -SqlCredential $SqlCredential)
@@ -146,6 +151,9 @@ try {
         } catch {
             Add-SsaFinding $findings Critical AG ($topo.AgNames -join ',') ([string]$_) 'Fix SQL connectivity (consider -SqlCredential) and re-run'
         }
+    } elseif ($topo.Mode -eq 'AvailabilityGroup' -and $topo.Offline) {
+        Add-SsaFinding $findings Warning AG ($topo.AgNames -join ',') 'Skipped AG sync validate (topology offline)' `
+            'Re-run stage 05 without -ComputerName once Engine is Running'
     }
 
     Write-SsaBanner 'Validation findings'

@@ -19,6 +19,10 @@ param(
     [string]$SqlInstance,
 
     [string[]]$AvailabilityGroup,
+
+    # When SQL is stopped (expired password RTS), pass the same nodes as discover
+    [string[]]$ComputerName,
+
     [string[]]$InstanceName,
 
     [Parameter(Mandatory)]
@@ -58,9 +62,10 @@ try {
     Write-SsaBanner 'Stage 03 - Apply service password (NoRestart)'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
+        -ComputerName $ComputerName -OutputFolder $OutputFolder `
         -SqlCredential $SqlCredential -Credential $Credential
-    Write-Host "Mode: $($topo.Mode)" -ForegroundColor Cyan
-    $topo.Nodes | Format-Table ComputerName, SqlInstance, Role -AutoSize
+    Write-Host "Mode: $($topo.Mode)$(if ($topo.Offline) { ' [OFFLINE - apply via WinRM, SQL need not be Running]' })" -ForegroundColor Cyan
+    $topo.Nodes | Format-Table ComputerName, SqlInstance, Role -AutoSize | Out-Host
 
     $services = @(Get-SqlTargetService -Nodes $topo.Nodes -InstanceName $InstanceName `
             -Credential $Credential -SqlCredential $SqlCredential)

@@ -517,13 +517,104 @@ function Get-NodeComputer {
     throw "Could not resolve computer name for $Instance"
 }
 
+function Test-SqlOfflineMessage {
+    param([string]$Message)
+    [bool]($Message -match
+        'cannot connect|connection.*failed|network.?related|timeout|timed out|error: 40|error: 53|error: 2|' +
+        'not allow remote|login failed|unable to complete login|server is not found|does not exist|' +
+        'No connection could be made|actively refused|The wait operation timed out|' +
+        'Failed to connect|ConnectionError|physical connection is not usable|' +
+        'A network-related|Named Pipes Provider|TCP Provider|error: 0|' +
+        'The target principal name is incorrect|Cannot generate SSPI|Login timeout expired')
+}
+
+function New-SsaOfflineTopology {
+    param(
+        [string]$SqlInstance,
+        [string[]]$ComputerName,
+        [string[]]$AvailabilityGroup,
+        [string]$Reason
+    )
+
+    $computers = @($ComputerName | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Sort-Object -Unique)
+    if (-not $computers -and $SqlInstance) {
+        $computers = @(($SqlInstance.Split('\')[0]).Trim())
+    }
+    if (-not $computers) {
+        throw 'Offline topology needs -ComputerName and/or -SqlInstance (host).'
+    }
+
+    $instPart = $null
+    if ($SqlInstance -and $SqlInstance -match '\\') {
+        $instPart = $SqlInstance.Split('\')[1]
+    }
+
+    $nodes = foreach ($c in $computers) {
+        $sqlLabel = if ($instPart) {
+            '{0}\{1}' -f $c, $instPart
+        } elseif ($SqlInstance -and (Test-ComputerNameMatch -Left $c -Right ($SqlInstance.Split('\')[0]))) {
+            $SqlInstance
+        } else {
+            $c
+        }
+        [pscustomobject]@{
+            ComputerName = $c
+            SqlInstance  = $sqlLabel
+            Role         = 'Offline'
+        }
+    }
+
+    $agNames = @($AvailabilityGroup | Where-Object { $_ } | Sort-Object -Unique)
+    $mode = if ($agNames -or $nodes.Count -gt 1) { 'AvailabilityGroup' } else { 'Standalone' }
+    $primary = if ($SqlInstance) { $SqlInstance } else { [string]$nodes[0].SqlInstance }
+
+    Write-Warning ("SQL offline topology ({0}). Mode={1}; nodes={2}. Services need not be Running; WinRM/CIM used for account discovery/apply." -f `
+            $Reason, $mode, (($nodes.ComputerName) -join ', '))
+    if ($mode -eq 'AvailabilityGroup' -and $nodes.Count -lt 2) {
+        Write-Warning 'Offline AG path has fewer than 2 nodes. Pass every replica with -ComputerName so stage 03 updates all service caches.'
+    }
+
+    [pscustomobject]@{
+        Mode            = $mode
+        Nodes           = @($nodes)
+        AgNames         = $agNames
+        OriginalPrimary = $primary
+        Offline         = $true
+        OfflineReason   = $Reason
+    }
+}
+
 function Get-TargetTopology {
     param(
         [string]$SqlInstance,
         [string[]]$AvailabilityGroup,
+        [string[]]$ComputerName,
+        [string]$OutputFolder,
         [PSCredential]$SqlCredential,
-        [PSCredential]$Credential
+        [PSCredential]$Credential,
+        # When SQL Engine is stopped (expired password RTS), inventory via WinRM.
+        [switch]$AllowOffline
     )
+
+    $explicitComputers = @($ComputerName | Where-Object { $_ } | Sort-Object -Unique)
+    # -ComputerName means WinRM-only inventory (SQL may be stopped / password expired).
+    if ($explicitComputers.Count -gt 0) {
+        return New-SsaOfflineTopology -SqlInstance $SqlInstance -ComputerName $explicitComputers `
+            -AvailabilityGroup $AvailabilityGroup -Reason 'explicit -ComputerName (SQL need not be Running)'
+    }
+
+    if (-not $SqlInstance) {
+        if ($OutputFolder) {
+            $disc = Read-SsaDiscovery -OutputFolder $OutputFolder
+            if ($disc -and $disc.Nodes) {
+                return New-SsaOfflineTopology -SqlInstance ([string]$disc.OriginalPrimary) `
+                    -ComputerName @($disc.Nodes.ComputerName) `
+                    -AvailabilityGroup $(if ($AvailabilityGroup) { $AvailabilityGroup } else { @($disc.AgNames) }) `
+                    -Reason 'discovery-latest.json (no -SqlInstance)'
+            }
+        }
+        throw 'Get-TargetTopology requires -SqlInstance and/or -ComputerName.'
+    }
 
     $agParams = @{
         SqlInstance     = $SqlInstance
@@ -539,20 +630,49 @@ function Get-TargetTopology {
         $ags = @(Get-DbaAvailabilityGroup @agParams)
     } catch {
         $msg = [string]$_
-        if ($msg -notmatch 'HADR|Availability Group|not configured|is not enabled') { throw }
-        if ($AvailabilityGroup) {
-            throw "Instance $SqlInstance has no HADR/AG configured, but -AvailabilityGroup was specified."
+        if ($msg -match 'HADR|Availability Group|not configured|is not enabled') {
+            if ($AvailabilityGroup) {
+                throw "Instance $SqlInstance has no HADR/AG configured, but -AvailabilityGroup was specified."
+            }
+            $ags = @()
+        } elseif (Test-SqlOfflineMessage $msg) {
+            # Engine stopped / expired logon / network - normal return-to-service path.
+            $offlineNodes = $explicitComputers
+            if (-not $offlineNodes -and $OutputFolder) {
+                $disc = Read-SsaDiscovery -OutputFolder $OutputFolder
+                if ($disc -and $disc.Nodes) {
+                    $offlineNodes = @($disc.Nodes.ComputerName | Sort-Object -Unique)
+                    if (-not $AvailabilityGroup -and $disc.AgNames) {
+                        $AvailabilityGroup = @($disc.AgNames)
+                    }
+                }
+            }
+            if (-not $offlineNodes) { $offlineNodes = @(($SqlInstance.Split('\')[0])) }
+            return New-SsaOfflineTopology -SqlInstance $SqlInstance -ComputerName $offlineNodes `
+                -AvailabilityGroup $AvailabilityGroup -Reason ("SQL unreachable: " + $msg.Split("`n")[0])
+        } else {
+            throw
         }
-        $ags = @()
     }
 
     if (-not $ags) {
-        $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential -SqlCredential $SqlCredential
+        $computer = $null
+        try {
+            $computer = Get-NodeComputer -Instance $SqlInstance -Credential $Credential -SqlCredential $SqlCredential
+        } catch {
+            if (Test-SqlOfflineMessage ([string]$_) -or $AllowOffline -or $explicitComputers) {
+                $fallback = if ($explicitComputers) { $explicitComputers } else { @(($SqlInstance.Split('\')[0])) }
+                return New-SsaOfflineTopology -SqlInstance $SqlInstance -ComputerName $fallback `
+                    -AvailabilityGroup $AvailabilityGroup -Reason 'standalone host resolve failed; WinRM-only'
+            }
+            throw
+        }
         return [pscustomobject]@{
             Mode            = 'Standalone'
             Nodes           = @([pscustomobject]@{ ComputerName = $computer; SqlInstance = $SqlInstance; Role = 'Standalone' })
             AgNames         = @()
             OriginalPrimary = $SqlInstance
+            Offline         = $false
         }
     }
 
@@ -576,6 +696,7 @@ function Get-TargetTopology {
         Nodes           = $nodes
         AgNames         = $agNames
         OriginalPrimary = $primaryName
+        Offline         = $false
     }
 }
 
@@ -1468,6 +1589,8 @@ function Save-SsaDiscovery {
     $payload = [pscustomobject]@{
         GeneratedAt     = (Get-Date).ToString('o')
         Mode            = $Topology.Mode
+        Offline         = [bool]$Topology.Offline
+        OfflineReason   = [string]$Topology.OfflineReason
         AgNames         = @($Topology.AgNames)
         OriginalPrimary = $Topology.OriginalPrimary
         Nodes           = @($Topology.Nodes | Select-Object ComputerName, SqlInstance, Role)
