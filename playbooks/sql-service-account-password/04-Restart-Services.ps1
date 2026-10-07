@@ -28,6 +28,10 @@ param(
     [string]$SqlInstance,
 
     [string[]]$AvailabilityGroup,
+
+    # When SQL is still down pre-restart, pass nodes (or reuse discovery-latest.json)
+    [string[]]$ComputerName,
+
     [string[]]$InstanceName,
     [string[]]$Account,
     [SecureString[]]$SecurePassword,
@@ -78,13 +82,17 @@ try {
     Write-SsaBanner 'Stage 04 - Restart services / graceful AG failover'
 
     $topo = Get-TargetTopology -SqlInstance $SqlInstance -AvailabilityGroup $AvailabilityGroup `
+        -ComputerName $ComputerName -OutputFolder $OutputFolder `
         -SqlCredential $SqlCredential -Credential $Credential
-    Write-Host "Mode: $($topo.Mode)" -ForegroundColor Cyan
-    $topo.Nodes | Format-Table ComputerName, SqlInstance, Role -AutoSize
+    Write-Host "Mode: $($topo.Mode)$(if ($topo.Offline) { ' [starting from offline - restart brings Engine/Agent up]' })" -ForegroundColor Cyan
+    $topo.Nodes | Format-Table ComputerName, SqlInstance, Role -AutoSize | Out-Host
     if ($topo.AgNames) { Write-Host "AGs: $($topo.AgNames -join ', ')" -ForegroundColor Cyan }
 
     if ($FailbackOnly) {
         if ($topo.Mode -ne 'AvailabilityGroup') { throw '-FailbackOnly requires an Availability Group topology.' }
+        if ($topo.Offline) {
+            throw '-FailbackOnly needs live SQL. Omit -ComputerName and re-run after Engine is Running.'
+        }
 
         $desired = $OriginalPrimary
         if (-not $desired) {
@@ -171,7 +179,11 @@ try {
     $needsAgFailover = @($typesToRestart | Where-Object { $_ -in @('Engine', 'Agent') }).Count -gt 0
     $agResult = $null
 
-    if ($topo.Mode -eq 'AvailabilityGroup' -and $needsAgFailover) {
+    # Offline RTS: SQL was down at discover/apply - start services on every node first.
+    # AG graceful failover needs a live primary; re-run 04 later once SQL is up if needed.
+    $useGracefulAg = ($topo.Mode -eq 'AvailabilityGroup' -and $needsAgFailover -and -not $topo.Offline)
+
+    if ($useGracefulAg) {
         if ($Failback) {
             Write-Host 'Failback will run after former-primary restart (-Failback).' -ForegroundColor Yellow
         } else {
@@ -190,7 +202,9 @@ try {
             -AccountPassword $restartPasswords `
             -Failback:$Failback
     } else {
-        if ($topo.Mode -eq 'AvailabilityGroup' -and -not $needsAgFailover) {
+        if ($topo.Offline -and $needsAgFailover) {
+            Write-Host 'Offline/return-to-service: restarting Engine/Agent on ALL nodes (no AG failover until SQL is live).' -ForegroundColor Yellow
+        } elseif ($topo.Mode -eq 'AvailabilityGroup' -and -not $needsAgFailover) {
             Write-Host 'SSRS/SSIS only (or non-Engine/Agent): restarting on all nodes - no AG failover.' -ForegroundColor Cyan
         }
         foreach ($node in $topo.Nodes) {
