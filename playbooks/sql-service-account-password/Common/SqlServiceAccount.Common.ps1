@@ -519,13 +519,15 @@ function Get-NodeComputer {
 
 function Test-SqlOfflineMessage {
     param([string]$Message)
+    # Includes dbatools ConnectionError: "The remote computer refused the network connection"
     [bool]($Message -match
         'cannot connect|connection.*failed|network.?related|timeout|timed out|error: 40|error: 53|error: 2|' +
         'not allow remote|login failed|unable to complete login|server is not found|does not exist|' +
-        'No connection could be made|actively refused|The wait operation timed out|' +
-        'Failed to connect|ConnectionError|physical connection is not usable|' +
-        'A network-related|Named Pipes Provider|TCP Provider|error: 0|' +
-        'The target principal name is incorrect|Cannot generate SSPI|Login timeout expired')
+        'No connection could be made|actively refused|refused the network connection|connection refused|' +
+        'The wait operation timed out|Failed to connect|ConnectionError|physical connection is not usable|' +
+        'A network-related|Named Pipes Provider|TCP Provider|error: 0|dbatools_Get-DbaAvailabilityGroup|' +
+        'The target principal name is incorrect|Cannot generate SSPI|Login timeout expired|' +
+        'SQL Server does not exist|error 26|error 40|could not open a connection')
 }
 
 function New-SsaOfflineTopology {
@@ -1310,6 +1312,69 @@ function Wait-AdAfterAuthFailure {
     }
 }
 
+function Get-SsaInstanceNameFromSqlInstance {
+    param([string]$SqlInstance)
+    if ([string]::IsNullOrWhiteSpace($SqlInstance)) { return $null }
+    if ($SqlInstance -notmatch '\\') { return $null }
+    $name = $SqlInstance.Split('\')[-1]
+    if ([string]::IsNullOrWhiteSpace($name) -or $name -eq '.') { return $null }
+    return $name
+}
+
+function Get-SsaServiceSnapshot {
+    param(
+        [string[]]$Targets,
+        [string]$Type,
+        [string]$InstanceName,
+        [PSCredential]$Credential
+    )
+    foreach ($t in $Targets) {
+        try {
+            $gp = @{
+                ComputerName    = $t
+                Type            = $Type
+                EnableException = $true
+                ErrorAction     = 'Stop'
+            }
+            if ($InstanceName) { $gp.InstanceName = $InstanceName }
+            if ($Credential) { $gp.Credential = $Credential }
+            $svcs = @(Get-DbaService @gp)
+            return [pscustomobject]@{ Target = $t; Services = $svcs }
+        } catch {
+            if (Test-WinRmComputerNameFailure ([string]$_)) { continue }
+            throw
+        }
+    }
+    return [pscustomobject]@{ Target = $null; Services = @() }
+}
+
+function Invoke-SsaServiceStartOrRestart {
+    param(
+        [string]$ComputerTarget,
+        [string]$Type,
+        [string]$InstanceName,
+        [string]$Action, # Start | Restart
+        [PSCredential]$Credential
+    )
+    $p = @{
+        ComputerName    = $ComputerTarget
+        Type            = $Type
+        Force           = $true
+        Confirm         = $false
+        EnableException = $true
+    }
+    if ($InstanceName) { $p.InstanceName = $InstanceName }
+    if ($Credential) { $p.Credential = $Credential }
+
+    if ($Action -eq 'Start') {
+        if (-not (Get-Command Start-DbaService -ErrorAction SilentlyContinue)) {
+            throw 'Start-DbaService not found (dbatools). Cannot start Stopped SQL services.'
+        }
+        return @(Start-DbaService @p)
+    }
+    return @(Restart-DbaService @p)
+}
+
 function Restart-SqlTargetService {
     param(
         [string]$Computer,
@@ -1324,6 +1389,7 @@ function Restart-SqlTargetService {
     )
     # Engine before Agent - Agent start fails while Engine is down ("dependent service").
     $Type = @(Get-SsaRestartTypeOrder -Type $Type)
+    $instanceName = Get-SsaInstanceNameFromSqlInstance -SqlInstance $SqlInstance
     $targets = @(Resolve-RemoteComputerTarget -ComputerName $Computer -SqlInstance $SqlInstance `
             -SqlCredential $SqlCredential -Credential $Credential)
     Initialize-DbaCmWinRm -ComputerName $Computer -Credential $Credential `
@@ -1332,32 +1398,70 @@ function Restart-SqlTargetService {
     foreach ($oneType in $Type) {
         $typeDone = $false
         for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
-            Write-Host ("  Restart {0} on {1} (attempt {2}/{3}; targets: {4})" -f $oneType, $Computer, $attempt, $RetryCount, ($targets -join ', ')) -ForegroundColor Cyan
+            $snap = Get-SsaServiceSnapshot -Targets $targets -Type $oneType -InstanceName $instanceName -Credential $Credential
+            $states = @($snap.Services | ForEach-Object { "$($_.ServiceName)=$($_.State)" }) -join ', '
+            # Restart-DbaService on an already-Stopped service often leaves it Stopped (manual Start works).
+            # Return-to-service path must Start when Stopped; Restart only when Running.
+            $anyRunning = @($snap.Services | Where-Object { [string]$_.State -eq 'Running' }).Count -gt 0
+            $action = if ($anyRunning) { 'Restart' } else { 'Start' }
+            Write-Host ("  {0} {1} on {2} (attempt {3}/{4}; state: {5}; targets: {6})" -f `
+                    $action, $oneType, $Computer, $attempt, $RetryCount, $(if ($states) { $states } else { 'unknown' }), ($targets -join ', ')) -ForegroundColor Cyan
+
             $result = $null
             $lastErr = $null
             $winRmOnlyFailures = $true
+            $actionUsed = $action
             foreach ($t in $targets) {
                 try {
-                    $p = @{
-                        ComputerName    = $t
-                        Type            = $oneType
-                        Force           = $true
-                        Confirm         = $false
-                        EnableException = $true
+                    $result = @(Invoke-SsaServiceStartOrRestart -ComputerTarget $t -Type $oneType `
+                            -InstanceName $instanceName -Action $action -Credential $Credential)
+                    # If Restart reported OK but services are still Stopped, force Start once (RTS).
+                    if ($action -eq 'Restart' -and $result.Count -gt 0) {
+                        $stillStopped = @($result | Where-Object {
+                                $_.Status -ne 'Failed' -and [string]$_.State -eq 'Stopped'
+                            })
+                        if ($stillStopped.Count -gt 0) {
+                            Write-Warning ("  Restart left {0} Stopped - falling back to Start-DbaService" -f (($stillStopped.ServiceName) -join ', '))
+                            $result = @(Invoke-SsaServiceStartOrRestart -ComputerTarget $t -Type $oneType `
+                                    -InstanceName $instanceName -Action 'Start' -Credential $Credential)
+                            $actionUsed = 'Start'
+                        }
                     }
-                    if ($Credential) { $p.Credential = $Credential }
-                    $result = @(Restart-DbaService @p)
+                    if ($result.Count -eq 0) {
+                        Write-Warning ("  {0}-DbaService returned no result on {1}; trying next name / Start fallback" -f $actionUsed, $t)
+                        if ($actionUsed -eq 'Restart') {
+                            $result = @(Invoke-SsaServiceStartOrRestart -ComputerTarget $t -Type $oneType `
+                                    -InstanceName $instanceName -Action 'Start' -Credential $Credential)
+                            $actionUsed = 'Start'
+                        }
+                        if ($result.Count -eq 0) { continue }
+                    }
                     $winRmOnlyFailures = $false
+                    Write-Host ("  {0} result: {1}" -f $actionUsed, (($result | ForEach-Object { "$($_.ServiceName)=$($_.Status)/$($_.State)" }) -join ', ')) -ForegroundColor DarkCyan
                     break
                 } catch {
                     $lastErr = $_
                     $err = [string]$_
                     if (Test-WinRmComputerNameFailure $err) {
-                        Write-Warning ("  Restart-DbaService WinRM failed on {0}: {1}" -f $t, $err.Split("`n")[0])
+                        Write-Warning ("  {0}-DbaService WinRM failed on {1}: {2}" -f $actionUsed, $t, $err.Split("`n")[0])
                         continue
                     }
                     $winRmOnlyFailures = $false
-                    Write-Warning "  Restart-DbaService threw on ${t}: $err"
+                    Write-Warning ("  {0}-DbaService threw on {1}: {2}" -f $actionUsed, $t, $err)
+                    # If Restart threw because service was Stopped, retry Start on same target.
+                    if ($actionUsed -eq 'Restart' -and ($err -match 'cannot start|not started|stopped|pending')) {
+                        try {
+                            Write-Warning "  Retrying with Start-DbaService on $t"
+                            $result = @(Invoke-SsaServiceStartOrRestart -ComputerTarget $t -Type $oneType `
+                                    -InstanceName $instanceName -Action 'Start' -Credential $Credential)
+                            $actionUsed = 'Start'
+                            $winRmOnlyFailures = $false
+                            break
+                        } catch {
+                            $lastErr = $_
+                            $err = [string]$_
+                        }
+                    }
                     if (Test-RestartDependencyFailure -Results @() -ErrorText $err) {
                         if ($attempt -ge $RetryCount) { throw }
                         Write-Warning "  Dependency/timing failure for $oneType - waiting before retry (not AD unlock)"
@@ -1381,29 +1485,30 @@ function Restart-SqlTargetService {
                 continue
             }
 
-            # Only Status=Failed is a hard restart failure. State may still be StartPending;
-            # Wait-SqlTargetServiceRunning below (and callers) cover readiness.
-            $bad = @($result | Where-Object { $_.Status -eq 'Failed' })
+            $bad = @($result | Where-Object {
+                    $_.Status -eq 'Failed' -or [string]$_.State -eq 'Stopped'
+                })
             if (-not $bad) {
                 Wait-SqlTargetServiceRunning -Computer $Computer -SqlInstance $SqlInstance -Type $oneType `
                     -Credential $Credential -SqlCredential $SqlCredential `
-                    -TimeoutSeconds ([Math]::Max(120, $RetryDelaySeconds * 6))
+                    -TimeoutSeconds ([Math]::Max(180, $RetryDelaySeconds * 6))
                 $typeDone = $true
                 break
             }
 
             $names = ($bad.ServiceName) -join ', '
-            Write-Warning "  Restart failed on ${Computer}: $names ($oneType)"
+            Write-Warning ("  {0} failed on {1}: {2} ({3}) -> {4}" -f $actionUsed, $Computer, $names, $oneType, `
+                    (($bad | ForEach-Object { "$($_.Status)/$($_.State)" }) -join ', '))
             if (Test-RestartDependencyFailure -Results $bad) {
                 if ($attempt -ge $RetryCount) {
-                    throw "Restart failed on ${Computer}: $names ($oneType) - dependency/timing"
+                    throw "$actionUsed failed on ${Computer}: $names ($oneType) - dependency/timing"
                 }
                 Write-Warning "  Dependency/timing failure for $oneType - waiting before retry (not AD unlock)"
                 Start-Sleep -Seconds $RetryDelaySeconds
                 continue
             }
             if (-not (Test-RestartAuthFailure -Results $bad) -or $attempt -ge $RetryCount) {
-                throw "Restart failed on ${Computer}: $names ($oneType)"
+                throw "$actionUsed failed on ${Computer}: $names ($oneType)"
             }
 
             Wait-AdAfterAuthFailure -Account $Account -AccountPassword $AccountPassword `
@@ -1411,7 +1516,7 @@ function Restart-SqlTargetService {
             Start-Sleep -Seconds $RetryDelaySeconds
         }
         if (-not $typeDone) {
-            throw "Restart did not complete for $oneType on $Computer after $RetryCount attempt(s)."
+            throw "Start/Restart did not complete for $oneType on $Computer after $RetryCount attempt(s)."
         }
     }
 }
