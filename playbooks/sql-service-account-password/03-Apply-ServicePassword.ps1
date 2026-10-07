@@ -5,7 +5,9 @@
 .DESCRIPTION
     Updates the service logon password cache on all topology nodes via
     Update-DbaServiceAccount -NoRestart. Does NOT restart services and does NOT
-    failover. Re-validates AD on affected nodes before success. Re-run safely if interrupted.
+    failover. Works while Engine/Agent are Stopped (expired-password return-to-service).
+    Re-validates AD on affected nodes before success. Re-run safely if interrupted.
+    Pass -ComputerName when SQL is unreachable so topology comes from WinRM nodes.
 
 .EXAMPLE
     $p = ConvertTo-SecureString 'NewPw!' -AsPlainText -Force
