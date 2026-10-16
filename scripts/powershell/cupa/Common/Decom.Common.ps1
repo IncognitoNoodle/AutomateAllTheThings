@@ -211,10 +211,19 @@ function Get-DecomExpectedIp {
         return $script:DecomHostInventory[$key].ExpectedIP
     }
 
-    # Allow short-name match when inventory has short names and target is FQDN (or vice versa)
+    # Bidirectional short/FQDN match:
+    # - inventory short + lookup FQDN
+    # - inventory FQDN + lookup short / different FQDN same host
     $short = ($ServerName -split '\.')[0].ToLowerInvariant()
     if ($script:DecomHostInventory.ContainsKey($short)) {
         return $script:DecomHostInventory[$short].ExpectedIP
+    }
+
+    foreach ($entry in $script:DecomHostInventory.GetEnumerator()) {
+        $invShort = ($entry.Value.ServerName -split '\.')[0].ToLowerInvariant()
+        if ($invShort -eq $short) {
+            return $entry.Value.ExpectedIP
+        }
     }
 
     return $null
@@ -491,36 +500,53 @@ function Get-DecomDestinationPath {
 
 function Test-DecomBackupArtifact {
     <#
-    Confirms Backup-DbaDatabase left a usable file for the database under Path.
+    Confirms a usable backup file for the database.
+    Prefer an explicit FilePath from Backup-DbaDatabase; otherwise require the
+    database name in the filename (never accept an unrelated newest .bak).
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Database
+        [Parameter(Mandatory)][string]$Database,
+        [string]$FilePath
     )
+
+    if ($FilePath) {
+        if (-not (Test-Path -LiteralPath $FilePath)) {
+            return [pscustomobject]@{ Ok = $false; File = $FilePath; Length = 0; Message = "Backup file missing: $FilePath" }
+        }
+        $item = Get-Item -LiteralPath $FilePath
+        if ($item.Length -le 0) {
+            return [pscustomobject]@{ Ok = $false; File = $item.FullName; Length = 0; Message = "Backup file is empty: $($item.FullName)" }
+        }
+        return [pscustomobject]@{
+            Ok      = $true
+            File    = $item.FullName
+            Length  = $item.Length
+            Message = "Verified $($item.FullName) ($([math]::Round($item.Length / 1MB, 2)) MB)"
+        }
+    }
 
     if (-not (Test-Path -LiteralPath $Path)) {
         return [pscustomobject]@{ Ok = $false; File = $null; Length = 0; Message = "Backup path missing: $Path" }
     }
 
-    $candidates = Get-ChildItem -LiteralPath $Path -File -ErrorAction SilentlyContinue |
+    # Escape regex metacharacters in DB name for a safe wildcard-ish match via -like
+    $file = Get-ChildItem -LiteralPath $Path -File -ErrorAction SilentlyContinue |
         Where-Object {
             $_.Extension -match '\.(bak|trn|diff)$' -and
             ($_.BaseName -like "*$Database*" -or $_.Name -like "*$Database*")
         } |
-        Sort-Object LastWriteTime -Descending
-
-    $file = $candidates | Select-Object -First 1
-    if (-not $file) {
-        # Fallback: newest .bak written in the last 30 minutes
-        $file = Get-ChildItem -LiteralPath $Path -Filter *.bak -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-30) } |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-    }
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
 
     if (-not $file) {
-        return [pscustomobject]@{ Ok = $false; File = $null; Length = 0; Message = "No backup file found for '$Database' under $Path" }
+        return [pscustomobject]@{
+            Ok      = $false
+            File    = $null
+            Length  = 0
+            Message = "No backup file whose name contains '$Database' under $Path"
+        }
     }
     if ($file.Length -le 0) {
         return [pscustomobject]@{ Ok = $false; File = $file.FullName; Length = 0; Message = "Backup file is empty: $($file.FullName)" }
@@ -534,6 +560,27 @@ function Test-DecomBackupArtifact {
     }
 }
 
+function Get-DecomBackupResultPath {
+    <# Extract a concrete backup file path from Backup-DbaDatabase output. #>
+    [CmdletBinding()]
+    param($BackupResult)
+
+    foreach ($row in @($BackupResult)) {
+        foreach ($prop in @('BackupPath', 'Path', 'FullName', 'FileName', 'FileList')) {
+            $val = $row.$prop
+            if (-not $val) { continue }
+            if ($val -is [System.Array]) {
+                $first = @($val | Where-Object { $_ }) | Select-Object -First 1
+                if ($first) { return "$first" }
+            }
+            else {
+                return "$val"
+            }
+        }
+    }
+    return $null
+}
+
 function Invoke-DecomBackupWithFallback {
     [CmdletBinding()]
     param(
@@ -544,7 +591,7 @@ function Invoke-DecomBackupWithFallback {
     )
 
     try {
-        Backup-DbaDatabase `
+        $backupResult = Backup-DbaDatabase `
             -SqlInstance $SqlInstance `
             -Database $Database `
             -Path $ArchivePath `
@@ -553,9 +600,10 @@ function Invoke-DecomBackupWithFallback {
             -Checksum `
             -Verify `
             -Initialize `
-            -ErrorAction Stop | Out-Null
+            -ErrorAction Stop
 
-        $verify = Test-DecomBackupArtifact -Path $ArchivePath -Database $Database
+        $filePath = Get-DecomBackupResultPath -BackupResult $backupResult
+        $verify = Test-DecomBackupArtifact -Path $ArchivePath -Database $Database -FilePath $filePath
         if (-not $verify.Ok) { throw $verify.Message }
 
         Write-Host "[BACKUP] $Database -> $($verify.File)"
@@ -567,7 +615,7 @@ function Invoke-DecomBackupWithFallback {
         New-Item -Path $FallbackPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
 
         try {
-            Backup-DbaDatabase `
+            $backupResult = Backup-DbaDatabase `
                 -SqlInstance $SqlInstance `
                 -Database $Database `
                 -Path $FallbackPath `
@@ -576,9 +624,10 @@ function Invoke-DecomBackupWithFallback {
                 -Checksum `
                 -Verify `
                 -Initialize `
-                -ErrorAction Stop | Out-Null
+                -ErrorAction Stop
 
-            $verify = Test-DecomBackupArtifact -Path $FallbackPath -Database $Database
+            $filePath = Get-DecomBackupResultPath -BackupResult $backupResult
+            $verify = Test-DecomBackupArtifact -Path $FallbackPath -Database $Database -FilePath $filePath
             if (-not $verify.Ok) { throw $verify.Message }
 
             Write-Warning "[FALLBACK] $Database backed up locally to $($verify.File)"
@@ -1009,8 +1058,9 @@ function Get-DecomExitCode {
     [CmdletBinding()]
     param()
 
-    if ($script:DecomHadFailures) { return 1 }
+    # Preflight aborts first (documented exit 2), even though those also set HadFailures.
     if ($script:DecomPreflightHardFailures.Count -gt 0) { return 2 }
+    if ($script:DecomHadFailures) { return 1 }
     if ($script:DecomFailedServers.Count -gt 0 -or $script:DecomFailedAgs.Count -gt 0) { return 1 }
     if ($script:DecomUnreachableOrUnresolved.Count -gt 0) { return 3 }
     return 0
