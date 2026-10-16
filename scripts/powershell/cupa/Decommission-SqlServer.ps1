@@ -6,36 +6,25 @@
     Thin entry point. Shared helpers and branch pipelines live under Common\:
 
       Common\Config.ps1                  Environment defaults
-      Common\DecomHosts.csv              Source of truth: hosts + ExpectedIP
+      Common\DecomHosts.csv              Default host list (CSV)
       Common\Decom.Common.ps1            Session, backup/rename/AG-config helpers
-      Common\Decom.Resolve.ps1           Classify targets (standalone vs AG)
+      Common\Decom.Resolve.ps1           Classify hosts (standalone vs AG)
       Common\Decom.Preflight.ps1         IP validation, SQL checks, plan file
       Common\Decom.Standalone.ps1        Branch A - two-phase standalone pipeline
       Common\Decom.AvailabilityGroup.ps1 Branch B - two-phase AG pipeline
       Common\Decom.Inventory.ps1         Mark processed standalone servers inactive
 
-    Targets are read from DecomHosts.csv. Optional -Targets filters that list.
-
-    Flow:
-      1. Initialize session / dbatools / load hosts from CSV
-      2. Resolve each target -> standalone list OR AG (with discovered replicas)
-      3. Preflight: hostname/IP validation, SQL connect, write plan JSON
-      4. Stop on preflight hard failures (unless overridden)
-      5. Branch A / Branch B (skipped when -PlanOnly)
-      6. Inventory update (standalone successes only)
-      7. Summary + non-zero exit code on failures
+    Pass -HostList with a CSV or XLSX path. Every ServerName row in that file is processed.
+    There is no separate -Targets parameter.
 
 .EXAMPLE
-    # Plan every host in DecomHosts.csv
     .\Decommission-SqlServer.ps1 -RFCNumber '12345' -PlanOnly
 
 .EXAMPLE
-    # Execute full CSV list
-    .\Decommission-SqlServer.ps1 -RFCNumber '12345'
+    .\Decommission-SqlServer.ps1 -RFCNumber '12345' -HostList '.\Common\DecomHosts.csv'
 
 .EXAMPLE
-    # Optional filter: only these CSV rows
-    .\Decommission-SqlServer.ps1 -RFCNumber '12345' -Targets 'sresmsq400','srsclsq405'
+    .\Decommission-SqlServer.ps1 -RFCNumber '12345' -HostList '\\share\Decom\Wave1.xlsx'
 
 .NOTES
     See Decommission-SqlServer.md for the full process walkthrough.
@@ -47,17 +36,15 @@ param (
     [ValidatePattern('^[A-Za-z0-9_-]+$')]
     [string]$RFCNumber,
 
-    # Optional filter. Omit to process every ServerName in DecomHosts.csv.
-    [string[]]$Targets,
+    # CSV or XLSX with ServerName + ExpectedIP columns (filename or full path)
+    [Parameter(Mandatory = $false)]
+    [string]$HostList = (Join-Path $PSScriptRoot 'Common\DecomHosts.csv'),
 
     # When an instance has multiple AGs, select which one(s) to process
     [string[]]$AvailabilityGroup,
 
     # Process every AG on the instance when more than one exists
     [switch]$AllAvailabilityGroups,
-
-    # Override default Common\DecomHosts.csv (still the target source of truth)
-    [string]$HostsFile,
 
     # Additional DB names to skip (merged with Config excludes)
     [string[]]$ExcludeDatabase,
@@ -68,8 +55,7 @@ param (
     # Do not validate hostname vs ExpectedIP
     [switch]$SkipIpValidation,
 
-    # Fail preflight when a planned host is missing from DecomHosts.csv
-    # (mainly relevant if inventory was bypassed; CSV-driven runs already require membership)
+    # Fail preflight when a discovered AG replica is missing from the host list
     [switch]$RequireHostInventory,
 
     # Continue even when DNS IP does not match ExpectedIP (dangerous)
@@ -86,15 +72,26 @@ $here = $PSScriptRoot
 . (Join-Path $here 'Common\Decom.AvailabilityGroup.ps1')
 . (Join-Path $here 'Common\Decom.Inventory.ps1')
 
+# Allow bare filenames relative to the script folder or Common\
+if (-not [System.IO.Path]::IsPathRooted($HostList) -and -not (Test-Path -LiteralPath $HostList)) {
+    $candidateCommon = Join-Path $here "Common\$HostList"
+    $candidateHere   = Join-Path $here $HostList
+    if (Test-Path -LiteralPath $candidateCommon) {
+        $HostList = $candidateCommon
+    }
+    elseif (Test-Path -LiteralPath $candidateHere) {
+        $HostList = $candidateHere
+    }
+}
+
 $exitCode = 0
 
 try {
     Initialize-DecomSession `
         -RFCNumber $RFCNumber `
-        -Targets $Targets `
+        -HostList $HostList `
         -AvailabilityGroup $AvailabilityGroup `
         -AllAvailabilityGroups:$AllAvailabilityGroups `
-        -HostsFile $HostsFile `
         -ExcludeDatabase $ExcludeDatabase `
         -PlanOnly:$PlanOnly `
         -SkipIpValidation:$SkipIpValidation `
@@ -115,7 +112,6 @@ try {
         $exitCode = Get-DecomExitCode
     }
     else {
-        # ----- Pipeline branch: standalone vs AG -----
         Invoke-DecomStandalonePipeline
         Invoke-DecomAvailabilityGroupPipeline
 

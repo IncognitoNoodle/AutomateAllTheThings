@@ -10,9 +10,9 @@ Run the orchestrator only — modules under `Common\` are not meant to be invoke
 |------|------|
 | `Decommission-SqlServer.ps1` | Entry point / orchestrator |
 | `Common\Config.ps1` | Environment defaults + DB exclude list |
-| `Common\DecomHosts.csv` | **Source of truth** — hosts to decommission + ExpectedIP |
+| `Common\DecomHosts.csv` | Default host list (ServerName + ExpectedIP) |
 | `Common\Decom.Common.ps1` | Session, backup/verify, rename, rich AG config export, manifest |
-| `Common\Decom.Resolve.ps1` | Classify targets (SQL connect is the hard gate) |
+| `Common\Decom.Resolve.ps1` | Classify hosts (SQL connect is the hard gate) |
 | `Common\Decom.Preflight.ps1` | IP validation, SQL checks, plan JSON |
 | `Common\Decom.Standalone.ps1` | **Branch A** — two-phase standalone pipeline |
 | `Common\Decom.AvailabilityGroup.ps1` | **Branch B** — two-phase AG pipeline |
@@ -21,8 +21,9 @@ Run the orchestrator only — modules under `Common\` are not meant to be invoke
 ## Pipeline overview
 
 ```
-DecomHosts.csv  (ServerName + ExpectedIP)
-    |  optional -Targets filter
+-HostList path  (.csv or .xlsx)
+    ServerName + ExpectedIP rows
+    |
     v
 [Resolve]  SQL connect (ICMP is soft warning only)
     |---- multi-AG? require -AvailabilityGroup or -AllAvailabilityGroups
@@ -61,39 +62,53 @@ DecomHosts.csv  (ServerName + ExpectedIP)
                      [Summary JSON + exit code]
 ```
 
-## Host CSV = target list + IP check
+## Host list file (`-HostList`)
 
-`Common\DecomHosts.csv` is the single source of truth:
+Pass a **CSV or Excel (.xlsx)** file. Every row is a host to decommission — there is no separate `-Targets` list.
+
+```powershell
+# Default bundled list
+.\Decommission-SqlServer.ps1 -RFCNumber '45012' -PlanOnly
+
+# Explicit CSV / Excel path (or bare filename under Common\)
+.\Decommission-SqlServer.ps1 -RFCNumber '45012' -HostList '.\Common\DecomHosts.csv'
+.\Decommission-SqlServer.ps1 -RFCNumber '45012' -HostList '\\share\Decom\Wave1.xlsx'
+.\Decommission-SqlServer.ps1 -RFCNumber '45012' -HostList 'DecomHosts.csv'
+```
+
+Required columns (aliases accepted):
+
+| Logical field | Accepted column names |
+|---------------|----------------------|
+| Server name | `ServerName`, `Hostname`, `Server`, `Name` |
+| Expected IP | `ExpectedIP`, `IPAddress`, `IpAddress`, `IP` |
+
+Example CSV:
 
 ```csv
 ServerName,ExpectedIP
 sresmsq400,10.119.40.16
 srsclsq405,10.119.40.12
-...
 ```
 
-- **Default:** process every `ServerName` in the CSV (no `-Targets` needed).
-- **Optional `-Targets`:** filter to a subset; each name must exist in the CSV or the run throws.
-- **`-HostsFile`:** point at a different CSV (same columns) for another wave/RFC.
+Excel (`.xlsx`) needs the **ImportExcel** module (`Install-Module ImportExcel -Scope CurrentUser`). Otherwise save the sheet as CSV.
 
-During preflight, for every planned host (CSV target or discovered AG replica):
+### IP validation
 
-1. Look up `ExpectedIP` from the CSV (case-insensitive; FQDN matches on short name).
-2. Forward DNS (`GetHostEntry`) — resolved IPv4 list must contain `ExpectedIP`.
-3. Reverse DNS of `ExpectedIP` — best-effort confirm hostname (warning if forward OK but reverse does not).
+During preflight, for every planned host (file row or discovered AG replica):
+
+1. Look up `ExpectedIP` from the host list.
+2. Forward DNS — resolved IPv4 list must contain `ExpectedIP`.
+3. Reverse DNS of `ExpectedIP` — best-effort hostname confirm.
 
 | Status | Meaning | Default action |
 |--------|---------|----------------|
 | `Ok` | Forward + reverse agree | Continue |
 | `OkForwardOnly` | Forward matches, reverse unclear | Warning, continue |
 | `Mismatch` / `DnsFailed` | Wrong IP or DNS failure | **Hard fail** (abort) |
-| `MissingInventory` | Host not in CSV (e.g. AG replica discovered outside the list) | Warning (hard fail if `-RequireHostInventory`) |
+| `MissingInventory` | Host not in file (e.g. AG replica outside the list) | Warning (hard fail if `-RequireHostInventory`) |
 
-Overrides:
-
-- `-SkipIpValidation` — skip the DNS vs ExpectedIP check
-- `-ForceIpMismatch` — continue despite mismatch (dangerous)
-- `-HostsFile <path>` — alternate CSV (targets + IPs)
+Overrides: `-SkipIpValidation`, `-ForceIpMismatch`.
 
 ## AG configuration backup
 
@@ -121,27 +136,6 @@ If any artifact is missing/empty or JSON fails to parse, **Phase 2 does not run*
 4. Only then: remove from AG → drop secondary orphans → rename on primary.
 5. AG object + listener stay intact.
 
-## Order of operations
-
-1. **Initialize** — config, host inventory, dbatools, transcript/manifest paths.
-2. **Resolve** — SQL connect; classify standalone vs AG; expand replicas; multi-AG guard.
-3. **Preflight** — IP identity, SQL on all nodes, AG health snapshot, plan JSON.
-4. **Branch A / B** — two-phase pipelines (skipped with `-PlanOnly`).
-5. **Inventory** — `Active = 0` for fully successful standalone servers only.
-6. **Summary** — console + `DecomSummary_RFC{n}.json`; non-zero exit on failures.
-
-## Standalone vs AG branching
-
-| | Standalone (Branch A) | Availability Group (Branch B) |
-|--|----------------------|-------------------------------|
-| Detection | No AG on instance | AG(s) on instance; replicas via dbatools |
-| Work scope | That one host | Primary + every secondary node |
-| Config backup | ServerInfo.txt | Rich AgConfig JSON/TXT/SQL (gated) |
-| Backup source | The standalone instance | Primary only |
-| Cleanup | Rename after all backups OK | Remove from AG → drop orphans → rename |
-| AG object | N/A | Left intact (listener too) |
-| Inventory | Marked inactive on full success | Not marked inactive |
-
 ## Configuration
 
 Edit `Common\Config.ps1`:
@@ -151,7 +145,7 @@ $script:DecomInstanceSuffix    = '\SQL01'
 $script:DecomArchiveBasePath   = '\\ucles.internal\DBArchive'
 $script:DecomInventoryInstance = 'DBAPRDAG01\SQL01'
 $script:DecomLogDir            = 'C:\Temp\DecomLogs'
-$script:DecomHostsFile         = Join-Path $PSScriptRoot 'DecomHosts.csv'
+$script:DecomHostListPath      = Join-Path $PSScriptRoot 'DecomHosts.csv'
 $script:DecomExcludeDatabases  = @('SSISDB','distribution','ReportServer','ReportServerTempDB')
 ```
 
@@ -160,14 +154,13 @@ $script:DecomExcludeDatabases  = @('SSISDB','distribution','ReportServer','Repor
 | Parameter | Purpose |
 |-----------|---------|
 | `-RFCNumber` | Mandatory RFC token (safe charset) |
-| `-Targets` | Optional filter of CSV hosts (omit = entire CSV) |
+| `-HostList` | CSV/XLSX path or filename (default: `Common\DecomHosts.csv`) |
 | `-AvailabilityGroup` | Select AG(s) when instance has more than one |
 | `-AllAvailabilityGroups` | Process every AG on multi-AG instances |
-| `-HostsFile` | Alternate CSV (targets + ExpectedIP) |
 | `-ExcludeDatabase` | Extra DB names to skip |
 | `-PlanOnly` | Resolve + preflight + plan; no mutations |
 | `-SkipIpValidation` | Skip DNS vs ExpectedIP checks |
-| `-RequireHostInventory` | Fail if a discovered AG replica is missing from CSV |
+| `-RequireHostInventory` | Fail if a discovered AG replica is missing from the file |
 | `-ForceIpMismatch` | Continue despite IP mismatch |
 | `-WhatIf` / `-Confirm` | SupportsShouldProcess on mutating steps |
 
@@ -178,28 +171,25 @@ $script:DecomExcludeDatabases  = @('SSISDB','distribution','ReportServer','Repor
 | 0 | Success |
 | 1 | Backup/rename/AG mutate failures |
 | 2 | Preflight hard failures (IP mismatch, SQL down, etc.) |
-| 3 | Some targets unreachable/unresolved (no other hard fail) |
+| 3 | Some hosts unreachable/unresolved (no other hard fail) |
 
 ## Examples
 
 ```powershell
 cd scripts\powershell\cupa
 
-# 1) Plan every host in DecomHosts.csv (IP check included)
+# Plan every host in the default CSV
 .\Decommission-SqlServer.ps1 -RFCNumber '45012' -PlanOnly
 
-# 2) Execute the full CSV list after reviewing DecomPlan_*.json
+# Execute after reviewing DecomPlan_*.json
 .\Decommission-SqlServer.ps1 -RFCNumber '45012'
 
-# Optional: only a subset of CSV rows
-.\Decommission-SqlServer.ps1 -RFCNumber '45012' -Targets 'sresmsq400','srsclsq405'
+# Different wave file
+.\Decommission-SqlServer.ps1 -RFCNumber '45012' -HostList '\\share\Decom\RFC45012.xlsx'
 
-# Multi-AG instance (still CSV-driven; filter if needed)
+# Multi-AG instance
 .\Decommission-SqlServer.ps1 -RFCNumber '45012' `
-  -Targets 'srsclsq405' -AvailabilityGroup 'AG_APP'
-
-# Dry-run mutations for one CSV host
-.\Decommission-SqlServer.ps1 -RFCNumber '45012' -Targets 'suinfsq018' -WhatIf
+  -HostList 'DecomHosts.csv' -AvailabilityGroup 'AG_APP' -WhatIf
 ```
 
 ## Outputs

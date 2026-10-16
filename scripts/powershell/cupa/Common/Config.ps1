@@ -7,8 +7,8 @@ $script:DecomLocalBackupRoot   = 'N:\'
 $script:DecomInventoryInstance = 'DBAPRDAG01\SQL01'
 $script:DecomLogDir            = 'C:\Temp\DecomLogs'
 
-# Host inventory used for hostname <-> ExpectedIP validation (decom team list).
-$script:DecomHostsFile         = Join-Path $PSScriptRoot 'DecomHosts.csv'
+# Default host list (CSV or XLSX). Override with -HostList on the orchestrator.
+$script:DecomHostListPath      = Join-Path $PSScriptRoot 'DecomHosts.csv'
 
 # User databases never touched by backup/rename (in addition to system DBs).
 $script:DecomExcludeDatabases  = @(

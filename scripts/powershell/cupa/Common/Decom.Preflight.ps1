@@ -146,7 +146,7 @@ function Invoke-DecomPreflight {
         PreflightWarnings    = @($script:DecomPreflightWarnings)
         ExcludeDatabases     = @($script:DecomExcludeDatabases)
         ArchiveBasePath      = $script:DecomEffectiveBasePath
-        HostsFile            = $script:DecomHostsFile
+        HostList             = $script:DecomHostListPath
     }
 
     $plan | ConvertTo-Json -Depth 8 |

@@ -7,18 +7,18 @@ function Initialize-DecomSession {
     <#
     Sets run-scoped state used by resolve / preflight / standalone / AG / inventory modules.
 
-    Targets come from DecomHosts.csv by default. Optional -Targets filters that list.
+    Hosts are loaded entirely from -HostList (CSV or XLSX). There is no separate -Targets list.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [string]$RFCNumber,
 
-        [string[]]$Targets,
+        [Parameter(Mandatory)]
+        [string]$HostList,
 
         [string[]]$AvailabilityGroup,
         [switch]$AllAvailabilityGroups,
-        [string]$HostsFile,
         [string[]]$ExcludeDatabase,
         [switch]$PlanOnly,
         [switch]$SkipIpValidation,
@@ -27,6 +27,7 @@ function Initialize-DecomSession {
     )
 
     $script:DecomRFCNumber               = $RFCNumber
+    $script:DecomHostListPath            = $HostList
     $script:DecomAvailabilityGroupFilter = @($AvailabilityGroup | Where-Object { $_ })
     $script:DecomAllAvailabilityGroups   = [bool]$AllAvailabilityGroups
     $script:DecomPlanOnly                = [bool]$PlanOnly
@@ -38,10 +39,6 @@ function Initialize-DecomSession {
         $script:DecomExcludeDatabases + @($ExcludeDatabase | Where-Object { $_ }) |
             Select-Object -Unique
     )
-
-    if ($HostsFile) {
-        $script:DecomHostsFile = $HostsFile
-    }
 
     if (Test-Path $script:DecomArchiveBasePath) {
         $script:DecomEffectiveBasePath = $script:DecomArchiveBasePath
@@ -63,6 +60,7 @@ function Initialize-DecomSession {
     Start-Transcript -Path $script:DecomTranscriptPath -Append | Out-Null
 
     Write-Host "`n[INFO] Initializing for RFC $RFCNumber..." -ForegroundColor Cyan
+    Write-Host "[INFO] Host list file: $($script:DecomHostListPath)"
     if ($script:DecomPlanOnly) {
         Write-Host '[INFO] PlanOnly mode - no backups/renames/inventory updates will run.' -ForegroundColor Yellow
     }
@@ -70,8 +68,12 @@ function Initialize-DecomSession {
     Import-DecomDependencies
     Import-DecomHostInventory
 
-    $script:DecomTargets = Resolve-DecomTargetsFromInventory -Targets $Targets
-    Write-Host "[INFO] Targets ($($script:DecomTargets.Count)): $($script:DecomTargets -join ', ')"
+    $script:DecomTargets = @(
+        $script:DecomHostInventory.Values |
+            ForEach-Object { $_.ServerName } |
+            Sort-Object -Unique
+    )
+    Write-Host "[INFO] Loaded $($script:DecomTargets.Count) host(s) from file: $($script:DecomTargets -join ', ')"
 
     $script:DecomDbatoolsVersion = (Get-Module dbatools).Version.ToString()
     $script:DecomPsVersion       = $PSVersionTable.PSVersion.ToString()
@@ -93,16 +95,16 @@ function Initialize-DecomSession {
     $script:DecomHadFailures             = $false
 
     $script:DecomManifest = [ordered]@{
-        RFCNumber         = $RFCNumber
-        StartedAt         = (Get-Date -Format o)
-        RunBy             = $script:DecomRunBy
-        Targets           = $script:DecomTargets
-        PlanOnly          = $script:DecomPlanOnly
-        HostsFile         = $script:DecomHostsFile
-        ExcludeDatabases  = $script:DecomExcludeDatabases
-        Standalone        = [ordered]@{}
+        RFCNumber          = $RFCNumber
+        StartedAt          = (Get-Date -Format o)
+        RunBy              = $script:DecomRunBy
+        HostList           = $script:DecomHostListPath
+        Targets            = $script:DecomTargets
+        PlanOnly           = $script:DecomPlanOnly
+        ExcludeDatabases   = $script:DecomExcludeDatabases
+        Standalone         = [ordered]@{}
         AvailabilityGroups = [ordered]@{}
-        Steps             = [System.Collections.Generic.List[object]]::new()
+        Steps              = [System.Collections.Generic.List[object]]::new()
     }
 }
 
@@ -119,20 +121,73 @@ function Import-DecomDependencies {
     Set-DbatoolsConfig sql.connection.trustcert $true
 }
 
+function Import-DecomHostListRows {
+    <#
+    Reads a decom host list from .csv or .xlsx.
+    Required columns (aliases accepted):
+      ServerName | Hostname | Server | Name
+      ExpectedIP | IP | IPAddress | IpAddress
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Host list file not found: $Path"
+    }
+
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    switch ($ext) {
+        '.csv' {
+            return @(Import-Csv -LiteralPath $Path)
+        }
+        '.xlsx' {
+            if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+                throw @"
+Excel host list '$Path' requires the ImportExcel module.
+Install with: Install-Module ImportExcel -Scope CurrentUser
+Or save the sheet as CSV (columns ServerName, ExpectedIP) and pass that path to -HostList.
+"@
+            }
+            Import-Module ImportExcel -ErrorAction Stop
+            return @(Import-Excel -Path $Path)
+        }
+        '.xls' {
+            throw "Unsupported .xls format. Save as .xlsx or .csv and pass that path to -HostList."
+        }
+        default {
+            throw "Unsupported host list extension '$ext'. Use .csv or .xlsx."
+        }
+    }
+}
+
+function Get-DecomRowProperty {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        $prop = $Row.PSObject.Properties |
+            Where-Object { $_.Name -eq $name -or $_.Name -ieq $name } |
+            Select-Object -First 1
+        if ($prop -and "$($prop.Value)".Trim()) {
+            return "$($prop.Value)".Trim()
+        }
+    }
+    return $null
+}
+
 function Import-DecomHostInventory {
     [CmdletBinding()]
     param()
 
     $script:DecomHostInventory = @{}
 
-    if (-not $script:DecomHostsFile -or -not (Test-Path -LiteralPath $script:DecomHostsFile)) {
-        throw "Host inventory CSV not found: $($script:DecomHostsFile). Targets are loaded from this file."
-    }
-
-    $rows = Import-Csv -LiteralPath $script:DecomHostsFile
+    $rows = Import-DecomHostListRows -Path $script:DecomHostListPath
     foreach ($row in $rows) {
-        $name = "$($row.ServerName)".Trim()
-        $ip   = "$($row.ExpectedIP)".Trim()
+        $name = Get-DecomRowProperty -Row $row -Names @('ServerName', 'Hostname', 'Server', 'Name')
+        $ip   = Get-DecomRowProperty -Row $row -Names @('ExpectedIP', 'IPAddress', 'IpAddress', 'IP')
         if (-not $name -or -not $ip) { continue }
         $script:DecomHostInventory[$name.ToLowerInvariant()] = [pscustomobject]@{
             ServerName = $name
@@ -141,72 +196,10 @@ function Import-DecomHostInventory {
     }
 
     if ($script:DecomHostInventory.Count -eq 0) {
-        throw "Host inventory CSV is empty or invalid: $($script:DecomHostsFile)"
+        throw "Host list is empty or missing ServerName/ExpectedIP columns: $($script:DecomHostListPath)"
     }
 
-    Write-Host "[INFO] Loaded $($script:DecomHostInventory.Count) hosts from $($script:DecomHostsFile)"
-}
-
-function Resolve-DecomTargetsFromInventory {
-    <#
-    CSV is the source of truth for which servers to decommission.
-    - No -Targets  -> process every ServerName in DecomHosts.csv
-    - With -Targets -> treat as a filter; each name must exist in the CSV
-    #>
-    [CmdletBinding()]
-    param([string[]]$Targets)
-
-    $inventoryNames = @(
-        $script:DecomHostInventory.Values |
-            ForEach-Object { $_.ServerName } |
-            Sort-Object -Unique
-    )
-
-    $filter = @($Targets | Where-Object { $_ } | ForEach-Object { "$_".Trim() } | Select-Object -Unique)
-
-    if ($filter.Count -eq 0) {
-        Write-Host "[INFO] No -Targets supplied; using all $($inventoryNames.Count) hosts from CSV."
-        return $inventoryNames
-    }
-
-    $resolved = [System.Collections.Generic.List[string]]::new()
-    $missing  = [System.Collections.Generic.List[string]]::new()
-
-    foreach ($t in $filter) {
-        $hostPart = if ($t -match '\\') { ($t -split '\\')[0] } else { $t }
-        $key = $hostPart.ToLowerInvariant()
-        $short = ($hostPart -split '\.')[0].ToLowerInvariant()
-
-        if ($script:DecomHostInventory.ContainsKey($key)) {
-            # Preserve instance qualifier if caller passed host\instance
-            if ($t -match '\\') {
-                $invName = $script:DecomHostInventory[$key].ServerName
-                $resolved.Add("$invName\$($t.Split('\')[1])") | Out-Null
-            }
-            else {
-                $resolved.Add($script:DecomHostInventory[$key].ServerName) | Out-Null
-            }
-        }
-        elseif ($script:DecomHostInventory.ContainsKey($short)) {
-            if ($t -match '\\') {
-                $invName = $script:DecomHostInventory[$short].ServerName
-                $resolved.Add("$invName\$($t.Split('\')[1])") | Out-Null
-            }
-            else {
-                $resolved.Add($script:DecomHostInventory[$short].ServerName) | Out-Null
-            }
-        }
-        else {
-            $missing.Add($t) | Out-Null
-        }
-    }
-
-    if ($missing.Count -gt 0) {
-        throw "Target(s) not found in host inventory CSV ($($script:DecomHostsFile)): $($missing -join ', '). Add them to the CSV or omit -Targets to run the full list."
-    }
-
-    Write-Host "[INFO] -Targets filter matched $($resolved.Count) inventory host(s)."
-    return @($resolved | Select-Object -Unique)
+    Write-Host "[INFO] Loaded $($script:DecomHostInventory.Count) hosts from $($script:DecomHostListPath)"
 }
 
 function Get-DecomExpectedIp {
@@ -926,7 +919,8 @@ function Write-DecomSummary {
 
     Write-Host "`n===== SUMMARY =====" -ForegroundColor Cyan
     Write-Host "RFC                  : $($script:DecomRFCNumber)"
-    Write-Host "Targets as provided  : $($script:DecomTargets -join ', ')"
+    Write-Host "Host list file       : $($script:DecomHostListPath)"
+    Write-Host "Hosts from file      : $($script:DecomTargets -join ', ')"
     Write-Host "PlanOnly             : $($script:DecomPlanOnly)"
     Write-Host 'Unreachable/unresolved:'
     if ($script:DecomUnreachableOrUnresolved.Count -gt 0) {
