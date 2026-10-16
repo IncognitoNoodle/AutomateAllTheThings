@@ -1,7 +1,7 @@
 @{
     RootModule        = 'SqlDecom.psm1'
     ModuleVersion     = '1.0.0'
-    GUID              = 'a3c8e2f1-9b4d-4e7a-8c21-decom001cupa'
+    GUID              = 'fa398924-aefb-420e-b653-82454779e4ee'
     Author            = 'CUPA DBA Automation'
     CompanyName       = 'CUPA'
     Description       = 'SQL Server decommission playbook module (standalone + Availability Group).'

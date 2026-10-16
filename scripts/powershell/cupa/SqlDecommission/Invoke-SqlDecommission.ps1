@@ -49,29 +49,46 @@ Import-Module (Join-Path $here 'module\SqlDecom.psd1') -Force
 if (-not $HostList) {
     $HostList = Join-Path $here 'config\hosts.csv'
 }
+else {
+    # Resolve relative / legacy bare names only — never silently substitute
+    # config\hosts.csv when the caller passed an explicit missing path.
+    $originalHostList = $HostList
+    if (-not (Test-Path -LiteralPath $HostList)) {
+        $leaf = [System.IO.Path]::GetFileName($HostList)
+        $isBareOrLegacyName = -not [System.IO.Path]::IsPathRooted($HostList) -or
+            ($leaf -match '^(?i)(DecomHosts|hosts)\.csv$')
 
-# Resolve relative / legacy paths (pre-refactor Common\DecomHosts.csv names)
-if (-not (Test-Path -LiteralPath $HostList)) {
-    $leaf = [System.IO.Path]::GetFileName($HostList)
-    # Old inventory filename -> current config\hosts.csv
-    if ($leaf -match '^(?i)DecomHosts\.csv$') {
-        $leaf = 'hosts.csv'
-    }
+        $candidates = @()
+        if (-not [System.IO.Path]::IsPathRooted($originalHostList)) {
+            $candidates += (Join-Path $here $originalHostList)
+            $candidates += (Join-Path $here "config\$leaf")
+            $candidates += (Join-Path $here $leaf)
+        }
+        # Legacy inventory filename only
+        if ($leaf -match '^(?i)DecomHosts\.csv$') {
+            $candidates += (Join-Path $here 'config\hosts.csv')
+        }
 
-    $candidates = @(
-        (Join-Path $here $HostList)
-        (Join-Path $here "config\$leaf")
-        (Join-Path $here $leaf)
-        (Join-Path $here "config\hosts.csv")
-    )
+        $resolved = $null
+        foreach ($candidate in ($candidates | Select-Object -Unique)) {
+            if (Test-Path -LiteralPath $candidate) {
+                $resolved = $candidate
+                break
+            }
+        }
 
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate) {
-            Write-Host "[INFO] Resolved -HostList '$HostList' -> $candidate"
-            $HostList = $candidate
-            break
+        if ($resolved) {
+            Write-Host "[INFO] Resolved -HostList '$originalHostList' -> $resolved"
+            $HostList = $resolved
+        }
+        elseif (-not $isBareOrLegacyName -or [System.IO.Path]::IsPathRooted($originalHostList)) {
+            throw "Host list not found: $originalHostList"
         }
     }
+}
+
+if (-not (Test-Path -LiteralPath $HostList)) {
+    throw "Host list not found: $HostList"
 }
 
 $exitCode = 0
