@@ -3,22 +3,22 @@
     CUPA SQL Server decommission orchestrator.
 
 .DESCRIPTION
-    Production entry point for the sql-decommission playbook.
+    Production entry point for the SqlDecommission playbook.
 
     Project layout:
-      config/     defaults + host list (CSV/XLSX)
-      module/     sql-decom PowerShell module (public/ + private/)
-      docs/       process + architecture
-      tests/      Pester stubs
+      config/              defaults + host list (CSV/XLSX)
+      module/SqlDecom.*    PowerShell module (Public/ + Private/)
+      docs/                process + architecture
+      tests/               Pester stubs
 
 .EXAMPLE
-    .\invoke-sql-decommission.ps1 -RFCNumber '45012' -PlanOnly
+    .\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -PlanOnly
 
 .EXAMPLE
-    .\invoke-sql-decommission.ps1 -RFCNumber '45012' -HostList '.\config\hosts.csv'
+    .\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -HostList '.\config\hosts.csv'
 
 .EXAMPLE
-    .\invoke-sql-decommission.ps1 -RFCNumber '45012' -HostList '\\share\Decom\Wave1.xlsx'
+    .\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -HostList '\\share\Decom\Wave1.xlsx'
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -43,22 +43,34 @@ param (
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 
-Import-Module (Join-Path $here 'module\sql-decom.psd1') -Force
+Import-Module (Join-Path $here 'module\SqlDecom.psd1') -Force
 
 # Default host list from project config when -HostList omitted
 if (-not $HostList) {
     $HostList = Join-Path $here 'config\hosts.csv'
 }
 
-# Allow bare filenames relative to project root or config\
-if (-not [System.IO.Path]::IsPathRooted($HostList) -and -not (Test-Path -LiteralPath $HostList)) {
-    $candidateConfig = Join-Path $here "config\$HostList"
-    $candidateHere   = Join-Path $here $HostList
-    if (Test-Path -LiteralPath $candidateConfig) {
-        $HostList = $candidateConfig
+# Resolve relative / legacy paths (pre-refactor Common\DecomHosts.csv names)
+if (-not (Test-Path -LiteralPath $HostList)) {
+    $leaf = [System.IO.Path]::GetFileName($HostList)
+    # Old inventory filename -> current config\hosts.csv
+    if ($leaf -match '^(?i)DecomHosts\.csv$') {
+        $leaf = 'hosts.csv'
     }
-    elseif (Test-Path -LiteralPath $candidateHere) {
-        $HostList = $candidateHere
+
+    $candidates = @(
+        (Join-Path $here $HostList)
+        (Join-Path $here "config\$leaf")
+        (Join-Path $here $leaf)
+        (Join-Path $here "config\hosts.csv")
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            Write-Host "[INFO] Resolved -HostList '$HostList' -> $candidate"
+            $HostList = $candidate
+            break
+        }
     }
 }
 

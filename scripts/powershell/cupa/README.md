@@ -1,7 +1,7 @@
 # CUPA PowerShell playbooks
 
-| Playbook | Path |
-|----------|------|
-| SQL decommission | [`sql-decommission/`](sql-decommission/) |
+| Playbook | Entry |
+|----------|-------|
+| SQL decommission | [`SqlDecommission/Invoke-SqlDecommission.ps1`](SqlDecommission/Invoke-SqlDecommission.ps1) |
 
-Org PowerShell template: [`../../../templates/powershell-project/`](../../../templates/powershell-project/).
+Org template: [`../../../templates/PowerShellProject/`](../../../templates/PowerShellProject/)
