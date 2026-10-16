@@ -6,13 +6,14 @@
 function Initialize-DecomSession {
     <#
     Sets run-scoped state used by resolve / preflight / standalone / AG / inventory modules.
+
+    Targets come from DecomHosts.csv by default. Optional -Targets filters that list.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [string]$RFCNumber,
 
-        [Parameter(Mandatory)]
         [string[]]$Targets,
 
         [string[]]$AvailabilityGroup,
@@ -25,14 +26,13 @@ function Initialize-DecomSession {
         [switch]$ForceIpMismatch
     )
 
-    $script:DecomRFCNumber             = $RFCNumber
-    $script:DecomTargets               = @($Targets | Select-Object -Unique)
+    $script:DecomRFCNumber               = $RFCNumber
     $script:DecomAvailabilityGroupFilter = @($AvailabilityGroup | Where-Object { $_ })
-    $script:DecomAllAvailabilityGroups = [bool]$AllAvailabilityGroups
-    $script:DecomPlanOnly              = [bool]$PlanOnly
-    $script:DecomSkipIpValidation      = [bool]$SkipIpValidation
-    $script:DecomRequireHostInventory  = [bool]$RequireHostInventory
-    $script:DecomForceIpMismatch       = [bool]$ForceIpMismatch
+    $script:DecomAllAvailabilityGroups   = [bool]$AllAvailabilityGroups
+    $script:DecomPlanOnly                = [bool]$PlanOnly
+    $script:DecomSkipIpValidation        = [bool]$SkipIpValidation
+    $script:DecomRequireHostInventory    = [bool]$RequireHostInventory
+    $script:DecomForceIpMismatch         = [bool]$ForceIpMismatch
 
     $script:DecomExcludeDatabases = @(
         $script:DecomExcludeDatabases + @($ExcludeDatabase | Where-Object { $_ }) |
@@ -63,13 +63,15 @@ function Initialize-DecomSession {
     Start-Transcript -Path $script:DecomTranscriptPath -Append | Out-Null
 
     Write-Host "`n[INFO] Initializing for RFC $RFCNumber..." -ForegroundColor Cyan
-    Write-Host "[INFO] Targets as provided: $($script:DecomTargets -join ', ')"
     if ($script:DecomPlanOnly) {
         Write-Host '[INFO] PlanOnly mode - no backups/renames/inventory updates will run.' -ForegroundColor Yellow
     }
 
     Import-DecomDependencies
     Import-DecomHostInventory
+
+    $script:DecomTargets = Resolve-DecomTargetsFromInventory -Targets $Targets
+    Write-Host "[INFO] Targets ($($script:DecomTargets.Count)): $($script:DecomTargets -join ', ')"
 
     $script:DecomDbatoolsVersion = (Get-Module dbatools).Version.ToString()
     $script:DecomPsVersion       = $PSVersionTable.PSVersion.ToString()
@@ -124,8 +126,7 @@ function Import-DecomHostInventory {
     $script:DecomHostInventory = @{}
 
     if (-not $script:DecomHostsFile -or -not (Test-Path -LiteralPath $script:DecomHostsFile)) {
-        Write-Warning "[WARN] Host inventory not found: $($script:DecomHostsFile)"
-        return
+        throw "Host inventory CSV not found: $($script:DecomHostsFile). Targets are loaded from this file."
     }
 
     $rows = Import-Csv -LiteralPath $script:DecomHostsFile
@@ -134,12 +135,78 @@ function Import-DecomHostInventory {
         $ip   = "$($row.ExpectedIP)".Trim()
         if (-not $name -or -not $ip) { continue }
         $script:DecomHostInventory[$name.ToLowerInvariant()] = [pscustomobject]@{
-            ServerName  = $name
-            ExpectedIP  = $ip
+            ServerName = $name
+            ExpectedIP = $ip
         }
     }
 
-    Write-Host "[INFO] Loaded $($script:DecomHostInventory.Count) host identity rows from $($script:DecomHostsFile)"
+    if ($script:DecomHostInventory.Count -eq 0) {
+        throw "Host inventory CSV is empty or invalid: $($script:DecomHostsFile)"
+    }
+
+    Write-Host "[INFO] Loaded $($script:DecomHostInventory.Count) hosts from $($script:DecomHostsFile)"
+}
+
+function Resolve-DecomTargetsFromInventory {
+    <#
+    CSV is the source of truth for which servers to decommission.
+    - No -Targets  -> process every ServerName in DecomHosts.csv
+    - With -Targets -> treat as a filter; each name must exist in the CSV
+    #>
+    [CmdletBinding()]
+    param([string[]]$Targets)
+
+    $inventoryNames = @(
+        $script:DecomHostInventory.Values |
+            ForEach-Object { $_.ServerName } |
+            Sort-Object -Unique
+    )
+
+    $filter = @($Targets | Where-Object { $_ } | ForEach-Object { "$_".Trim() } | Select-Object -Unique)
+
+    if ($filter.Count -eq 0) {
+        Write-Host "[INFO] No -Targets supplied; using all $($inventoryNames.Count) hosts from CSV."
+        return $inventoryNames
+    }
+
+    $resolved = [System.Collections.Generic.List[string]]::new()
+    $missing  = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($t in $filter) {
+        $hostPart = if ($t -match '\\') { ($t -split '\\')[0] } else { $t }
+        $key = $hostPart.ToLowerInvariant()
+        $short = ($hostPart -split '\.')[0].ToLowerInvariant()
+
+        if ($script:DecomHostInventory.ContainsKey($key)) {
+            # Preserve instance qualifier if caller passed host\instance
+            if ($t -match '\\') {
+                $invName = $script:DecomHostInventory[$key].ServerName
+                $resolved.Add("$invName\$($t.Split('\')[1])") | Out-Null
+            }
+            else {
+                $resolved.Add($script:DecomHostInventory[$key].ServerName) | Out-Null
+            }
+        }
+        elseif ($script:DecomHostInventory.ContainsKey($short)) {
+            if ($t -match '\\') {
+                $invName = $script:DecomHostInventory[$short].ServerName
+                $resolved.Add("$invName\$($t.Split('\')[1])") | Out-Null
+            }
+            else {
+                $resolved.Add($script:DecomHostInventory[$short].ServerName) | Out-Null
+            }
+        }
+        else {
+            $missing.Add($t) | Out-Null
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        throw "Target(s) not found in host inventory CSV ($($script:DecomHostsFile)): $($missing -join ', '). Add them to the CSV or omit -Targets to run the full list."
+    }
+
+    Write-Host "[INFO] -Targets filter matched $($resolved.Count) inventory host(s)."
+    return @($resolved | Select-Object -Unique)
 }
 
 function Get-DecomExpectedIp {

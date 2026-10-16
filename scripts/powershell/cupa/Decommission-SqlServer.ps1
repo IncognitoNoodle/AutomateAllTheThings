@@ -6,7 +6,7 @@
     Thin entry point. Shared helpers and branch pipelines live under Common\:
 
       Common\Config.ps1                  Environment defaults
-      Common\DecomHosts.csv              Hostname <-> ExpectedIP inventory
+      Common\DecomHosts.csv              Source of truth: hosts + ExpectedIP
       Common\Decom.Common.ps1            Session, backup/rename/AG-config helpers
       Common\Decom.Resolve.ps1           Classify targets (standalone vs AG)
       Common\Decom.Preflight.ps1         IP validation, SQL checks, plan file
@@ -14,8 +14,10 @@
       Common\Decom.AvailabilityGroup.ps1 Branch B - two-phase AG pipeline
       Common\Decom.Inventory.ps1         Mark processed standalone servers inactive
 
+    Targets are read from DecomHosts.csv. Optional -Targets filters that list.
+
     Flow:
-      1. Initialize session / dbatools / host inventory
+      1. Initialize session / dbatools / load hosts from CSV
       2. Resolve each target -> standalone list OR AG (with discovered replicas)
       3. Preflight: hostname/IP validation, SQL connect, write plan JSON
       4. Stop on preflight hard failures (unless overridden)
@@ -24,14 +26,16 @@
       7. Summary + non-zero exit code on failures
 
 .EXAMPLE
-    # Validate plan + IPs only
-    .\Decommission-SqlServer.ps1 -RFCNumber '12345' -Targets 'sresmsq400' -PlanOnly
+    # Plan every host in DecomHosts.csv
+    .\Decommission-SqlServer.ps1 -RFCNumber '12345' -PlanOnly
 
 .EXAMPLE
-    .\Decommission-SqlServer.ps1 -RFCNumber '12345' -Targets 'srsclsq405','suinfsq018'
+    # Execute full CSV list
+    .\Decommission-SqlServer.ps1 -RFCNumber '12345'
 
 .EXAMPLE
-    .\Decommission-SqlServer.ps1 -RFCNumber '12345' -Targets 'AGNODE1' -AvailabilityGroup 'AG_APP' -WhatIf
+    # Optional filter: only these CSV rows
+    .\Decommission-SqlServer.ps1 -RFCNumber '12345' -Targets 'sresmsq400','srsclsq405'
 
 .NOTES
     See Decommission-SqlServer.md for the full process walkthrough.
@@ -43,7 +47,7 @@ param (
     [ValidatePattern('^[A-Za-z0-9_-]+$')]
     [string]$RFCNumber,
 
-    [Parameter(Mandatory = $true)]
+    # Optional filter. Omit to process every ServerName in DecomHosts.csv.
     [string[]]$Targets,
 
     # When an instance has multiple AGs, select which one(s) to process
@@ -52,7 +56,7 @@ param (
     # Process every AG on the instance when more than one exists
     [switch]$AllAvailabilityGroups,
 
-    # Override default Common\DecomHosts.csv
+    # Override default Common\DecomHosts.csv (still the target source of truth)
     [string]$HostsFile,
 
     # Additional DB names to skip (merged with Config excludes)
@@ -64,7 +68,8 @@ param (
     # Do not validate hostname vs ExpectedIP
     [switch]$SkipIpValidation,
 
-    # Fail preflight when a target host is missing from DecomHosts.csv
+    # Fail preflight when a planned host is missing from DecomHosts.csv
+    # (mainly relevant if inventory was bypassed; CSV-driven runs already require membership)
     [switch]$RequireHostInventory,
 
     # Continue even when DNS IP does not match ExpectedIP (dangerous)
