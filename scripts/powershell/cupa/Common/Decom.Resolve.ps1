@@ -1,5 +1,5 @@
 # Target resolution: classify each input as standalone or Availability Group,
-# discover AG replica nodes, and skip unreachable / duplicate entries.
+# discover AG replica nodes, prefer SQL connectivity over ICMP.
 
 function Resolve-DecomTargets {
     [CmdletBinding()]
@@ -19,42 +19,61 @@ function Resolve-DecomTargets {
         }
         if ($t -in $script:DecomResolvedStandalone) { continue }
 
-        if (-not (Test-Connection $t -Count 1 -Quiet)) {
-            Write-Warning "[WARN] '$t' is unreachable - skipping."
+        $resolvedTarget = Resolve-DecomSqlInstance -Name $t
+        $hostName       = $resolvedTarget.HostName
+        $instance       = $resolvedTarget.SqlInstance
+
+        # Soft ICMP hint only - SQL connect is the hard gate
+        if (-not (Test-Connection $hostName -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+            Write-Warning "[WARN] '$hostName' did not respond to ping - still attempting SQL connect."
+        }
+
+        if (-not (Test-DecomSqlConnection -SqlInstance $instance)) {
+            Write-Warning "[WARN] Cannot connect to SQL instance $instance"
             $script:DecomUnreachableOrUnresolved.Add($t) | Out-Null
             continue
         }
 
         try {
-            $resolvedTarget = Resolve-DecomSqlInstance -Name $t
-            $instance       = $resolvedTarget.SqlInstance
+            $ags = @(Get-DbaAvailabilityGroup -SqlInstance $instance -ErrorAction SilentlyContinue)
 
-            try {
-                Connect-DbaInstance -SqlInstance $instance -ErrorAction Stop | Out-Null
-            }
-            catch {
-                Write-Warning "[WARN] Cannot connect to SQL instance $instance"
-                $script:DecomUnreachableOrUnresolved.Add($t) | Out-Null
-                continue
-            }
+            if ($ags.Count -gt 0) {
+                $selected = $ags
 
-            # Determine whether this target is a member of an Availability Group.
-            $ag = Get-DbaAvailabilityGroup -SqlInstance $instance -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-
-            if ($ag) {
-                $agName = $ag.Name
-                if ($script:DecomResolvedAgs.ContainsKey($agName)) {
-                    Write-Host "[INFO] '$t' resolves to already-queued AG '$agName' - skipping duplicate."
+                if ($script:DecomAvailabilityGroupFilter.Count -gt 0) {
+                    $selected = @(
+                        $ags | Where-Object { $_.Name -in $script:DecomAvailabilityGroupFilter }
+                    )
+                    if ($selected.Count -eq 0) {
+                        Write-Warning "[WARN] '$t' has AG(s) $($ags.Name -join ', ') but none match -AvailabilityGroup filter."
+                        $script:DecomUnreachableOrUnresolved.Add($t) | Out-Null
+                        continue
+                    }
+                }
+                elseif ($ags.Count -gt 1 -and -not $script:DecomAllAvailabilityGroups) {
+                    $msg = "Instance $instance has multiple AGs ($($ags.Name -join ', ')). Pass -AvailabilityGroup <name> or -AllAvailabilityGroups."
+                    Write-Warning "[WARN] $msg"
+                    $script:DecomPreflightHardFailures.Add($msg) | Out-Null
+                    $script:DecomHadFailures = $true
+                    $script:DecomUnreachableOrUnresolved.Add($t) | Out-Null
                     continue
                 }
-                $replicas = (Get-DbaAgReplica -SqlInstance $instance -AvailabilityGroup $agName).Name
-                $script:DecomResolvedAgs[$agName] = @{
-                    Primary      = $ag.PrimaryReplica
-                    Replicas     = $replicas
-                    SeedInstance = $instance
+
+                foreach ($ag in $selected) {
+                    $agName = $ag.Name
+                    if ($script:DecomResolvedAgs.ContainsKey($agName)) {
+                        Write-Host "[INFO] '$t' resolves to already-queued AG '$agName' - skipping duplicate."
+                        continue
+                    }
+
+                    $replicas = @((Get-DbaAgReplica -SqlInstance $instance -AvailabilityGroup $agName).Name)
+                    $script:DecomResolvedAgs[$agName] = @{
+                        Primary      = $ag.PrimaryReplica
+                        Replicas     = $replicas
+                        SeedInstance = $instance
+                    }
+                    Write-Host "[AG] '$t' -> AG '$agName' (primary: $($ag.PrimaryReplica), replicas: $($replicas -join ', '))" -ForegroundColor Green
                 }
-                Write-Host "[AG] '$t' -> AG '$agName' (primary: $($ag.PrimaryReplica), replicas: $($replicas -join ', '))" -ForegroundColor Green
             }
             else {
                 $script:DecomResolvedStandalone.Add($t) | Out-Null
@@ -67,16 +86,22 @@ function Resolve-DecomTargets {
         }
     }
 
-    # Sanity-check every AG's replicas are reachable before touching anything.
+    # Sanity-check every AG replica with SQL connect (not just ping) before touching anything.
     foreach ($agName in @($script:DecomResolvedAgs.Keys)) {
         $info = $script:DecomResolvedAgs[$agName]
-        $offline = $info.Replicas | Where-Object {
-            $serverName = (Resolve-DecomSqlInstance -Name $_).HostName
-            -not (Test-Connection $serverName -Count 1 -Quiet)
+        $offline = @()
+
+        foreach ($rep in $info.Replicas) {
+            $repResolved = Resolve-DecomSqlInstance -Name $rep
+            if (-not (Test-DecomSqlConnection -SqlInstance $repResolved.SqlInstance)) {
+                $offline += $rep
+            }
         }
-        if ($offline) {
-            Write-Warning "[SKIP] AG '$agName' has unreachable replica(s): $($offline -join ', ') - skipping for safety."
+
+        if ($offline.Count -gt 0) {
+            Write-Warning "[SKIP] AG '$agName' has unreachable replica SQL instance(s): $($offline -join ', ') - skipping for safety."
             $script:DecomFailedAgs.Add($agName) | Out-Null
+            $script:DecomHadFailures = $true
             continue
         }
         $script:DecomValidAgs[$agName] = $info
@@ -88,8 +113,8 @@ function Resolve-DecomTargets {
     }
 
     [pscustomobject]@{
-        Standalone = @($script:DecomResolvedStandalone)
-        Ags        = $script:DecomValidAgs
+        Standalone  = @($script:DecomResolvedStandalone)
+        Ags         = $script:DecomValidAgs
         Unreachable = @($script:DecomUnreachableOrUnresolved)
     }
 }
