@@ -1,5 +1,5 @@
 @{
-    RootModule        = 'sample-module.psm1'
+    RootModule        = 'SampleModule.psm1'
     ModuleVersion     = '0.1.0'
     GUID              = '00000000-0000-4000-8000-000000000001'
     Author            = 'Platform Engineering'

@@ -1,22 +1,22 @@
 # CUPA SQL Server decommission — process
 
-> Entry point: [`../invoke-sql-decommission.ps1`](../invoke-sql-decommission.ps1)  
+> Entry point: [`../Invoke-SqlDecommission.ps1`](../Invoke-SqlDecommission.ps1)  
 > Architecture: [`architecture.md`](architecture.md)
 
 RFC-driven decommission for CUPA SQL estates: host identity check, AG configuration backup, verified full backups, rename databases with an `_Decom_RFC{n}` suffix, clean Availability Group membership, and (for standalone) mark inventory inactive.
 
-Run the orchestrator only — `module/private` helpers are not meant to be called directly.
+Run the orchestrator only — `module/Private` helpers are not meant to be called directly.
 
 ## Layout
 
 | Path | Role |
 |------|------|
-| `invoke-sql-decommission.ps1` | Entry point / orchestrator |
+| `Invoke-SqlDecommission.ps1` | Entry point / orchestrator |
 | `config/defaults.ps1` | Environment defaults + DB exclude list |
 | `config/hosts.csv` | Default host list (ServerName + ExpectedIP) |
-| `module/sql-decom.psd1` / `.psm1` | Module manifest + loader |
-| `module/public/` | Exported pipeline commands |
-| `module/private/` | Internal helpers (backup, IP check, AG config, …) |
+| `module/SqlDecom.psd1` / `.psm1` | Module manifest + loader |
+| `module/Public/` | Exported pipeline commands |
+| `module/Private/` | Internal helpers (backup, IP check, AG config, …) |
 | `tests/` | Pester stubs |
 
 ## Pipeline overview
@@ -69,12 +69,12 @@ Pass a **CSV or Excel (.xlsx)** file. Every row is a host to decommission — th
 
 ```powershell
 # Default bundled list
-.\invoke-sql-decommission.ps1 -RFCNumber '45012' -PlanOnly
+.\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -PlanOnly
 
 # Explicit CSV / Excel path (or bare filename under module/ + config/)
-.\invoke-sql-decommission.ps1 -RFCNumber '45012' -HostList '.\config\hosts.csv'
-.\invoke-sql-decommission.ps1 -RFCNumber '45012' -HostList '\\share\Decom\Wave1.xlsx'
-.\invoke-sql-decommission.ps1 -RFCNumber '45012' -HostList 'DecomHosts.csv'
+.\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -HostList '.\config\hosts.csv'
+.\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -HostList '\\share\Decom\Wave1.xlsx'
+.\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -HostList 'DecomHosts.csv'
 ```
 
 Required columns (aliases accepted):
@@ -180,16 +180,16 @@ $script:DecomExcludeDatabases  = @('SSISDB','distribution','ReportServer','Repor
 cd scripts\powershell\cupa
 
 # Plan every host in the default CSV
-.\invoke-sql-decommission.ps1 -RFCNumber '45012' -PlanOnly
+.\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -PlanOnly
 
 # Execute after reviewing DecomPlan_*.json
-.\invoke-sql-decommission.ps1 -RFCNumber '45012'
+.\Invoke-SqlDecommission.ps1 -RFCNumber '45012'
 
 # Different wave file
-.\invoke-sql-decommission.ps1 -RFCNumber '45012' -HostList '\\share\Decom\RFC45012.xlsx'
+.\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -HostList '\\share\Decom\RFC45012.xlsx'
 
 # Multi-AG instance
-.\invoke-sql-decommission.ps1 -RFCNumber '45012' `
+.\Invoke-SqlDecommission.ps1 -RFCNumber '45012' `
   -HostList 'DecomHosts.csv' -AvailabilityGroup 'AG_APP' -WhatIf
 ```
 

@@ -1,10 +1,6 @@
 <#
 .SYNOPSIS
-    Compatibility shim — forwards to sql-decommission/invoke-sql-decommission.ps1
-
-.DESCRIPTION
-    The playbook lives under sql-decommission/. This lowercase shim preserves
-    older call sites that pointed at the cupa folder root.
+    Compatibility shim — forwards to SqlDecommission\Invoke-SqlDecommission.ps1
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -22,9 +18,9 @@ param(
     [switch]$ForceIpMismatch
 )
 
-$target = Join-Path $PSScriptRoot 'sql-decommission\invoke-sql-decommission.ps1'
+$target = Join-Path $PSScriptRoot 'SqlDecommission\Invoke-SqlDecommission.ps1'
 if (-not (Test-Path -LiteralPath $target)) {
-    throw "Moved entry point not found: $target"
+    throw "Entry point not found: $target"
 }
 
 & $target @PSBoundParameters

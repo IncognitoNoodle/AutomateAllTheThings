@@ -1,22 +1,20 @@
 #Requires -Modules Pester
 <#
 .SYNOPSIS
-    Pester stubs for sql-decom.
+    Pester stubs for SqlDecom.
 
 .DESCRIPTION
     Run on a Windows jump box with Pester 5+:
 
-      Invoke-Pester -Path .\tests\sql-decom.tests.ps1
-
-    These are structural/unit stubs — expand with mocked dbatools for CI.
+      Invoke-Pester -Path .\tests\SqlDecom.Tests.ps1
 #>
 
 BeforeAll {
     $projectRoot = Split-Path -Parent $PSScriptRoot
-    Import-Module (Join-Path $projectRoot 'module\sql-decom.psd1') -Force
+    Import-Module (Join-Path $projectRoot 'module\SqlDecom.psd1') -Force
 }
 
-Describe 'sql-decom module surface' {
+Describe 'SqlDecom module surface' {
     It 'exports the orchestrator commands' {
         $expected = @(
             'Initialize-DecomSession'
@@ -30,7 +28,7 @@ Describe 'sql-decom module surface' {
             'Get-DecomExitCode'
             'Set-DecomHadFailures'
         )
-        $exported = (Get-Command -Module sql-decom).Name
+        $exported = (Get-Command -Module SqlDecom).Name
         foreach ($name in $expected) {
             $exported | Should -Contain $name
         }

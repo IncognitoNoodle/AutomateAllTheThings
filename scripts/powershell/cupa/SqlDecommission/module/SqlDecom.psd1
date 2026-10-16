@@ -1,5 +1,5 @@
 @{
-    RootModule        = 'sql-decom.psm1'
+    RootModule        = 'SqlDecom.psm1'
     ModuleVersion     = '1.0.0'
     GUID              = 'a3c8e2f1-9b4d-4e7a-8c21-decom001cupa'
     Author            = 'CUPA DBA Automation'

@@ -3,22 +3,22 @@
     CUPA SQL Server decommission orchestrator.
 
 .DESCRIPTION
-    Production entry point for the sql-decommission playbook.
+    Production entry point for the SqlDecommission playbook.
 
     Project layout:
-      config/     defaults + host list (CSV/XLSX)
-      module/     sql-decom PowerShell module (public/ + private/)
-      docs/       process + architecture
-      tests/      Pester stubs
+      config/              defaults + host list (CSV/XLSX)
+      module/SqlDecom.*    PowerShell module (Public/ + Private/)
+      docs/                process + architecture
+      tests/               Pester stubs
 
 .EXAMPLE
-    .\invoke-sql-decommission.ps1 -RFCNumber '45012' -PlanOnly
+    .\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -PlanOnly
 
 .EXAMPLE
-    .\invoke-sql-decommission.ps1 -RFCNumber '45012' -HostList '.\config\hosts.csv'
+    .\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -HostList '.\config\hosts.csv'
 
 .EXAMPLE
-    .\invoke-sql-decommission.ps1 -RFCNumber '45012' -HostList '\\share\Decom\Wave1.xlsx'
+    .\Invoke-SqlDecommission.ps1 -RFCNumber '45012' -HostList '\\share\Decom\Wave1.xlsx'
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -43,7 +43,7 @@ param (
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 
-Import-Module (Join-Path $here 'module\sql-decom.psd1') -Force
+Import-Module (Join-Path $here 'module\SqlDecom.psd1') -Force
 
 # Default host list from project config when -HostList omitted
 if (-not $HostList) {
