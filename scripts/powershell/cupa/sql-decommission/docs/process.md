@@ -5,21 +5,19 @@
 
 RFC-driven decommission for CUPA SQL estates: host identity check, AG configuration backup, verified full backups, rename databases with an `_Decom_RFC{n}` suffix, clean Availability Group membership, and (for standalone) mark inventory inactive.
 
-Run the orchestrator only — modules under `module/ + config/` are not meant to be invoked directly unless you are debugging a single branch.
+Run the orchestrator only — `module/private` helpers are not meant to be called directly.
 
 ## Layout
 
 | Path | Role |
 |------|------|
 | `invoke-sql-decommission.ps1` | Entry point / orchestrator |
-| `config\defaults.ps1` | Environment defaults + DB exclude list |
-| `config\hosts.csv` | Default host list (ServerName + ExpectedIP) |
-| `module/ + config/Decom.Common.ps1` | Session, backup/verify, rename, rich AG config export, manifest |
-| `module/ + config/Decom.Resolve.ps1` | Classify hosts (SQL connect is the hard gate) |
-| `module/ + config/Decom.Preflight.ps1` | IP validation, SQL checks, plan JSON |
-| `module/ + config/Decom.Standalone.ps1` | **Branch A** — two-phase standalone pipeline |
-| `module/ + config/Decom.AvailabilityGroup.ps1` | **Branch B** — two-phase AG pipeline |
-| `module/ + config/Decom.Inventory.ps1` | Mark successfully processed standalone servers inactive |
+| `config/defaults.ps1` | Environment defaults + DB exclude list |
+| `config/hosts.csv` | Default host list (ServerName + ExpectedIP) |
+| `module/sql-decom.psd1` / `.psm1` | Module manifest + loader |
+| `module/public/` | Exported pipeline commands |
+| `module/private/` | Internal helpers (backup, IP check, AG config, …) |
+| `tests/` | Pester stubs |
 
 ## Pipeline overview
 
