@@ -146,7 +146,7 @@ $script:DecomInstanceSuffix    = '\SQL01'
 $script:DecomArchiveBasePath   = '\\ucles.internal\DBArchive'
 $script:DecomInventoryInstance = 'DBAPRDAG01\SQL01'
 $script:DecomLogDir            = 'C:\Temp\DecomLogs'
-$script:DecomHostListPath      = Join-Path $PSScriptRoot 'DecomHosts.csv'
+$script:DecomHostListPath      = Join-Path $PSScriptRoot 'hosts.csv'
 $script:DecomExcludeDatabases  = @('SSISDB','distribution','ReportServer','ReportServerTempDB')
 ```
 
