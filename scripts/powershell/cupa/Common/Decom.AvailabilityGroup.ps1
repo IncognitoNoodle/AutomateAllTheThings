@@ -126,6 +126,11 @@ function Invoke-DecomAvailabilityGroup {
             }
         }
 
+        if ($WhatIfPreference) {
+            Write-Host "[WHATIF] Skipping Phase 2 mutate for AG $AgName (no detach/rename under -WhatIf)." -ForegroundColor Yellow
+            return
+        }
+
         if (-not $phase1Ok -or $backedUp.Count -ne $agDatabases.Count) {
             Write-Warning "[ABORT] Phase 1 incomplete for AG $AgName ($($backedUp.Count)/$($agDatabases.Count) verified). Skipping detach/rename."
             $script:DecomFailedAgs.Add($AgName) | Out-Null

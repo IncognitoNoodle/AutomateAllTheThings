@@ -93,6 +93,11 @@ function Invoke-DecomStandaloneServer {
             }
         }
 
+        if ($WhatIfPreference) {
+            Write-Host "[WHATIF] Skipping rename phase for $ServerName (no mutations under -WhatIf)." -ForegroundColor Yellow
+            return
+        }
+
         if ($backedUp.Count -eq 0) {
             Write-Warning "[SKIP] No verified backups on $ServerName - rename phase skipped."
             $script:DecomFailedServers.Add($ServerName) | Out-Null
