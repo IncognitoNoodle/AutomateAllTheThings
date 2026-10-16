@@ -10,8 +10,8 @@ Putting **all** project code under `Common/` is **not** a production-grade pract
 
 ```
 cupa/
-  Decommission-SqlServer.ps1
-  Common/          ← everything lived here
+  decommission-sql-server.ps1   # (was PascalCase entry)
+  Common/                       # ← everything lived here
     Config.ps1
     Decom.Common.ps1
     Decom.Resolve.ps1
