@@ -6,4 +6,4 @@ This playbook now lives under [`sql-decommission/`](sql-decommission/).
 - Docs: [`sql-decommission/docs/process.md`](sql-decommission/docs/process.md)
 - Architecture: [`sql-decommission/docs/architecture.md`](sql-decommission/docs/architecture.md)
 
-A compatibility shim remains at `Decommission-SqlServer.ps1`.
+Compatibility shim: `decommission-sql-server.ps1` (lowercase).

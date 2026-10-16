@@ -3,8 +3,8 @@
     Compatibility shim — forwards to sql-decommission/invoke-sql-decommission.ps1
 
 .DESCRIPTION
-    The playbook moved to a production module layout under sql-decommission/.
-    This shim preserves old call sites.
+    The playbook lives under sql-decommission/. This lowercase shim preserves
+    older call sites that pointed at the cupa folder root.
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(

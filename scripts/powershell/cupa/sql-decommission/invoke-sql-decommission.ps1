@@ -50,15 +50,27 @@ if (-not $HostList) {
     $HostList = Join-Path $here 'config\hosts.csv'
 }
 
-# Allow bare filenames relative to project root or config\
-if (-not [System.IO.Path]::IsPathRooted($HostList) -and -not (Test-Path -LiteralPath $HostList)) {
-    $candidateConfig = Join-Path $here "config\$HostList"
-    $candidateHere   = Join-Path $here $HostList
-    if (Test-Path -LiteralPath $candidateConfig) {
-        $HostList = $candidateConfig
+# Resolve relative / legacy paths (pre-refactor Common\DecomHosts.csv names)
+if (-not (Test-Path -LiteralPath $HostList)) {
+    $leaf = [System.IO.Path]::GetFileName($HostList)
+    # Old inventory filename -> current config\hosts.csv
+    if ($leaf -match '^(?i)DecomHosts\.csv$') {
+        $leaf = 'hosts.csv'
     }
-    elseif (Test-Path -LiteralPath $candidateHere) {
-        $HostList = $candidateHere
+
+    $candidates = @(
+        (Join-Path $here $HostList)
+        (Join-Path $here "config\$leaf")
+        (Join-Path $here $leaf)
+        (Join-Path $here "config\hosts.csv")
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            Write-Host "[INFO] Resolved -HostList '$HostList' -> $candidate"
+            $HostList = $candidate
+            break
+        }
     }
 }
 
