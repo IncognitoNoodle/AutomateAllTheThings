@@ -21,8 +21,8 @@ Run the orchestrator only — modules under `Common\` are not meant to be invoke
 ## Pipeline overview
 
 ```
-Targets[]
-    |
+DecomHosts.csv  (ServerName + ExpectedIP)
+    |  optional -Targets filter
     v
 [Resolve]  SQL connect (ICMP is soft warning only)
     |---- multi-AG? require -AvailabilityGroup or -AllAvailabilityGroups
