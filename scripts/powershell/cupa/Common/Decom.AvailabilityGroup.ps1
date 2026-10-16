@@ -1,7 +1,6 @@
-# Branch B - Availability Group pipeline.
-# Processed as a unit across discovered replica nodes:
-#   backup (primary) -> remove from AG -> drop orphan on each secondary -> rename (primary)
-# AG and listener are left intact after databases are cleared.
+# Branch B - Availability Group pipeline (two-phase).
+# Phase 1: AG config backup (gated) + backup/verify ALL AG databases on primary.
+# Phase 2 (only if Phase 1 fully succeeded): remove from AG -> drop secondary orphans -> rename.
 
 function Invoke-DecomAvailabilityGroupPipeline {
     [CmdletBinding(SupportsShouldProcess = $true)]
@@ -26,7 +25,6 @@ function Invoke-DecomAvailabilityGroup {
     )
 
     Write-Host "`n----- Processing AG $AgName -----" -ForegroundColor Cyan
-    $agOk = $true
 
     try {
         $info = $script:DecomValidAgs[$AgName]
@@ -35,9 +33,6 @@ function Invoke-DecomAvailabilityGroup {
         $primary         = $primaryResolved.HostName
         $primaryInstance = $primaryResolved.SqlInstance
 
-        # Compare by normalized hostname, not raw string, since
-        # .PrimaryReplica and replica .Name values aren't guaranteed to be
-        # formatted identically (one may be qualified, the other not).
         $secondaries = @(
             $info.Replicas | Where-Object {
                 (Resolve-DecomSqlInstance -Name $_).HostName -ne $primary
@@ -49,12 +44,24 @@ function Invoke-DecomAvailabilityGroup {
         $destPath = Get-DecomDestinationPath -Label $AgName -FallbackHost $primary
         New-Item -Path $destPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
 
-        Export-DecomAgRollbackPackage `
+        # ---- AG configuration backup (hard gate) ----
+        Write-Host "[PHASE 0] Exporting AG configuration for $AgName" -ForegroundColor Cyan
+        $configOk = Export-DecomAgConfiguration `
             -PrimaryInstance $primaryInstance `
             -AgName $AgName `
             -OutputFolder $destPath
 
-        $agDatabases = Get-DbaAgDatabase -SqlInstance $primaryInstance -AvailabilityGroup $AgName
+        if (-not $configOk) {
+            Write-Warning "[ABORT] AG configuration backup failed for $AgName - no database mutations will run."
+            $script:DecomFailedAgs.Add($AgName) | Out-Null
+            $script:DecomHadFailures = $true
+            return
+        }
+
+        $agDatabases = @(
+            Get-DbaAgDatabase -SqlInstance $primaryInstance -AvailabilityGroup $AgName |
+                Where-Object { -not (Test-DecomExcludedDatabase -Name $_.Name) }
+        )
 
         # ---- Logging: every replica + every database, before touching anything ----
         $serverInfoBlocks = @(
@@ -82,61 +89,93 @@ function Invoke-DecomAvailabilityGroup {
             Write-DecomInfoFile -Path (Join-Path $destPath 'ServerInfo.txt') -Blocks $dbInfoBlocks -Header 'DATABASES'
         }
 
-        # ---- Per-database: backup -> detach -> clean secondaries -> rename ----
+        if ($agDatabases.Count -eq 0) {
+            Write-Host "[INFO] No eligible AG databases in $AgName."
+            $script:DecomProcessedAgs.Add($AgName) | Out-Null
+            return
+        }
+
+        # -------- Phase 1: backup + verify ALL databases (no AG mutations) --------
+        Write-Host "[PHASE 1] Backing up all AG databases on primary $primary" -ForegroundColor Cyan
+        $backedUp = [System.Collections.Generic.List[string]]::new()
+        $phase1Ok = $true
+
         foreach ($agDb in $agDatabases) {
-            $dbOk = Invoke-DecomAgDatabase `
+            $dbName = $agDb.Name
+            Set-DecomDbManifestState -Branch AvailabilityGroup -OwnerKey $AgName -DatabaseName $dbName -State 'Pending'
+
+            if ($PSCmdlet.ShouldProcess($dbName, "Backup on $primary (primary of $AgName)")) {
+                $fallbackPath = "\\$primary\N$\${AgName}_RFC$($script:DecomRFCNumber)"
+                $backupResult = Invoke-DecomBackupWithFallback `
+                    -SqlInstance $primaryInstance `
+                    -Database $dbName `
+                    -ArchivePath $destPath `
+                    -FallbackPath $fallbackPath
+
+                if (-not $backupResult.Ok) {
+                    Set-DecomDbManifestState -Branch AvailabilityGroup -OwnerKey $AgName -DatabaseName $dbName `
+                        -State 'BackupFailed' -ErrorMessage 'Backup+verify failed'
+                    Add-DecomFailure -FailureKey $AgName -DatabaseName $dbName
+                    $phase1Ok = $false
+                    continue
+                }
+
+                Set-DecomDbManifestState -Branch AvailabilityGroup -OwnerKey $AgName -DatabaseName $dbName `
+                    -State 'BackedUp' -BackupPath $backupResult.Path
+                $backedUp.Add($dbName) | Out-Null
+            }
+        }
+
+        if (-not $phase1Ok -or $backedUp.Count -ne $agDatabases.Count) {
+            Write-Warning "[ABORT] Phase 1 incomplete for AG $AgName ($($backedUp.Count)/$($agDatabases.Count) verified). Skipping detach/rename."
+            $script:DecomFailedAgs.Add($AgName) | Out-Null
+            $script:DecomHadFailures = $true
+            return
+        }
+
+        # -------- Phase 2: detach / clean secondaries / rename --------
+        Write-Host "[PHASE 2] Detaching and renaming databases in AG $AgName" -ForegroundColor Cyan
+        $agOk = $true
+
+        foreach ($dbName in $backedUp) {
+            $dbOk = Invoke-DecomAgDatabaseMutate `
                 -AgName $AgName `
-                -DatabaseName $agDb.Name `
+                -DatabaseName $dbName `
                 -PrimaryHost $primary `
                 -PrimaryInstance $primaryInstance `
-                -Secondaries $secondaries `
-                -DestPath $destPath
+                -Secondaries $secondaries
 
             if (-not $dbOk) { $agOk = $false }
         }
 
-        # ---- Leave AG and Listener intact ----
         if ($agOk) {
             Write-Host "[SUCCESS] Databases removed from AG $AgName. AG and listener left intact." -ForegroundColor Green
             $script:DecomProcessedAgs.Add($AgName) | Out-Null
         }
         else {
-            Write-Warning "[PARTIAL] $AgName had database-level failures."
+            Write-Warning "[PARTIAL] $AgName had database-level failures during Phase 2."
             $script:DecomFailedAgs.Add($AgName) | Out-Null
+            $script:DecomHadFailures = $true
         }
     }
     catch {
         Write-Warning "[ERROR] AG processing failed for $AgName : $($_.Exception.Message)"
         $script:DecomFailedAgs.Add($AgName) | Out-Null
+        $script:DecomHadFailures = $true
     }
 }
 
-function Invoke-DecomAgDatabase {
+function Invoke-DecomAgDatabaseMutate {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory)][string]$AgName,
         [Parameter(Mandatory)][string]$DatabaseName,
         [Parameter(Mandatory)][string]$PrimaryHost,
         [Parameter(Mandatory)][string]$PrimaryInstance,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Secondaries,
-        [Parameter(Mandatory)][string]$DestPath
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Secondaries
     )
 
     try {
-        if ($PSCmdlet.ShouldProcess($DatabaseName, "Backup on $PrimaryHost (primary of $AgName)")) {
-            $fallbackPath = "\\$PrimaryHost\N$\${AgName}_RFC$($script:DecomRFCNumber)"
-
-            $backupOk = Invoke-DecomBackupWithFallback `
-                -SqlInstance $PrimaryInstance `
-                -Database $DatabaseName `
-                -ArchivePath $DestPath `
-                -FallbackPath $fallbackPath
-
-            if (-not $backupOk) {
-                throw "Backup failed for $DatabaseName"
-            }
-        }
-
         if ($PSCmdlet.ShouldProcess($DatabaseName, "Remove from AG $AgName")) {
             Remove-DbaAgDatabase `
                 -SqlInstance $PrimaryInstance `
@@ -145,11 +184,9 @@ function Invoke-DecomAgDatabase {
                 -Confirm:$false `
                 -ErrorAction Stop
 
-            # Verify database is no longer a member of the AG
             $removed = $false
-
-            for ($i = 1; $i -le 30; $i++) {
-                Start-Sleep -Seconds 2
+            for ($i = 1; $i -le $script:DecomAgRemovePollAttempts; $i++) {
+                Start-Sleep -Seconds $script:DecomAgRemovePollSeconds
 
                 $stillInAg = Get-DbaAgDatabase `
                     -SqlInstance $PrimaryInstance `
@@ -168,10 +205,9 @@ function Invoke-DecomAgDatabase {
             }
 
             Write-Host "[REMOVED] $DatabaseName removed from AG $AgName"
+            Set-DecomDbManifestState -Branch AvailabilityGroup -OwnerKey $AgName -DatabaseName $DatabaseName -State 'RemovedFromAg'
         }
 
-        # Detaching only happens on the primary - every secondary is
-        # left holding a RESTORING orphan copy under the old name.
         $secondaryOk = $true
         foreach ($sec in $Secondaries) {
             $secInstance = (Resolve-DecomSqlInstance -Name $sec).SqlInstance
@@ -188,17 +224,31 @@ function Invoke-DecomAgDatabase {
             }
         }
 
+        if ($secondaryOk) {
+            Set-DecomDbManifestState -Branch AvailabilityGroup -OwnerKey $AgName -DatabaseName $DatabaseName -State 'OrphansCleaned'
+        }
+
         $renameOk = Invoke-DecomRenameDatabase `
             -SqlInstance $PrimaryInstance `
             -ServerName $PrimaryHost `
             -OriginalName $DatabaseName `
             -FailureKey $AgName
 
+        if ($renameOk) {
+            Set-DecomDbManifestState -Branch AvailabilityGroup -OwnerKey $AgName -DatabaseName $DatabaseName -State 'Renamed'
+        }
+        else {
+            Set-DecomDbManifestState -Branch AvailabilityGroup -OwnerKey $AgName -DatabaseName $DatabaseName `
+                -State 'RenameFailed' -ErrorMessage 'Rename failed'
+        }
+
         return ($secondaryOk -and $renameOk)
     }
     catch {
-        Write-Warning "[ERROR] Processing failed for $DatabaseName in $AgName : $($_.Exception.Message)"
+        Write-Warning "[ERROR] Phase 2 failed for $DatabaseName in $AgName : $($_.Exception.Message)"
         Add-DecomFailure -FailureKey $AgName -DatabaseName $DatabaseName
+        Set-DecomDbManifestState -Branch AvailabilityGroup -OwnerKey $AgName -DatabaseName $DatabaseName `
+            -State 'MutateFailed' -ErrorMessage $_.Exception.Message
         return $false
     }
 }

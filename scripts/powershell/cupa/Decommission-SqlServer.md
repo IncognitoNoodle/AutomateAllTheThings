@@ -1,6 +1,6 @@
 # CUPA SQL Server decommission
 
-RFC-driven decommission for CUPA SQL estates: full backup, rename databases with an `_Decom_RFC{n}` suffix, clean Availability Group membership, and (for standalone) mark inventory inactive.
+RFC-driven decommission for CUPA SQL estates: host identity check, AG configuration backup, verified full backups, rename databases with an `_Decom_RFC{n}` suffix, clean Availability Group membership, and (for standalone) mark inventory inactive.
 
 Run the orchestrator only — modules under `Common\` are not meant to be invoked directly unless you are debugging a single branch.
 
@@ -9,11 +9,13 @@ Run the orchestrator only — modules under `Common\` are not meant to be invoke
 | Path | Role |
 |------|------|
 | `Decommission-SqlServer.ps1` | Entry point / orchestrator |
-| `Common\Config.ps1` | Environment defaults (archive share, instance suffix, inventory) |
-| `Common\Decom.Common.ps1` | Session init, backup/rename helpers, summary |
-| `Common\Decom.Resolve.ps1` | Classify each target as standalone or AG |
-| `Common\Decom.Standalone.ps1` | **Branch A** — standalone server pipeline |
-| `Common\Decom.AvailabilityGroup.ps1` | **Branch B** — AG pipeline across discovered replica nodes |
+| `Common\Config.ps1` | Environment defaults + DB exclude list |
+| `Common\DecomHosts.csv` | Decom-team hostname ↔ ExpectedIP inventory |
+| `Common\Decom.Common.ps1` | Session, backup/verify, rename, rich AG config export, manifest |
+| `Common\Decom.Resolve.ps1` | Classify targets (SQL connect is the hard gate) |
+| `Common\Decom.Preflight.ps1` | IP validation, SQL checks, plan JSON |
+| `Common\Decom.Standalone.ps1` | **Branch A** — two-phase standalone pipeline |
+| `Common\Decom.AvailabilityGroup.ps1` | **Branch B** — two-phase AG pipeline |
 | `Common\Decom.Inventory.ps1` | Mark successfully processed standalone servers inactive |
 
 ## Pipeline overview
@@ -22,128 +24,197 @@ Run the orchestrator only — modules under `Common\` are not meant to be invoke
 Targets[]
     |
     v
-[Resolve] ---- ping + Connect-DbaInstance ----+
-    |                                        |
-    | has AG?                                | no AG
-    v                                        v
- Branch B: Availability Group          Branch A: Standalone
-    |                                        |
-    | discover primary + replicas            | per server
-    | reachability gate on ALL replicas      | backup -> rename
-    |                                        |
-    | per AG database:                       |
-    |   backup (primary)                     |
-    |   Remove-DbaAgDatabase                 |
-    |   drop orphan on each secondary        |
-    |   rename on primary                    |
-    |                                        |
-    | AG + listener LEFT INTACT              |
-    |                                        |
-    +------------------+---------------------+
-                       |
-                       v
-              [Inventory update]
-              (standalone successes only)
-                       |
-                       v
-                   [Summary]
+[Resolve]  SQL connect (ICMP is soft warning only)
+    |---- multi-AG? require -AvailabilityGroup or -AllAvailabilityGroups
+    |
+    +-- standalone list ----------+
+    +-- AG units (all replicas) --+
+                                  |
+                                  v
+                           [Preflight]
+                     hostname DNS vs ExpectedIP
+                     SQL connect every planned node
+                     AG sync snapshot
+                     write DecomPlan_RFC{n}.json
+                                  |
+                     hard failure? ---- abort (exit 2)
+                                  |
+                     -PlanOnly? ------- stop after plan
+                                  |
+                                  v
+              +-------------------+-------------------+
+              |                                       |
+              v                                       v
+     Branch A: Standalone                      Branch B: AG
+     Phase1 backup+verify all                  Phase0 AG config backup (gate)
+     Phase2 rename only if all OK              Phase1 backup+verify ALL DBs
+                                               Phase2 detach/orphan/rename
+                                               (skipped if Phase1 incomplete)
+              |                                       |
+              +-------------------+-------------------+
+                                  |
+                                  v
+                         [Inventory update]
+                         (standalone successes)
+                                  |
+                                  v
+                     [Summary JSON + exit code]
 ```
+
+## Host identity validation
+
+`Common\DecomHosts.csv` holds the decom-team list:
+
+```csv
+ServerName,ExpectedIP
+sresmsq400,10.119.40.16
+srsclsq405,10.119.40.12
+...
+```
+
+During preflight, for every planned host (standalone target or AG replica):
+
+1. Look up `ExpectedIP` from the CSV (case-insensitive; FQDN matches on short name).
+2. Forward DNS (`GetHostEntry`) — resolved IPv4 list must contain `ExpectedIP`.
+3. Reverse DNS of `ExpectedIP` — best-effort confirm hostname (warning if forward OK but reverse does not).
+
+| Status | Meaning | Default action |
+|--------|---------|----------------|
+| `Ok` | Forward + reverse agree | Continue |
+| `OkForwardOnly` | Forward matches, reverse unclear | Warning, continue |
+| `Mismatch` / `DnsFailed` | Wrong IP or DNS failure | **Hard fail** (abort) |
+| `MissingInventory` | Host not in CSV | Warning (hard fail if `-RequireHostInventory`) |
+
+Overrides:
+
+- `-SkipIpValidation` — skip the check entirely
+- `-ForceIpMismatch` — continue despite mismatch (dangerous)
+- `-HostsFile <path>` — use an alternate inventory CSV
+
+## AG configuration backup
+
+Before any AG database mutation, Branch B writes `AgConfig\` under the AG archive folder:
+
+| File | Purpose |
+|------|---------|
+| `AG_Config_{Ag}.json` | Structured replicas, listeners, databases, seeding/routing |
+| `AG_Config_{Ag}.txt` | Human-readable snapshot |
+| `AG_Rollback_{Ag}.sql` | Rebuild script + commented `ADD DATABASE` list |
+
+If any artifact is missing/empty or JSON fails to parse, **Phase 2 does not run**.
+
+## Two-phase mutation (flawless-run safety)
+
+### Standalone
+1. Backup + on-disk verify every eligible DB.
+2. If any backup fails → **no renames** for that server.
+3. Rename only verified `BackedUp` databases.
+
+### Availability Group
+1. Export AG configuration (gate).
+2. Backup + verify **all** AG databases on the primary.
+3. If Phase 1 is incomplete → **no detach/rename**.
+4. Only then: remove from AG → drop secondary orphans → rename on primary.
+5. AG object + listener stay intact.
 
 ## Order of operations
 
-1. **Initialize** — load config, ensure `dbatools`, start transcript under `C:\Temp\DecomLogs`.
-2. **Resolve** — for each unique target:
-   - Skip if unreachable or SQL connect fails.
-   - If the instance belongs to an AG → queue that AG (primary + all replica names).
-   - Otherwise → queue as standalone.
-   - Deduplicate overlapping inputs (listener + node both passed → one AG unit).
-   - Skip any AG that has an offline replica (safety).
-3. **Branch A — Standalone** — for each standalone host:
-   - Create archive folder `{server}_RFC{n}` (share or `\\server\N$\...` fallback).
-   - Write `ServerInfo.txt` (instance + database inventory).
-   - For each user database (skip already-renamed `*_Decom_RFC*`):
-     - Full backup to archive; on failure retry to local `N$` path.
-     - Rename to `{name}_Decom_RFC{n}`.
-4. **Branch B — Availability Group** — for each valid AG:
-   - Expand work to **all discovered replica nodes** (primary + secondaries).
-   - Export AG rollback package (`AG_Config_*.txt`, `AG_Rollback_*.sql`).
-   - Snapshot every replica + every AG database into `ServerInfo.txt`.
-   - Per AG database:
-     - Backup on **primary**.
-     - Remove database from AG; poll until membership clears.
-     - Drop the orphaned RESTORING copy on **each secondary**.
-     - Rename on **primary**.
-   - Leave the AG object and listener in place.
-5. **Inventory** — set `Active = 0` on `dba_inv` for standalone servers that fully succeeded. AG replica nodes are not auto-deactivated (AG still exists).
-6. **Summary** — processed / failed / unreachable + transcript path.
+1. **Initialize** — config, host inventory, dbatools, transcript/manifest paths.
+2. **Resolve** — SQL connect; classify standalone vs AG; expand replicas; multi-AG guard.
+3. **Preflight** — IP identity, SQL on all nodes, AG health snapshot, plan JSON.
+4. **Branch A / B** — two-phase pipelines (skipped with `-PlanOnly`).
+5. **Inventory** — `Active = 0` for fully successful standalone servers only.
+6. **Summary** — console + `DecomSummary_RFC{n}.json`; non-zero exit on failures.
 
 ## Standalone vs AG branching
 
 | | Standalone (Branch A) | Availability Group (Branch B) |
 |--|----------------------|-------------------------------|
-| Detection | No AG found on instance | First AG on instance; replicas discovered via dbatools |
+| Detection | No AG on instance | AG(s) on instance; replicas via dbatools |
 | Work scope | That one host | Primary + every secondary node |
+| Config backup | ServerInfo.txt | Rich AgConfig JSON/TXT/SQL (gated) |
 | Backup source | The standalone instance | Primary only |
-| Cleanup | Rename only | Remove from AG → drop secondary orphans → rename primary |
+| Cleanup | Rename after all backups OK | Remove from AG → drop orphans → rename |
 | AG object | N/A | Left intact (listener too) |
 | Inventory | Marked inactive on full success | Not marked inactive |
 
 ## Configuration
 
-Edit `Common\Config.ps1` once per environment:
+Edit `Common\Config.ps1`:
 
 ```powershell
 $script:DecomInstanceSuffix    = '\SQL01'
 $script:DecomArchiveBasePath   = '\\ucles.internal\DBArchive'
-$script:DecomLocalBackupRoot   = 'N:\'
 $script:DecomInventoryInstance = 'DBAPRDAG01\SQL01'
 $script:DecomLogDir            = 'C:\Temp\DecomLogs'
+$script:DecomHostsFile         = Join-Path $PSScriptRoot 'DecomHosts.csv'
+$script:DecomExcludeDatabases  = @('SSISDB','distribution','ReportServer','ReportServerTempDB')
 ```
 
-If the archive share is offline, backups fall back to `\\{host}\N$\...`.
+## Parameters
 
-## Requirements
+| Parameter | Purpose |
+|-----------|---------|
+| `-RFCNumber` | Mandatory RFC token (safe charset) |
+| `-Targets` | Host or `host\instance` list |
+| `-AvailabilityGroup` | Select AG(s) when instance has more than one |
+| `-AllAvailabilityGroups` | Process every AG on multi-AG instances |
+| `-HostsFile` | Alternate identity CSV |
+| `-ExcludeDatabase` | Extra DB names to skip |
+| `-PlanOnly` | Resolve + preflight + plan; no mutations |
+| `-SkipIpValidation` | Skip DNS vs ExpectedIP checks |
+| `-RequireHostInventory` | Fail if a planned host is missing from CSV |
+| `-ForceIpMismatch` | Continue despite IP mismatch |
+| `-WhatIf` / `-Confirm` | SupportsShouldProcess on mutating steps |
 
-- Windows jump box with network access to targets and (ideally) the archive share
-- **dbatools** (auto-installed for CurrentUser if missing)
-- Rights to backup, rename, remove AG databases, drop secondary orphans, and update `dba_inv`
-- ICMP / `Test-Connection` reachability to hosts being decommissioned
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Backup/rename/AG mutate failures |
+| 2 | Preflight hard failures (IP mismatch, SQL down, etc.) |
+| 3 | Some targets unreachable/unresolved (no other hard fail) |
 
 ## Examples
 
 ```powershell
 cd scripts\powershell\cupa
 
-# Dry run
-.\Decommission-SqlServer.ps1 -RFCNumber '45012' -Targets 'SQLDEV01' -WhatIf
+# 1) Always start with a plan + IP check against DecomHosts.csv
+.\Decommission-SqlServer.ps1 -RFCNumber '45012' `
+  -Targets 'sresmsq400','srsclsq405','suinfsq018' -PlanOnly
 
-# Standalone only
-.\Decommission-SqlServer.ps1 -RFCNumber '45012' -Targets 'SQLDEV01'
+# 2) Execute after reviewing DecomPlan_*.json
+.\Decommission-SqlServer.ps1 -RFCNumber '45012' `
+  -Targets 'sresmsq400','srsclsq405','suinfsq018'
 
-# Mixed: AG seed/node + a standalone box
-.\Decommission-SqlServer.ps1 -RFCNumber '45012' -Targets 'AGNODE1','SQLBOX02'
+# Multi-AG instance
+.\Decommission-SqlServer.ps1 -RFCNumber '45012' `
+  -Targets 'AGNODE1' -AvailabilityGroup 'AG_APP'
 
-# Already-qualified instance name (suffix not appended)
-.\Decommission-SqlServer.ps1 -RFCNumber '45012' -Targets 'SQLDEV01\SQL01'
+# Dry-run mutations
+.\Decommission-SqlServer.ps1 -RFCNumber '45012' -Targets 'suinfsq018' -WhatIf
 ```
 
 ## Outputs
 
-Per target folder under the archive share (or `N$` fallback):
+Under archive share (or `N$` fallback) plus `C:\Temp\DecomLogs\`:
 
 | Artifact | Contents |
 |----------|----------|
-| `ServerInfo.txt` | Server / replica metadata and database inventory at run start |
-| `*.bak` (via Backup-DbaDatabase) | Full compressed/checksum/verified backups |
-| `AG_Config_{AgName}.txt` | Replica + listener snapshot (AG branch only) |
-| `AG_Rollback_{AgName}.sql` | Rebuild script for the AG (AG branch only) |
-
-Transcript: `C:\Temp\DecomLogs\Decom_RFC{n}_{timestamp}.log`
+| `ServerInfo.txt` | Server/replica + database inventory |
+| `AgConfig\*` | AG JSON/TXT/SQL configuration backup |
+| `*.bak` | Verified full backups |
+| `DecomPlan_RFC{n}_*.json` | Preflight plan + IP results |
+| `DecomManifest_RFC{n}_*.json` | Per-DB state machine for the run |
+| `DecomSummary_RFC{n}_*.json` | Final summary |
+| `Decom_RFC{n}_*.log` | Transcript |
 
 ## Safety notes
 
-- Supports `-WhatIf` / `-Confirm` via `SupportsShouldProcess` on mutating steps.
-- Databases already named `*_Decom_RFC*` are skipped.
-- An AG with any unreachable replica is skipped entirely.
-- Rename failures and backup failures are tracked per server/AG and listed in the summary for manual follow-up.
-- AG and listener are **not** dropped by this playbook — only databases are removed from the group.
+- ICMP ping is informational only; SQL connectivity decides reachability.
+- IP mismatch aborts the run by default.
+- Phase 2 never starts if Phase 1 (or AG config export) is incomplete.
+- Databases already named `*_Decom_RFC*` and Config excludes are skipped.
+- AG and listener are **not** dropped by this playbook.
